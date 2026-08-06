@@ -42,6 +42,9 @@ start "greeks" python3 run_greeks_only.py
 # 3) Joiner: opt ticks + latest greeks -> features stream
 start "joiner" python3 run_joiner.py
 
+# 3a2) Greeks phase engine: Accumulation/Markup/Distribution per contract
+start "greeks_phase" python3 run_greeks_analyzer.py
+
 # 3b) Candles: ticks -> 1m/1d, then resample -> 5m/10m/30m
 start "candles_pub" python3 run_candles_publisher.py
 start "candles_rs"  python3 run_candles_resampler.py
@@ -93,6 +96,9 @@ start "imbalance" python3 run_bidask_imbalance.py
 
 # 3e2i) Composite score: synthesizes imbalance+orderflow+smartmoney+bidask+strikeflow+optexit
 start "composite" python3 run_composite.py
+
+# 3e2i2) Liquidity score: entry sizing + scale-out levels per contract
+start "liquidity_score" python3 run_liquidity_score.py
 
 # 3e2j) OI analysis: per-contract long/short buildup classification (Steps 1-4 only, see notes)
 start "oi_analysis" python3 run_oi_analysis.py

@@ -28,6 +28,7 @@ EMA_LATEST_PREFIX = os.getenv("EMA_CROSS_LATEST_PREFIX", "md:ema:cross:latest:")
 HTF_LATEST_PREFIX = os.getenv("HTF_TREND_LATEST_PREFIX", "md:htf:trend:latest:")
 VOLUME_LATEST_KEY = os.getenv("VOLUME_LATEST_KEY", "md:volume:latest")
 OI_UNDERLYING_LATEST_PREFIX = os.getenv("OI_UNDERLYING_LATEST_PREFIX", "md:oi:underlying:latest:")
+GREEKS_PHASE_UNDERLYING_PREFIX = os.getenv("GREEKS_PHASE_UNDERLYING_PREFIX", "md:greeks:phase:underlying:latest:")
 
 OUT_STREAM = os.getenv("STREAM_ENTRY_TRIGGER", "md:entry:trigger")
 OUT_MAXLEN = int(os.getenv("STREAM_MAXLEN_ENTRY_TRIGGER", "200000"))
@@ -159,6 +160,8 @@ def main():
                 htf = _load_latest(r, htf_key)
                 oi = _load_latest(r, oi_key)
                 vol = _load_volume_for_symbol(r, sym)
+                gp_ce = _load_latest(r, f"{GREEKS_PHASE_UNDERLYING_PREFIX}{sym}:CE")
+                gp_pe = _load_latest(r, f"{GREEKS_PHASE_UNDERLYING_PREFIX}{sym}:PE")
 
                 fresh_st = _is_fresh(st, now_ms)
                 fresh_ema = _is_fresh(ema, now_ms)
@@ -217,6 +220,8 @@ def main():
                     oi_positioning=oi_positioning,
                     oi_resistance=oi_resistance,
                     oi_support=oi_support,
+                    greeks_phase_ce=str((gp_ce or {}).get("phase") or ""),
+                    greeks_phase_pe=str((gp_pe or {}).get("phase") or ""),
                 )
 
                 payload = {
