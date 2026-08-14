@@ -57,6 +57,7 @@ SMARTMONEY_LATEST_PREFIX = os.getenv("SMARTMONEY_LATEST_PREFIX", "md:smartmoney:
 BIDASK_LATEST_PREFIX = os.getenv("BIDASK_LATEST_PREFIX", "md:bidask:latest:")
 STRIKEFLOW_LATEST_PREFIX = os.getenv("STRIKEFLOW_LATEST_PREFIX", "md:strikeflow:latest:")
 OPTEXIT_LATEST_PREFIX = os.getenv("OPTEXIT_LATEST_PREFIX", "md:optexit:latest:")
+GREEKS_PHASE_LATEST_PREFIX = os.getenv("GREEKS_PHASE_LATEST_PREFIX", "md:greeks:phase:latest:")
 
 OUT_STREAM = os.getenv("STREAM_COMPOSITE_SIGNAL", "md:composite:signal")
 OUT_MAXLEN = int(os.getenv("STREAM_MAXLEN_COMPOSITE", "50000"))
@@ -196,6 +197,16 @@ def main() -> None:
                     override_exit = True
                     override_reason = f"{tsym}:{status}"
                     break
+
+            if not override_exit:
+                for tsym in contracts_by_underlying.get(sym, ()):
+                    gp_doc = _load_json(r, f"{GREEKS_PHASE_LATEST_PREFIX}{tsym}")
+                    if not gp_doc:
+                        continue
+                    if str(gp_doc.get("phase") or "") == "DISTRIBUTION":
+                        override_exit = True
+                        override_reason = f"{tsym}:GREEKS_DISTRIBUTION"
+                        break
 
             status, reason = classify_composite(score, override_exit, override_reason)
 

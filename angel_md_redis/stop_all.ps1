@@ -1,20 +1,29 @@
-# PowerShell script to stop all running pipeline services
+# PowerShell Helper to Stop All Pipeline Workers
+Set-Location $PSScriptRoot
 
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $ScriptDir
+$date = Get-Date -Format "yyyy-MM-dd"
+$pidDir = Join-Path $PSScriptRoot "logs\$date\pids"
 
-$Day = Get-Date -Format "yyyy-MM-dd"
-$PidDir = "$ScriptDir\logs\$Day\pids"
-
-if (Test-Path $PidDir) {
-    Get-ChildItem "$PidDir\*.pid" | ForEach-Object {
-        $pidVal = Get-Content $_.FullName -ErrorAction SilentlyContinue
-        if ($pidVal) {
-            Write-Host "Stopping process ID $pidVal ($($_.BaseName))..." -ForegroundColor Yellow
-            Stop-Process -Id $pidVal -Force -ErrorAction SilentlyContinue
+if (Test-Path $pidDir) {
+    $pidFiles = Get-ChildItem -Path $pidDir -Filter "*.pid"
+    if ($pidFiles.Count -gt 0) {
+        Write-Host "Stopping $($pidFiles.Count) background pipeline workers..." -ForegroundColor Yellow
+        foreach ($file in $pidFiles) {
+            $pidVal = Get-Content $file.FullName
+            if ($pidVal) {
+                try {
+                    Stop-Process -Id [int]$pidVal -Force -ErrorAction SilentlyContinue
+                    Write-Host "  -> Stopped PID $pidVal ($($file.BaseName))" -ForegroundColor Gray
+                } catch {
+                    # Already stopped
+                }
+            }
+            Remove-Item -Path $file.FullName -Force -ErrorAction SilentlyContinue
         }
+        Write-Host "All background workers stopped." -ForegroundColor Green
+    } else {
+        Write-Host "No active PID files found in $pidDir." -ForegroundColor Yellow
     }
-    Write-Host "All workers stopped." -ForegroundColor Green
 } else {
-    Write-Host "No active PID files found for today ($Day)." -ForegroundColor Red
+    Write-Host "No PID directory found for today ($date)." -ForegroundColor Yellow
 }
