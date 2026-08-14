@@ -47,12 +47,13 @@ function Start-Worker {
     )
     Write-Host "  -> Launching worker: $Name" -ForegroundColor Green
     $stdoutFile = Join-Path $logDir "$Name.log"
+    $stderrFile = Join-Path $logDir "$Name.err.log"
     $pidFile = Join-Path $pidDir "$Name.pid"
     
     if ($Args) {
-        $proc = Start-Process -FilePath $VenvPython -ArgumentList "$Script $Args" -RedirectStandardOutput $stdoutFile -RedirectStandardError $stdoutFile -PassThru -NoNewWindow
+        $proc = Start-Process -FilePath $VenvPython -ArgumentList "$Script $Args" -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -PassThru -NoNewWindow
     } else {
-        $proc = Start-Process -FilePath $VenvPython -ArgumentList "$Script" -RedirectStandardOutput $stdoutFile -RedirectStandardError $stdoutFile -PassThru -NoNewWindow
+        $proc = Start-Process -FilePath $VenvPython -ArgumentList "$Script" -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -PassThru -NoNewWindow
     }
     
     $proc.Id | Out-File -FilePath $pidFile -Encoding ascii
@@ -63,6 +64,7 @@ Start-Worker "producer" "run_producer.py"
 Start-Sleep -Seconds 3
 Start-Worker "greeks" "run_greeks_only.py"
 Start-Worker "joiner" "run_joiner.py"
+Start-Worker "greeks_phase" "run_greeks_analyzer.py"
 
 # --- Candles & Pivots ---
 Start-Worker "candles_pub" "run_candles_publisher.py"
@@ -86,6 +88,7 @@ Start-Worker "optexit" "run_option_liquidity_exit.py"
 Start-Worker "imbalance" "run_bidask_imbalance.py"
 Start-Worker "composite" "run_composite.py"
 Start-Worker "oi_analysis" "run_oi_analysis.py"
+Start-Worker "liquidity_score" "run_liquidity_score.py"
 
 # --- Strategy Decision & Strike Selection ---
 Start-Worker "entry_trigger" "run_entry_trigger.py"
