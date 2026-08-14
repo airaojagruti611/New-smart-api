@@ -5,18 +5,24 @@ Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host " Starting Angel One Market Data Pipeline " -ForegroundColor Cyan
 Write-Host "==========================================" -ForegroundColor Cyan
 
-# 1. Determine Python executable (venv or system)
-$VenvPython = "$PSScriptRoot\venv\Scripts\python.exe"
-if (Test-Path "$PSScriptRoot\venv\Scripts\Activate.ps1") {
-    Write-Host "Activating local venv..." -ForegroundColor Gray
-    & "$PSScriptRoot\venv\Scripts\Activate.ps1"
-} elseif (Test-Path "$PSScriptRoot\..\.venv\Scripts\Activate.ps1") {
-    Write-Host "Activating workspace .venv..." -ForegroundColor Gray
-    & "$PSScriptRoot\..\.venv\Scripts\Activate.ps1"
-}
+# 1. Determine Python executable (active venv, .venv, venv, or system)
+$VenvPython = ""
 
-if (-not (Test-Path $VenvPython)) {
+if ($env:VIRTUAL_ENV -and (Test-Path "$env:VIRTUAL_ENV\Scripts\python.exe")) {
+    $VenvPython = "$env:VIRTUAL_ENV\Scripts\python.exe"
+    Write-Host "Using active virtualenv Python: $VenvPython" -ForegroundColor Gray
+} elseif (Test-Path "$PSScriptRoot\.venv\Scripts\python.exe") {
+    $VenvPython = "$PSScriptRoot\.venv\Scripts\python.exe"
+    Write-Host "Using local .venv Python: $VenvPython" -ForegroundColor Gray
+} elseif (Test-Path "$PSScriptRoot\venv\Scripts\python.exe") {
+    $VenvPython = "$PSScriptRoot\venv\Scripts\python.exe"
+    Write-Host "Using local venv Python: $VenvPython" -ForegroundColor Gray
+} elseif (Test-Path "$PSScriptRoot\..\.venv\Scripts\python.exe") {
+    $VenvPython = "$PSScriptRoot\..\.venv\Scripts\python.exe"
+    Write-Host "Using workspace .venv Python: $VenvPython" -ForegroundColor Gray
+} else {
     $VenvPython = "python"
+    Write-Host "WARNING: No virtualenv python executable found! Falling back to system 'python'." -ForegroundColor Yellow
 }
 
 # 2. Environment Variables
