@@ -2,8 +2,9 @@
 run_daily_pivots.py
 ───────────────────
 Consumes daily candles from md:candles:1d and writes classic pivot levels based on
-previous day's H/L/C into keys:
-  md:pivots:prevday:{SYMBOL}
+previous day's H/L/C into:
+  Key    : md:pivots:prevday:{SYMBOL}   (live snapshot for signal engines)
+  Stream : md:pivots:prevday             (history for data_lake parquet archive)
 
 Downstream signal engines read these levels for intraday pivot-break triggers.
 """
@@ -22,6 +23,8 @@ from app.pivots import classic_pivots
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 IN_1D_STREAM = os.getenv("STREAM_CANDLES_1D", "md:candles:1d")
+OUT_STREAM = os.getenv("STREAM_PIVOTS_PREVDAY", "md:pivots:prevday")
+OUT_MAXLEN = int(os.getenv("STREAM_MAXLEN_PIVOTS_PREVDAY", "200000"))
 
 GROUP = os.getenv("PIVOTS_GROUP", "pivots")
 CONSUMER = os.getenv("PIVOTS_CONSUMER", "pivots-1")
@@ -76,7 +79,10 @@ def main():
     # Keep last daily candle per symbol so we can compute pivots for the next day.
     prev_day_by_symbol: Dict[str, Tuple[str, Candle]] = {}
 
-    print(f"[PIVOTS] reading {IN_1D_STREAM} -> writing md:pivots:prevday:{{SYMBOL}}")
+    print(
+        f"[PIVOTS] reading {IN_1D_STREAM} -> writing md:pivots:prevday:{{SYMBOL}} "
+        f"and stream {OUT_STREAM}"
+    )
 
     while True:
         resp = r.xreadgroup(
@@ -104,6 +110,21 @@ def main():
                     prev_date, prev_candle = prev_day_by_symbol[sym]
                     p = classic_pivots(prev_candle, date=prev_date or date_str or "")
                     store.write_pivots_prevday(f"md:pivots:prevday:{sym}", p)
+                    r.xadd(
+                        OUT_STREAM,
+                        {
+                            "ts_ms": str(int(prev_candle.ts_ms)),
+                            "symbol": sym,
+                            "date": p.date,
+                            "P": f"{p.P:.2f}",
+                            "R1": f"{p.R1:.2f}",
+                            "S1": f"{p.S1:.2f}",
+                            "R2": f"{p.R2:.2f}",
+                            "S2": f"{p.S2:.2f}",
+                        },
+                        maxlen=OUT_MAXLEN,
+                        approximate=True,
+                    )
 
                 prev_day_by_symbol[sym] = (date_str, day_candle)
 

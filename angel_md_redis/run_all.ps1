@@ -28,6 +28,7 @@ if ($env:VIRTUAL_ENV -and (Test-Path "$env:VIRTUAL_ENV\Scripts\python.exe")) {
 # 2. Environment Variables
 $env:PYTHONUNBUFFERED = "1"
 $env:LOG_LEVEL = "INFO"
+$env:ARCHIVE_TZ = "Asia/Kolkata"
 
 # 3. Start Redis Container
 Write-Host "`n[1/3] Ensuring Redis Docker Container is running..." -ForegroundColor Yellow
@@ -101,20 +102,12 @@ Start-Worker "entry_trigger" "run_entry_trigger.py"
 Start-Worker "strike_select" "run_strike_select.py"
 Start-Worker "capital_alloc" "run_capital_alloc.py"
 
-# --- Archivers ---
-Start-Worker "arch_eq" "run_archiver_all.py" "eq"
-Start-Worker "arch_opt" "run_archiver_all.py" "opt"
-Start-Worker "arch_greeks" "run_archiver_all.py" "greeks"
-Start-Worker "arch_features" "run_archiver_all.py" "features"
+# --- Volatility (Modules 8-9) ---
+Start-Worker "expected_move" "run_expected_move.py"
+Start-Worker "greeks_change" "run_greeks_change.py"
 
-Start-Worker "arch_candles_1m" "run_archiver_candles_1m.py"
-Start-Worker "arch_candles_5m" "run_archiver_candles_5m.py"
-Start-Worker "arch_candles_10m" "run_archiver_candles_10m.py"
-Start-Worker "arch_candles_30m" "run_archiver_candles_30m.py"
-Start-Worker "arch_candles_1d" "run_archiver_candles_1d.py"
-
-Start-Worker "arch_regime_csv" "run_archiver_signals_csv.py" "regime"
-Start-Worker "arch_volume_csv" "run_archiver_signals_csv.py" "volume"
+# --- Archiver: all Angel One + layer streams -> data_lake/*.parquet ---
+Start-Worker "arch_layers" "run_archiver_layers.py" "all"
 
 Write-Host "`n[3/3] Success! Pipeline is running." -ForegroundColor Cyan
 Write-Host "Logs are being recorded in: $logDir" -ForegroundColor Gray

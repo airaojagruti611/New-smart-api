@@ -114,22 +114,12 @@ start "strike_select" python3 run_strike_select.py
 # 3h) Capital alloc: regime bias + strike -> sized CALL/PUT notional
 start "capital_alloc" python3 run_capital_alloc.py
 
-# 4) Archivers: Redis streams -> data_lake/stream=.../dt=YYYY-MM-DD/...
-start "arch_eq"       python3 run_archiver_all.py eq
-start "arch_opt"      python3 run_archiver_all.py opt
-start "arch_greeks"   python3 run_archiver_all.py greeks
-start "arch_features" python3 run_archiver_all.py features
+# 3i) Expected move (Module 8) + Greeks change (Module 9)
+start "expected_move" python3 run_expected_move.py
+start "greeks_change" python3 run_greeks_change.py
 
-# 4b) Candle archivers: Redis candle streams -> angel_md_data_lake/stream=.../dt=YYYY-MM-DD/...
-start "arch_candles_1m"  python3 run_archiver_candles_1m.py
-start "arch_candles_5m"  python3 run_archiver_candles_5m.py
-start "arch_candles_10m" python3 run_archiver_candles_10m.py
-start "arch_candles_30m" python3 run_archiver_candles_30m.py
-start "arch_candles_1d"  python3 run_archiver_candles_1d.py
-
-# 5) Signal archivers (CSV): regime + volume signals -> data_lake/stream=.../dt=YYYY-MM-DD/part-*.csv
-start "arch_regime_csv" python3 run_archiver_signals_csv.py regime
-start "arch_volume_csv" python3 run_archiver_signals_csv.py volume
+# 4) One parquet archiver: Angel One + all layer streams -> data_lake/stream=.../dt=YYYY-MM-DD/...
+start "arch_layers" python3 run_archiver_layers.py all
 
 echo
 echo "All started."
