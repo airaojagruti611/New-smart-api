@@ -68,7 +68,7 @@ function Start-Worker {
 
 # --- Core Pipeline Workers ---
 Start-Worker "producer" "run_producer.py"
-Start-Sleep -Seconds 3
+Start-Sleep -Seconds 8
 Start-Worker "greeks" "run_greeks_only.py"
 Start-Worker "joiner" "run_joiner.py"
 Start-Worker "greeks_phase" "run_greeks_analyzer.py"
@@ -112,3 +112,4 @@ Start-Worker "arch_layers" "run_archiver_layers.py" "all"
 Write-Host "`n[3/3] Success! Pipeline is running." -ForegroundColor Cyan
 Write-Host "Logs are being recorded in: $logDir" -ForegroundColor Gray
 Write-Host "To stop all processes, run: .\stop_all.ps1" -ForegroundColor Yellow
+Write-Host "Dashboard (Linux): ./run_dashboard.sh  →  http://127.0.0.1:8501" -ForegroundColor Gray

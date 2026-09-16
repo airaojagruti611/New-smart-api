@@ -268,6 +268,52 @@ KEYS md:greeks_change:latest:*
 
 ---
 
+## Client Excel snapshot (production)
+
+While Redis is up, dump every layer’s **inputs and outputs** for the symbols in `symbols.txt` into one workbook the client can review:
+
+```bash
+cd angel_md_redis
+source venv/bin/activate   # if not already
+chmod +x export_client_excel.sh
+./export_client_excel.sh
+```
+
+Or:
+
+```bash
+python3 export_client_excel.py
+python3 export_client_excel.py --symbols RELIANCE,TCS,INFY
+```
+
+File lands in `client_output/OptionRider_LayerAudit_YYYY-MM-DD_HHMM.xlsx` with sheets:
+
+- `00_Cover` — how to verify
+- `01_Summary` — key output + OK/EMPTY per symbol
+- `02_Layer_IO` — full input/output JSON per layer
+- `03_Per_Symbol` — flattened latest fields
+
+Needs `openpyxl` (`pip install -r requirements.txt`). Pipeline can keep running; this is a snapshot, not a worker.
+
+---
+
+## Live dashboard (Streamlit)
+
+Same Redis snapshot as the Excel, as a production UI:
+
+```bash
+cd angel_md_redis
+source venv/bin/activate
+chmod +x run_dashboard.sh
+./run_dashboard.sh
+```
+
+Open **http://127.0.0.1:8501**
+
+`./run_all.sh` starts the dashboard as well (skip with `START_DASHBOARD=0`). Port: `DASHBOARD_PORT` (default 8501).
+
+---
+
 ## Pipeline order (dependency map)
 
 ```

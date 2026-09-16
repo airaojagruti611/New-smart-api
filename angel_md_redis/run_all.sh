@@ -36,6 +36,11 @@ start() {
 # 1) Producer: WS -> Redis (eq + opt ticks)
 start "producer" python3 run_producer.py
 
+# Angel rate-limits concurrent generateSession (same TOTP).
+# Greeks waits on md:active_expiry anyway — delay is safe.
+echo "Waiting 8s for producer login before greeks..."
+sleep 8
+
 # 2) Greeks: REST -> Redis (needs md:active_expiry from producer)
 start "greeks" python3 run_greeks_only.py
 
@@ -121,9 +126,22 @@ start "greeks_change" python3 run_greeks_change.py
 # 4) One parquet archiver: Angel One + all layer streams -> data_lake/stream=.../dt=YYYY-MM-DD/...
 start "arch_layers" python3 run_archiver_layers.py all
 
+# 5) Live Streamlit UI (http://127.0.0.1:8501) — set START_DASHBOARD=0 to skip
+if [[ "${START_DASHBOARD:-1}" != "0" ]]; then
+  start "dashboard" streamlit run streamlit_app.py \
+    --server.port "${DASHBOARD_PORT:-8501}" \
+    --server.address "${DASHBOARD_ADDR:-0.0.0.0}" \
+    --server.headless true \
+    --browser.gatherUsageStats false
+fi
+
 echo
 echo "All started."
 echo "Logs: $LOGDIR"
 echo "PIDs: $PIDDIR"
+echo "Dashboard: http://127.0.0.1:${DASHBOARD_PORT:-8501}"
 echo "To stop everything:"
 echo "  kill \$(cat $PIDDIR/*.pid)"
+echo "Client Excel (any time while Redis is up):"
+echo "  ./export_client_excel.sh"
+echo "  python3 export_client_excel.py --symbols RELIANCE,TCS,INFY"
