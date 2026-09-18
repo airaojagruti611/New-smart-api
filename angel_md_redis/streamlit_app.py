@@ -434,7 +434,7 @@ with tabs[5]:
     with e1:
         st.markdown("**Expected move (prediction only — no strike)**")
         st.json(d.get("expected") or {"status": "EMPTY"})
-        st.caption("Empty IV means REST greeks have not populated yet. indicator_score is not sourced in this pipeline.")
+        st.caption("Empty IV means REST greeks have not populated yet. indicator_score comes from Supertrend + EMA + pivot strength.")
     with e2:
         st.markdown("**Greeks change (needs a selected option)**")
         st.json(d.get("greeks_change") or {"status": "EMPTY until strike_select OK"})

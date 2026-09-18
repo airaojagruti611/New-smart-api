@@ -18,13 +18,16 @@ price behavior:
 Greek sign convention: CE delta lives in [0,1], PE delta in [-1,0]. The
 brief's "delta >= 0.5 AND delta <= 0.8" is CE-side notation; PE mirrors
 on magnitude (|delta| in the same band) per "BUY PUT (bearish mirror
-logic)".
+logic)". Exit "delta decreasing" is also evaluated on |delta| so puts
+weaken correctly (-0.60 -> -0.50).
+
+Missing broker Greeks must NOT be coerced to 0.0 — that falsely triggers
+Accumulation. When required fields are absent the result is NO_DATA.
 
 Thresholds the brief doesn't pin a number to (gamma low/rising, iv
 stable/rising/dropping-sharply, theta "increasing rapidly", price "small"
 movement, what counts as "previous resistance") are defaulted below and
-are all overridable by the runner. Flag if you had specific values in
-mind — these are reasonable defaults, not calibrated ones.
+are all overridable by the runner.
 
 No I/O here — pure dataclasses + functions/classes. Redis wiring lives
 in run_greeks_analyzer.py.
@@ -44,7 +47,7 @@ GAMMA_LOW_THRESHOLD = 0.02        # gamma below this -> "low gamma" (accumulatio
 GAMMA_RISING_PCT = 10.0           # gamma up >= this % vs previous reading -> "increasing"
 GAMMA_FALLING_PCT = -10.0         # gamma down >= this % vs previous reading -> "falling"
 
-PRICE_CHANGE_SMALL_PCT = 0.15     # |underlying price change %| below this -> "low movement"
+PRICE_CHANGE_SMALL_PCT = 0.15     # |recent underlying price change %| below this -> "low movement"
 
 IV_STABLE_BAND_PCT = 3.0          # |iv change %| within this -> "stable"
 IV_RISING_PCT = 5.0               # iv up >= this % vs previous reading -> "rising"
@@ -64,14 +67,14 @@ def _pct_change(curr: Optional[float], prev: Optional[float]) -> Optional[float]
 
 @dataclass(frozen=True)
 class PhaseResult:
-    phase: str            # "ACCUMULATION" / "MARKUP" / "DISTRIBUTION" / "NEUTRAL"
+    phase: str            # "ACCUMULATION" / "MARKUP" / "DISTRIBUTION" / "NEUTRAL" / "NO_DATA"
     action: str            # "NO_TRADE" / "BUY CALL" / "BUY PUT" / "EXIT" / "HOLD"
     side: str               # "CE" / "PE" / ""
-    delta: float
-    gamma: float
-    theta: float
-    vega: float
-    iv: float
+    delta: Optional[float]
+    gamma: Optional[float]
+    theta: Optional[float]
+    vega: Optional[float]
+    iv: Optional[float]
     delta_pct: Optional[float]
     gamma_pct: Optional[float]
     iv_pct: Optional[float]
@@ -126,11 +129,27 @@ class GreeksPhaseTracker:
         breakout: Optional[bool] = None,
     ) -> PhaseResult:
         cp = (cp or "").strip().upper()
-        delta = delta if delta is not None else 0.0
-        gamma = gamma if gamma is not None else 0.0
-        theta = theta if theta is not None else 0.0
-        vega = vega if vega is not None else 0.0
-        iv = iv if iv is not None else 0.0
+        side = "CE" if cp == "CE" else ("PE" if cp == "PE" else "")
+
+        # Required for any real phase decision. Do not coerce to 0.0 —
+        # missing broker Greeks previously looked like Accumulation.
+        if delta is None or gamma is None or iv is None:
+            missing = []
+            if delta is None:
+                missing.append("delta")
+            if gamma is None:
+                missing.append("gamma")
+            if iv is None:
+                missing.append("iv")
+            result = PhaseResult(
+                phase="NO_DATA", action="HOLD", side=side,
+                delta=delta, gamma=gamma, theta=theta, vega=vega, iv=iv,
+                delta_pct=None, gamma_pct=None, iv_pct=None, theta_pct=None,
+                price_change_pct=price_change_pct, breakout=breakout,
+                reason=f"missing_greeks:{'+'.join(missing)}",
+            )
+            log.debug("LOGIC_OUT %s", result)
+            return result
 
         delta_pct = _pct_change(delta, self._prev_delta)
         gamma_pct = _pct_change(gamma, self._prev_gamma)
@@ -138,20 +157,23 @@ class GreeksPhaseTracker:
         theta_pct = _pct_change(theta, self._prev_theta)
 
         abs_delta = abs(delta)
+        prev_abs_delta = abs(self._prev_delta) if self._prev_delta is not None else None
+        abs_delta_pct = _pct_change(abs_delta, prev_abs_delta)
+
         gamma_rising = gamma_pct is not None and gamma_pct >= self.gamma_rising_pct
         gamma_falling = gamma_pct is not None and gamma_pct <= self.gamma_falling_pct
         iv_rising = iv_pct is not None and iv_pct >= self.iv_rising_pct
-        iv_stable = iv_pct is None or abs(iv_pct) <= self.iv_stable_band
+        # IV "stable" requires a prior reading; first tick must not count as stable.
+        iv_stable = iv_pct is not None and abs(iv_pct) <= self.iv_stable_band
         iv_dropping_sharply = iv_pct is not None and iv_pct <= self.iv_drop_sharp_pct
-        delta_decreasing = delta_pct is not None and delta_pct < 0
+        # Magnitude: CE and PE both "weaken" when |delta| falls.
+        delta_decreasing = abs_delta_pct is not None and abs_delta_pct < 0
         theta_surging = theta_pct is not None and abs(theta_pct) >= self.theta_surge_pct
-        price_small = price_change_pct is None or abs(price_change_pct) < self.price_small_pct
+        price_small = price_change_pct is not None and abs(price_change_pct) < self.price_small_pct
         # breakout is optional context (price vs pivot); when the caller
-        # doesn't have it (or the simplified Delta/Gamma/IV-only view),
-        # None means "not evaluated" -> doesn't block entry.
+        # doesn't have it, None means "not evaluated" -> doesn't block entry.
         breakout_ok = True if breakout is None else breakout
 
-        side = "CE" if cp == "CE" else ("PE" if cp == "PE" else "")
         reasons = []
 
         if self._in_markup:
@@ -199,7 +221,8 @@ class GreeksPhaseTracker:
         result = PhaseResult(
             phase=phase, action=action, side=side,
             delta=delta, gamma=gamma, theta=theta, vega=vega, iv=iv,
-            delta_pct=delta_pct, gamma_pct=gamma_pct, iv_pct=iv_pct, theta_pct=theta_pct,
+            delta_pct=abs_delta_pct if abs_delta_pct is not None else delta_pct,
+            gamma_pct=gamma_pct, iv_pct=iv_pct, theta_pct=theta_pct,
             price_change_pct=price_change_pct, breakout=breakout,
             reason="|".join(reasons),
         )

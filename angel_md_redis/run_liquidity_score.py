@@ -4,8 +4,7 @@ run_liquidity_score.py
 Liquidity Score Module — Redis wiring. Maintains per-underlying option
 chain state (strike -> OI, for chain ranking + cluster/wall detection,
 same pattern as run_oi_analysis.py / run_strike_flow.py), cross-references
-cached spread/depth signals from run_bidask_analyzer.py, and OI-change
-signals from run_oi_analysis.py.
+cached spread/depth signals from run_bidask_analyzer.py.
 
 Emits:
   Stream : md:liquidity:score:signal
@@ -21,7 +20,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import redis
 
@@ -29,13 +28,15 @@ from app.config import load_symbols
 from app.liquidity_score import (
     GAMMA_JUMP_PCT,
     OI_WALL_MULT,
-    PRICE_NEAR_STRIKE_PCT,
     SessionOpenOI,
+    approaching_strike,
     compute_liquidity_score,
     degradation_multiplier,
     entry_size,
+    gamma_speed_bump_strikes,
     oi_cluster_targets,
     scale_out_decision,
+    vol_oi_is_dropping,
 )
 from app.logging_setup import setup_logger
 
@@ -46,8 +47,8 @@ EQ_STREAM = os.getenv("STREAM_EQ", "md:ticks:eq")
 OPT_STREAM = os.getenv("STREAM_OPT", "md:ticks:opt")
 
 BIDASK_LATEST_PREFIX = os.getenv("BIDASK_LATEST_PREFIX", "md:bidask:latest:")
-OI_LATEST_PREFIX = os.getenv("OI_LATEST_PREFIX", "md:oi:latest:")
 ORDERFLOW_LATEST_PREFIX = os.getenv("ORDERFLOW_LATEST_PREFIX", "md:orderflow:latest:")
+POSITION_OPEN_PREFIX = os.getenv("POSITION_OPEN_PREFIX", "md:position:open:")
 
 OUT_STREAM = os.getenv("STREAM_LIQUIDITY_SCORE", "md:liquidity:score:signal")
 OUT_MAXLEN = int(os.getenv("STREAM_MAXLEN_LIQUIDITY_SCORE", "50000"))
@@ -58,7 +59,6 @@ CONSUMER = os.getenv("LIQUIDITY_SCORE_CONSUMER", "liquidity-score-1")
 
 EVAL_INTERVAL_SEC = float(os.getenv("LIQUIDITY_SCORE_EVAL_INTERVAL_SEC", "3.0"))
 LATEST_TTL_SEC = int(os.getenv("LIQUIDITY_SCORE_LATEST_TTL_SEC", "3600"))
-AVG_VOLUME_WINDOW = int(os.getenv("LIQUIDITY_AVG_VOLUME_WINDOW", "20"))
 
 
 def ensure_group(r: redis.Redis, stream: str, group: str) -> None:
@@ -100,6 +100,20 @@ def _parse_csv_floats(raw: str) -> List[float]:
     return out
 
 
+def _open_position(r: redis.Redis, tsym: str) -> Optional[dict]:
+    """
+    Live fill, if the execution layer writes one.
+    Expected JSON: {qty|quantity|lots > 0, optional entry_spot|spot}.
+    """
+    doc = _load_json(r, f"{POSITION_OPEN_PREFIX}{tsym}")
+    if not doc:
+        return None
+    qty = _safe_float(doc.get("qty") or doc.get("quantity") or doc.get("lots"))
+    if qty is None or qty <= 0:
+        return None
+    return doc
+
+
 class ContractState:
     __slots__ = ("underlying", "cp", "strike", "oi", "cum_vol", "bid_sizes", "ltp")
 
@@ -113,26 +127,6 @@ class ContractState:
         self.ltp = 0.0
 
 
-class AvgVolTracker:
-    """Rolling avg of PERIOD (not cumulative) volume per contract."""
-
-    def __init__(self, window: int):
-        self.window = window
-        self._buf: Dict[str, List[float]] = {}
-
-    def push(self, tsym: str, period_vol: float) -> None:
-        buf = self._buf.setdefault(tsym, [])
-        buf.append(period_vol)
-        if len(buf) > self.window:
-            buf.pop(0)
-
-    def avg(self, tsym: str) -> Optional[float]:
-        buf = self._buf.get(tsym)
-        if not buf:
-            return None
-        return sum(buf) / len(buf)
-
-
 def main() -> None:
     symbols = set(load_symbols())
     r = redis.from_url(REDIS_URL, decode_responses=True)
@@ -143,11 +137,11 @@ def main() -> None:
     spot_by_sym: Dict[str, float] = {}
     prev_spot_by_sym: Dict[str, float] = {}
     book_by_underlying: Dict[str, Dict[str, ContractState]] = {}
-    # Eval-cycle previous cumulative volume (oi_analysis pattern) — NOT
-    # updated on every tick, otherwise period_vol at eval is always 0.
-    last_eval_cum_vol: Dict[str, float] = {}
     session_oi = SessionOpenOI()
-    avg_vol = AvgVolTracker(AVG_VOLUME_WINDOW)
+    last_vol_oi: Dict[str, float] = {}
+    # First time we observed an open position for this tsym this session:
+    # (entry_spot, qty). Used for Method C when the position doc has no spot.
+    position_entry_spot: Dict[str, Tuple[float, float]] = {}
 
     next_eval = time.time() + EVAL_INTERVAL_SEC
 
@@ -215,16 +209,10 @@ def main() -> None:
 
             prev_spot = prev_spot_by_sym.get(und)
             prev_spot_by_sym[und] = spot
-            underlying_move_pct = (
-                abs(spot - prev_spot) / prev_spot * 100.0 if prev_spot else 0.0
-            )
 
             of_doc = _load_json(r, f"{ORDERFLOW_LATEST_PREFIX}{und}") or {}
             net_delta_flattening = str(of_doc.get("bias") or "").upper() == "NEUTRAL"
 
-            # Chain-wide OI ranking, per side (CE/PE separately — ranking
-            # calls vs calls, puts vs puts, since that's what's actionable
-            # for a directional position).
             ce_rows = sorted(
                 ((s.strike, s.oi) for s in book.values() if s.cp == "CE" and s.strike > 0),
                 key=lambda x: x[1], reverse=True,
@@ -236,6 +224,17 @@ def main() -> None:
             ce_rank_by_strike = {s: i + 1 for i, (s, _oi) in enumerate(ce_rows)}
             pe_rank_by_strike = {s: i + 1 for i, (s, _oi) in enumerate(pe_rows)}
 
+            ce_jumps = {
+                s.strike: session_oi.jump_pct(tsym, s.oi)
+                for tsym, s in book.items() if s.cp == "CE" and s.strike > 0
+            }
+            pe_jumps = {
+                s.strike: session_oi.jump_pct(tsym, s.oi)
+                for tsym, s in book.items() if s.cp == "PE" and s.strike > 0
+            }
+            ce_bumps = gamma_speed_bump_strikes(ce_jumps)
+            pe_bumps = gamma_speed_bump_strikes(pe_jumps)
+
             for tsym, st in book.items():
                 if st.strike <= 0 or not st.cp:
                     continue
@@ -244,25 +243,37 @@ def main() -> None:
                 spread_ratio = _safe_float(bidask_doc.get("spread_ratio"))
                 bidask_depth_score = _safe_float(bidask_doc.get("liquidity_score"))
 
-                oi_doc = _load_json(r, f"{OI_LATEST_PREFIX}{tsym}") or {}
-                oi_change_pct = _safe_float(oi_doc.get("oi_change_pct"))
+                pos_doc = _open_position(r, tsym)
+                in_position = pos_doc is not None
+                if in_position:
+                    entry_spot = _safe_float(
+                        pos_doc.get("entry_spot") or pos_doc.get("spot") or pos_doc.get("entry_price")
+                    )
+                    if tsym not in position_entry_spot:
+                        position_entry_spot[tsym] = (entry_spot or spot, float(pos_doc.get("qty") or 0))
+                    elif entry_spot:
+                        position_entry_spot[tsym] = (entry_spot, position_entry_spot[tsym][1])
+                else:
+                    position_entry_spot.pop(tsym, None)
 
-                prev_cv = last_eval_cum_vol.get(tsym)
-                period_vol = max(0.0, st.cum_vol - prev_cv) if prev_cv is not None else 0.0
-                last_eval_cum_vol[tsym] = st.cum_vol
-                avg_vol.push(tsym, period_vol)
-                avg_daily_volume = avg_vol.avg(tsym)
+                if in_position and tsym in position_entry_spot and position_entry_spot[tsym][0] > 0:
+                    base_spot = position_entry_spot[tsym][0]
+                    underlying_move_pct = abs(spot - base_spot) / base_spot * 100.0
+                else:
+                    underlying_move_pct = 0.0
+
+                # Spec: "price moving toward/away from strike" = distance shrinking,
+                # not ITM/OTM level.
+                if prev_spot and st.strike > 0:
+                    price_moving_toward = abs(spot - st.strike) < abs(prev_spot - st.strike)
+                else:
+                    price_moving_toward = None
 
                 bid_top3 = sum(st.bid_sizes[:3])
-                price_moving_toward = (
-                    (spot >= st.strike) if st.cp == "CE" else (spot <= st.strike)
-                ) if spot else None
-
-                # today_volume = session cumulative vol (Angel `vol` field);
-                # period_vol only feeds the rolling "avg daily volume" proxy.
+                # Volume cap = 5% of session cumulative volume (ADV proxy).
                 ent = entry_size(
                     oi=st.oi,
-                    avg_daily_volume=avg_daily_volume,
+                    avg_daily_volume=st.cum_vol,
                     today_volume=st.cum_vol,
                     bid_top3_size=bid_top3,
                     spread_ratio=spread_ratio,
@@ -282,20 +293,15 @@ def main() -> None:
                     bidask_depth_score=bidask_depth_score,
                     entry=ent,
                 )
+                ent = score_result.entry_size
 
-                # Scale-out check (Module 2) — only meaningful once "in a
-                # trade"; caller/downstream decides whether a position is
-                # actually open. This module reports the CONDITIONS, same
-                # signal-only convention as stock_entry_exit.py.
                 same_side_rows = ce_rows if st.cp == "CE" else pe_rows
                 above_entry = [
                     (s, o) for (s, o) in same_side_rows
                     if (s > st.strike if st.cp == "CE" else s < st.strike)
                 ]
                 clusters = oi_cluster_targets(above_entry)
-                near_top_oi = any(
-                    abs(spot - c.strike) / c.strike * 100.0 <= PRICE_NEAR_STRIKE_PCT for c in clusters
-                ) if spot else False
+                near_top_oi = any(approaching_strike(spot, c.strike) for c in clusters)
 
                 next_strike_oi = None
                 same_side_sorted = sorted(same_side_rows, key=lambda x: x[0])
@@ -310,8 +316,20 @@ def main() -> None:
                     and next_strike_oi > OI_WALL_MULT * st.oi
                 )
 
-                vol_oi_dropping = (
-                    oi_change_pct is not None and oi_change_pct < 0
+                prev_ratio = last_vol_oi.get(tsym)
+                vol_oi_dropping = vol_oi_is_dropping(ent.vol_oi, prev_ratio)
+                if ent.vol_oi is not None:
+                    last_vol_oi[tsym] = ent.vol_oi
+
+                bumps = ce_bumps if st.cp == "CE" else pe_bumps
+                jump_pct = session_oi.jump_pct(tsym, st.oi)
+                speed_bump = jump_pct is not None and jump_pct > GAMMA_JUMP_PCT
+                profitable_bumps = [
+                    b for b in bumps
+                    if (b > st.strike if st.cp == "CE" else b < st.strike)
+                ]
+                approaching_gamma = any(
+                    approaching_strike(spot, b) for b in profitable_bumps
                 )
 
                 scale_out = scale_out_decision(
@@ -320,11 +338,11 @@ def main() -> None:
                     next_strike_oi_is_wall=wall_ahead,
                     vol_oi_dropping=vol_oi_dropping,
                     net_delta_flattening=net_delta_flattening,
+                    in_position=in_position,
+                    approaching_gamma_bump=approaching_gamma,
                 )
 
                 deg_mult = degradation_multiplier(underlying_move_pct)
-                jump_pct = session_oi.jump_pct(tsym, st.oi)
-                speed_bump = jump_pct is not None and jump_pct > GAMMA_JUMP_PCT
 
                 payload = {
                     "ts_ms": str(now_ms),
@@ -340,7 +358,9 @@ def main() -> None:
                     "depth_cap": str(ent.depth_cap),
                     "max_safe_entry": str(ent.max_safe_entry),
                     "confidence_multiplier": str(ent.confidence_multiplier),
+                    "band_size_mult": str(ent.band_size_mult),
                     "final_entry_size": str(ent.final_entry_size),
+                    "entry_reason": ent.reason,
                     "expected_oi": str(ent.expected_oi),
                     "opening_ratio": str(ent.opening_ratio),
                     "liquidity_score": str(score_result.score),
@@ -357,10 +377,13 @@ def main() -> None:
                         separators=(",", ":"),
                     ),
                     "gamma_speed_bump": "1" if speed_bump else "0",
+                    "approaching_gamma_bump": "1" if approaching_gamma else "0",
+                    "in_position": "1" if in_position else "0",
                     "session_oi_jump_pct": "" if jump_pct is None else str(jump_pct),
                     "degradation_multiplier": str(deg_mult),
                     "scale_out_conditions_met": str(scale_out.conditions_met),
                     "scale_out_exit_pct": str(scale_out.exit_pct),
+                    "scale_out_reason": scale_out.reason,
                     "scale_out_conditions": json.dumps(scale_out.conditions, separators=(",", ":")),
                 }
 
@@ -371,13 +394,19 @@ def main() -> None:
                     ex=LATEST_TTL_SEC,
                 )
 
-                if score_result.band in ("RED",) or scale_out.exit_pct > 0:
+                if in_position and scale_out.exit_pct > 0:
                     log.info(
-                        "EMIT tsym=%s band=%s score=%.2f scale_out_pct=%s payload=%s",
-                        tsym, score_result.band, score_result.score, scale_out.exit_pct, payload,
+                        "SCALE_OUT tsym=%s band=%s score=%.2f exit_pct=%s reason=%s",
+                        tsym, score_result.band, score_result.score,
+                        scale_out.exit_pct, scale_out.reason,
                     )
+                elif score_result.band == "RED" and st.oi > 0:
+                    log.debug("RED tsym=%s score=%.2f size=0", tsym, score_result.score)
                 else:
-                    log.debug("EMIT tsym=%s band=%s score=%.2f", tsym, score_result.band, score_result.score)
+                    log.debug(
+                        "EMIT tsym=%s band=%s score=%.2f size=%s",
+                        tsym, score_result.band, score_result.score, ent.final_entry_size,
+                    )
 
 
 if __name__ == "__main__":

@@ -9,15 +9,60 @@ log = setup_logger("entry_trigger")
 
 _BULLISH_VOLUME = frozenset({"Bullish Volume", "Strong Bullish Volume"})
 _BEARISH_VOLUME = frozenset({"Bearish Volume", "Strong Bearish Volume"})
+_CALL_LEVELS = frozenset({"P", "R1", "R2"})
+_PUT_LEVELS = frozenset({"P", "S1", "S2"})
 
 
 @dataclass(frozen=True)
 class EntryTriggerResult:
     signal: str  # "BUY CALL" / "BUY PUT" / "NEUTRAL"
     strength: str  # "strong" / "base" / ""
-    level: str  # "P" / "R1" / "S1" / ...
+    level: str  # "R1" / "R2" / "P" / "S1" / "S2" / ""
     reason: str = ""
-    oi_target_strike: Optional[float] = None  # OI resistance (CALL) / support (PUT), if available
+    oi_target_strike: Optional[float] = None
+    module1_signal: str = "NEUTRAL"
+    module1_reason: str = ""
+
+
+def _module1_decision(
+    bias: str,
+    state: str,
+    lvl_sig: str,
+    lvl: str,
+    strength_in: str,
+) -> tuple[str, str, str]:
+    """
+    Spec Module 1 only: Supertrend + EMA9/26 + pivot break.
+    HTF / volume / OI / Greeks are applied later as confirmation gates.
+    """
+    strong_call = lvl in ("R1", "R2") or strength_in == "strong"
+    strong_put = lvl in ("S1", "S2") or strength_in == "strong"
+
+    if bias == "CALL" and state == "bullish" and lvl_sig == "BUY CALL" and lvl in _CALL_LEVELS:
+        out_strength = strength_in or ("strong" if strong_call else "base")
+        return "BUY CALL", out_strength, f"st_ema_level({lvl})"
+    if bias == "PUT" and state == "bearish" and lvl_sig == "BUY PUT" and lvl in _PUT_LEVELS:
+        out_strength = strength_in or ("strong" if strong_put else "base")
+        return "BUY PUT", out_strength, f"st_ema_level({lvl})"
+
+    parts = []
+    if bias not in ("CALL", "PUT"):
+        parts.append(f"st={bias or 'na'}")
+    if state not in ("bullish", "bearish"):
+        parts.append(f"ema={state or 'na'}")
+    if bias == "CALL" and state != "bullish":
+        parts.append(f"ema_not_bullish({state or 'na'})")
+    if bias == "PUT" and state != "bearish":
+        parts.append(f"ema_not_bearish({state or 'na'})")
+    if lvl_sig not in ("BUY CALL", "BUY PUT"):
+        parts.append(f"no_pivot_break({lvl_sig or 'na'})")
+    elif bias == "CALL" and (lvl_sig != "BUY CALL" or lvl not in _CALL_LEVELS):
+        parts.append(f"call_level_mismatch({lvl_sig},{lvl})")
+    elif bias == "PUT" and (lvl_sig != "BUY PUT" or lvl not in _PUT_LEVELS):
+        parts.append(f"put_level_mismatch({lvl_sig},{lvl})")
+    if not parts:
+        parts.append("unaligned")
+    return "NEUTRAL", "", "|".join(parts)
 
 
 def entry_trigger(
@@ -35,22 +80,8 @@ def entry_trigger(
     greeks_phase_pe: str = "",
 ) -> EntryTriggerResult:
     """
-    Final entry: HTF D/W/M + Supertrend bias + EMA9/26 + pivot level break
-    + volume + OI positioning + Greeks phase (Market Breadth -> OI Flow ->
-    Volume Imbalance -> Greeks Analyzer -> Strike Selection chain).
-
-    CALL: HTF CALL + ST CALL + EMA bullish + break P (base) or R1 (strong)
-          + Bullish / Strong Bullish Volume + BULLISH_POSITIONING (OI)
-          + ATM CE Greeks phase == MARKUP
-    PUT:  HTF PUT  + ST PUT  + EMA bearish + break P (base) or S1 (strong)
-          + Bearish / Strong Bearish Volume + BEARISH_POSITIONING (OI)
-          + ATM PE Greeks phase == MARKUP
-
-    When OI positioning aligns, the fired result carries oi_target_strike
-    (the OI resistance level for a CALL breakout, or OI support level for a
-    PUT breakdown) so run_strike_select.py can prefer that strike over the
-    default ATM/offset logic — "select strike near resistance breakout"
-    per the integration brief's worked example.
+    Module 1 (ST + EMA + pivot) is computed independently of confirmation
+    gates (HTF, volume, OI, Greeks MARKUP). Final BUY requires both.
     """
     htf = (htf_bias or "").strip().upper()
     bias = (st_bias or "").strip().upper()
@@ -63,62 +94,113 @@ def entry_trigger(
     gp_ce = (greeks_phase_ce or "").strip().upper()
     gp_pe = (greeks_phase_pe or "").strip().upper()
 
-    call_ok = htf == "CALL" and bias == "CALL" and state == "bullish"
-    put_ok = htf == "PUT" and bias == "PUT" and state == "bearish"
+    m1_signal, m1_strength, m1_reason = _module1_decision(
+        bias, state, lvl_sig, lvl, strength_in
+    )
+
     vol_call_ok = vol in _BULLISH_VOLUME
     vol_put_ok = vol in _BEARISH_VOLUME
     oi_call_ok = oi_pos == "BULLISH_POSITIONING"
     oi_put_ok = oi_pos == "BEARISH_POSITIONING"
     greeks_call_ok = gp_ce == "MARKUP"
     greeks_put_ok = gp_pe == "MARKUP"
+    htf_call_ok = htf == "CALL"
+    htf_put_ok = htf == "PUT"
 
-    log.debug(
-        "LOGIC_IN htf=%s st=%s ema=%s lvl_sig=%s lvl=%s strength=%s vol=%s oi_pos=%s "
-        "gp_ce=%s gp_pe=%s call_ok=%s put_ok=%s vol_call_ok=%s vol_put_ok=%s "
-        "oi_call_ok=%s oi_put_ok=%s greeks_call_ok=%s greeks_put_ok=%s",
-        htf, bias, state, lvl_sig, lvl, strength_in, vol, oi_pos,
-        gp_ce, gp_pe, call_ok, put_ok, vol_call_ok, vol_put_ok,
-        oi_call_ok, oi_put_ok, greeks_call_ok, greeks_put_ok,
+    log.info(
+        "GATES module1=%s(%s) htf=%s st=%s ema=%s vol=%s oi=%s gp_ce=%s gp_pe=%s lvl=%s/%s",
+        m1_signal,
+        m1_reason,
+        htf or "na",
+        bias or "na",
+        state or "na",
+        vol or "na",
+        oi_pos or "na",
+        gp_ce or "na",
+        gp_pe or "na",
+        lvl_sig or "na",
+        lvl or "na",
     )
 
-    if call_ok and vol_call_ok and oi_call_ok and greeks_call_ok and lvl_sig == "BUY CALL" and lvl in ("P", "R1"):
-        out_strength = strength_in or ("strong" if lvl == "R1" else "base")
-        if vol.startswith("Strong"):
-            out_strength = "strong"
-        result = EntryTriggerResult("BUY CALL", out_strength, lvl, "aligned_call", oi_target_strike=oi_resistance)
-        log.debug("LOGIC_OUT %s", result)
+    if m1_signal == "BUY CALL":
+        fails = []
+        if not htf_call_ok:
+            fails.append(f"htf_fail({htf or 'na'})")
+        if not vol_call_ok:
+            fails.append(f"volume_fail({vol or 'na'})")
+        if not oi_call_ok:
+            fails.append(f"oi_positioning_fail({oi_pos or 'na'})")
+        if not greeks_call_ok:
+            fails.append(f"greeks_phase_fail(phase_ce={gp_ce or 'na'})")
+        if not fails:
+            out_strength = m1_strength
+            if vol.startswith("Strong"):
+                out_strength = "strong"
+            result = EntryTriggerResult(
+                "BUY CALL",
+                out_strength,
+                lvl,
+                "aligned_call",
+                oi_target_strike=oi_resistance,
+                module1_signal=m1_signal,
+                module1_reason=m1_reason,
+            )
+            log.info("LOGIC_OUT %s", result)
+            return result
+        result = EntryTriggerResult(
+            "NEUTRAL",
+            "",
+            lvl,
+            "|".join(fails),
+            module1_signal=m1_signal,
+            module1_reason=m1_reason,
+        )
+        log.info("LOGIC_OUT %s", result)
         return result
 
-    if put_ok and vol_put_ok and oi_put_ok and greeks_put_ok and lvl_sig == "BUY PUT" and lvl in ("P", "S1"):
-        out_strength = strength_in or ("strong" if lvl == "S1" else "base")
-        if vol.startswith("Strong"):
-            out_strength = "strong"
-        result = EntryTriggerResult("BUY PUT", out_strength, lvl, "aligned_put", oi_target_strike=oi_support)
-        log.debug("LOGIC_OUT %s", result)
+    if m1_signal == "BUY PUT":
+        fails = []
+        if not htf_put_ok:
+            fails.append(f"htf_fail({htf or 'na'})")
+        if not vol_put_ok:
+            fails.append(f"volume_fail({vol or 'na'})")
+        if not oi_put_ok:
+            fails.append(f"oi_positioning_fail({oi_pos or 'na'})")
+        if not greeks_put_ok:
+            fails.append(f"greeks_phase_fail(phase_pe={gp_pe or 'na'})")
+        if not fails:
+            out_strength = m1_strength
+            if vol.startswith("Strong"):
+                out_strength = "strong"
+            result = EntryTriggerResult(
+                "BUY PUT",
+                out_strength,
+                lvl,
+                "aligned_put",
+                oi_target_strike=oi_support,
+                module1_signal=m1_signal,
+                module1_reason=m1_reason,
+            )
+            log.info("LOGIC_OUT %s", result)
+            return result
+        result = EntryTriggerResult(
+            "NEUTRAL",
+            "",
+            lvl,
+            "|".join(fails),
+            module1_signal=m1_signal,
+            module1_reason=m1_reason,
+        )
+        log.info("LOGIC_OUT %s", result)
         return result
 
-    reasons = []
-    if not call_ok and not put_ok:
-        reasons.append(f"filters_fail(htf={htf},st={bias},ema={state})")
-    elif call_ok and not vol_call_ok:
-        reasons.append(f"volume_fail(vol={vol})")
-    elif put_ok and not vol_put_ok:
-        reasons.append(f"volume_fail(vol={vol})")
-    elif call_ok and not oi_call_ok:
-        reasons.append(f"oi_positioning_fail(oi_pos={oi_pos})")
-    elif put_ok and not oi_put_ok:
-        reasons.append(f"oi_positioning_fail(oi_pos={oi_pos})")
-    elif call_ok and not greeks_call_ok:
-        reasons.append(f"greeks_phase_fail(phase_ce={gp_ce})")
-    elif put_ok and not greeks_put_ok:
-        reasons.append(f"greeks_phase_fail(phase_pe={gp_pe})")
-    elif call_ok and (lvl_sig != "BUY CALL" or lvl not in ("P", "R1")):
-        reasons.append(f"call_level_mismatch(sig={lvl_sig},lvl={lvl})")
-    elif put_ok and (lvl_sig != "BUY PUT" or lvl not in ("P", "S1")):
-        reasons.append(f"put_level_mismatch(sig={lvl_sig},lvl={lvl})")
-    else:
-        reasons.append("neutral")
-
-    result = EntryTriggerResult("NEUTRAL", "", lvl if lvl else "", "|".join(reasons))
-    log.debug("LOGIC_OUT %s", result)
+    result = EntryTriggerResult(
+        "NEUTRAL",
+        "",
+        lvl if lvl else "",
+        m1_reason,
+        module1_signal=m1_signal,
+        module1_reason=m1_reason,
+    )
+    log.info("LOGIC_OUT %s", result)
     return result

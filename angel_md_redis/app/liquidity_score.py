@@ -7,20 +7,14 @@ Liquidity Score Module for Option Chain — Module 1 (Entry Size Calculator)
 Deliberately reuses signals this pipeline already computes rather than
 re-deriving them:
   - spread% vs rolling average  -> from run_bidask_analyzer.py (md:bidask:latest)
-  - OI change                    -> from run_oi_analysis.py (md:oi:latest)
-  - book depth top-5             -> from md:ticks:opt directly
+  - book depth top-5             -> from md:ticks:opt / bidask liquidity_score
 
-Two data points the brief wants that this pipeline doesn't store anywhere
-(flagged, not silently assumed away):
+Data approximations (flagged, not silently assumed away):
   - "Average daily volume" (multi-day). No historical daily-volume archive
-    exists here yet -> approximated with an intraday rolling average of
-    period volume (same RollingStat pattern as oi_analysis's
-    AVG_VOLUME_WINDOW). This is today's volume texture, not a true
-    multi-day average. Swap in a real daily-volume store if you build one.
+    exists yet -> volume cap uses session cumulative volume (today's
+    `volume_trade_for_the_day`) x 5%. Swap in a real ADV store if you build one.
   - "OI jumped >20% overnight" (gamma proxy). No prior-calendar-day OI
-    snapshot exists -> approximated with SESSION-OPEN OI (first OI value
-    seen for that contract each trading day, reset at day change) vs
-    current OI. Same caveat as above.
+    snapshot exists -> approximated with SESSION-OPEN OI vs current OI.
 
 No I/O here — pure dataclasses + functions/classes. Redis wiring lives in
 run_liquidity_score.py.
@@ -29,13 +23,13 @@ run_liquidity_score.py.
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional
 
 # ── Module 1: Entry Size ────────────────────────────────────────────────
 
 OI_CAP_PCT = 0.015          # 1.5% of OI (brief's "1-2%" -> mid-point default)
-VOLUME_CAP_PCT = 0.05       # 5% of (approximated) average daily volume
+VOLUME_CAP_PCT = 0.05       # 5% of session / average daily volume
 BOOK_DEPTH_MULT = 10.0      # 10x top-3 bid size
 
 VOL_OI_HOT = 3.0
@@ -51,6 +45,14 @@ _CONFIDENCE_ROWS = [
     (0.0, float("inf"), 0.2),
 ]
 
+# Spec Module 8.3 band actions applied to final entry size.
+BAND_SIZE_MULT = {
+    "GREEN": 1.0,    # full size
+    "YELLOW": 0.6,   # reduce 40%
+    "ORANGE": 0.2,   # probe size
+    "RED": 0.0,      # do not enter
+}
+
 
 def vol_oi_ratio(volume: float, oi: float) -> Optional[float]:
     if not oi or oi <= 0:
@@ -65,7 +67,7 @@ def classify_vol_oi(ratio: Optional[float]) -> str:
         return "UNUSUAL"
     if ratio > VOL_OI_ACTIVE:
         return "HOT"
-    if ratio > VOL_OI_NORMAL_HI:
+    if ratio >= VOL_OI_NORMAL_HI:  # spec: 0.5–1.5 Active
         return "ACTIVE"
     if ratio >= VOL_OI_NORMAL_LO:
         return "NORMAL"
@@ -108,10 +110,10 @@ def expected_oi_change(current_oi: float, volume: float, opening_ratio: float) -
 def _confidence_multiplier(ratio: Optional[float], spread_ratio: Optional[float]) -> float:
     """
     Two-column table (Vol/OI band, spread-vs-avg band) -> multiplier.
-    When the two columns point to different rows (e.g. high vol/oi but a
-    wide spread), take the MORE CONSERVATIVE (lower) of the two matches —
-    the brief doesn't specify how to combine a disagreement, and a wide
-    spread is a real fill-quality risk regardless of how hot the volume is.
+    When the two columns point to different rows, take the MORE CONSERVATIVE
+    (lower) of the two matches. Unusual Vol/OI (>3.0) is capped at the
+    probe multiplier regardless of spread — spec flags it as reversal risk,
+    not full-size liquidity.
     """
     if ratio is None:
         m_vol = 0.2
@@ -121,14 +123,13 @@ def _confidence_multiplier(ratio: Optional[float], spread_ratio: Optional[float]
             if ratio >= min_ratio:
                 m_vol = mult
                 break
+        if ratio > VOL_OI_HOT:
+            m_vol = min(m_vol, 0.2)
 
     if spread_ratio is None:
         m_spread = 0.2
     else:
         m_spread = 0.2
-        # spread_ratio ASCENDS with the row index in the table (tighter
-        # spread = better = higher multiplier), so walk rows in order and
-        # take the last one whose ceiling still admits this spread.
         for _min_ratio, max_spread, mult in _CONFIDENCE_ROWS:
             if spread_ratio <= max_spread:
                 m_spread = mult
@@ -150,6 +151,7 @@ class EntrySizeResult:
     expected_oi: float
     opening_ratio: float
     reason: str
+    band_size_mult: float = 1.0
 
 
 def entry_size(
@@ -161,33 +163,53 @@ def entry_size(
     price_moving_toward_strike: Optional[bool] = None,
 ) -> EntrySizeResult:
     oi = max(oi, 0.0)
-    avg_daily_volume = avg_daily_volume or 0.0
     today_volume = max(today_volume, 0.0)
     bid_top3_size = max(bid_top3_size, 0.0)
+    # Session cumulative volume is the ADV proxy until a multi-day store exists.
+    volume_for_cap = max(float(avg_daily_volume or 0.0), today_volume)
 
     oi_cap = round(oi * OI_CAP_PCT, 2)
-    volume_cap = round(avg_daily_volume * VOLUME_CAP_PCT, 2)
+    volume_cap = round(volume_for_cap * VOLUME_CAP_PCT, 2)
     depth_cap = round(bid_top3_size * BOOK_DEPTH_MULT, 2)
-
-    caps = [c for c in (oi_cap, volume_cap, depth_cap) if c > 0]
-    max_safe = min(caps) if caps else 0.0
 
     ratio = vol_oi_ratio(today_volume, oi)
     ratio_class = classify_vol_oi(ratio)
     mult = _confidence_multiplier(ratio, spread_ratio)
-
     opening_ratio = estimate_opening_ratio(ratio, price_moving_toward_strike)
     exp_oi = expected_oi_change(oi, today_volume, opening_ratio)
 
-    final = round(max_safe * mult, 2)
+    if oi <= 0:
+        max_safe = 0.0
+        reason = "no_oi"
+    else:
+        # Spec: MIN of the three caps. A zero cap is a hard block, not a skip.
+        max_safe = min(oi_cap, volume_cap, depth_cap)
+        reason = "ok" if max_safe > 0 else "no_liquidity_data"
 
-    reason = "ok" if max_safe > 0 else "no_liquidity_data"
+    final = round(max_safe * mult, 2)
     return EntrySizeResult(
         oi_cap=oi_cap, volume_cap=volume_cap, depth_cap=depth_cap,
         max_safe_entry=max_safe, vol_oi=ratio, vol_oi_class=ratio_class,
         confidence_multiplier=mult, final_entry_size=final,
         expected_oi=exp_oi, opening_ratio=opening_ratio, reason=reason,
     )
+
+
+def apply_band_to_entry(entry: EntrySizeResult, band: str) -> EntrySizeResult:
+    """Apply Green/Yellow/Orange/Red size action after the composite score."""
+    band_mult = BAND_SIZE_MULT.get(band, 0.0)
+    if entry.max_safe_entry <= 0:
+        return replace(entry, final_entry_size=0.0, band_size_mult=band_mult)
+    if band == "RED" or band_mult <= 0:
+        reason = "red_do_not_enter" if band == "RED" else entry.reason
+        return replace(
+            entry,
+            final_entry_size=0.0,
+            band_size_mult=0.0,
+            reason=reason,
+        )
+    final = round(entry.max_safe_entry * entry.confidence_multiplier * band_mult, 2)
+    return replace(entry, final_entry_size=final, band_size_mult=band_mult)
 
 
 # ── Session-open OI tracker (for the gamma-jump proxy) ──────────────────
@@ -225,6 +247,7 @@ GAMMA_JUMP_PCT = 20.0            # overnight/session OI jump -> "gamma building 
 OI_WALL_MULT = 2.0               # next strike OI > 2x current -> "wall ahead"
 SPREAD_SCALE_TRIGGER = 1.4       # spread% > 1.4x session avg -> scale-out check
 PRICE_NEAR_STRIKE_PCT = 0.5      # price within 0.5% of a target strike -> "approaching"
+VOL_OI_DROP_PCT = 5.0            # Vol/OI must fall at least 5% vs prior eval
 
 # Liquidity degradation curve multipliers by underlying-move band (Method C)
 _DEGRADATION_BANDS = [
@@ -262,6 +285,12 @@ def gamma_speed_bump_strikes(
     )
 
 
+def approaching_strike(spot: Optional[float], strike: float, pct: float = PRICE_NEAR_STRIKE_PCT) -> bool:
+    if not spot or strike <= 0:
+        return False
+    return abs(spot - strike) / strike * 100.0 <= pct
+
+
 def degradation_multiplier(underlying_move_pct: float) -> float:
     """Method C. underlying_move_pct is the ABS % move since entry."""
     mult = _DEGRADATION_BANDS[0][1]
@@ -269,6 +298,18 @@ def degradation_multiplier(underlying_move_pct: float) -> float:
         if underlying_move_pct >= band_pct:
             mult = band_mult
     return mult
+
+
+def vol_oi_is_dropping(
+    current: Optional[float],
+    previous: Optional[float],
+    min_drop_pct: float = VOL_OI_DROP_PCT,
+) -> bool:
+    """Spec condition 4: Vol/OI on the current strike is falling."""
+    if current is None or previous is None or previous <= 0:
+        return False
+    drop_pct = (previous - current) / previous * 100.0
+    return drop_pct >= min_drop_pct
 
 
 @dataclass(frozen=True)
@@ -285,21 +326,29 @@ def scale_out_decision(
     next_strike_oi_is_wall: bool,
     vol_oi_dropping: bool,
     net_delta_flattening: bool,
+    in_position: bool = False,
+    approaching_gamma_bump: bool = False,
 ) -> ScaleOutCheck:
     """
-    Decision matrix: 2-of-5 met -> 25%, 3-of-5 -> 40%, 4+/5 -> 65%
-    (midpoint of the brief's "60-70%"), trailing a stop on the remainder
-    in the 4+ case is a position-management action for the caller, not
-    represented in this return value.
+    Decision matrix: 2-of-5 met -> 25%, 3-of-5 -> 40%, 4+/5 -> 65%.
+    Scale-out % is 0 unless an actual position is open (spec is in-trade).
+    Approaching a Method-B gamma speed-bump counts as the OI-cluster condition
+    (scale out before price reaches that strike).
     """
     conditions = {
-        "near_top_oi_strike": price_near_top_oi_strike,
+        "near_top_oi_strike": bool(price_near_top_oi_strike or approaching_gamma_bump),
         "spread_widened": spread_ratio_vs_avg is not None and spread_ratio_vs_avg > SPREAD_SCALE_TRIGGER,
         "oi_wall_ahead": next_strike_oi_is_wall,
         "vol_oi_dropping": vol_oi_dropping,
         "delta_flattening": net_delta_flattening,
     }
     n = sum(1 for v in conditions.values() if v)
+
+    if not in_position:
+        return ScaleOutCheck(
+            conditions=conditions, conditions_met=n, exit_pct=0,
+            reason="no_open_position",
+        )
 
     if n >= 4:
         exit_pct = 65
@@ -327,10 +376,26 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
-def vol_oi_component(ratio: Optional[float], cap: float = 3.0, max_pts: float = 30.0) -> float:
-    if ratio is None:
+def vol_oi_component(ratio: Optional[float], max_pts: float = 30.0) -> float:
+    """
+    Vol/OI score peaks in the Active band (0.5–1.5). Stale is low; Hot
+    decays; Unusual (>3.0) is capped well below Green-making points.
+    """
+    if ratio is None or ratio <= 0:
         return 0.0
-    return round(_clamp(ratio / cap, 0.0, 1.0) * max_pts, 2)
+    if ratio < VOL_OI_NORMAL_LO:
+        pts = (ratio / VOL_OI_NORMAL_LO) * 8.0
+    elif ratio < VOL_OI_NORMAL_HI:
+        pts = 8.0 + (ratio - VOL_OI_NORMAL_LO) / (VOL_OI_NORMAL_HI - VOL_OI_NORMAL_LO) * 14.0
+    elif ratio <= 1.0:
+        pts = 22.0 + (ratio - VOL_OI_NORMAL_HI) / 0.5 * 8.0
+    elif ratio <= VOL_OI_ACTIVE:
+        pts = 30.0 - (ratio - 1.0) / (VOL_OI_ACTIVE - 1.0) * 4.0
+    elif ratio <= VOL_OI_HOT:
+        pts = 26.0 - (ratio - VOL_OI_ACTIVE) / (VOL_OI_HOT - VOL_OI_ACTIVE) * 14.0
+    else:
+        pts = max(6.0, 12.0 - (ratio - VOL_OI_HOT) * 2.0)
+    return round(_clamp(pts, 0.0, max_pts), 2)
 
 
 def spread_component(spread_ratio: Optional[float], max_pts: float = 25.0) -> float:
@@ -348,11 +413,21 @@ def oi_rank_component(rank: Optional[int], total: int, max_pts: float = 20.0) ->
     return round(_clamp(1.0 - (rank - 1) / total, 0.0, 1.0) * max_pts, 2)
 
 
-def oi_expansion_component(current_oi: float, expected_oi: float, max_pts: float = 15.0) -> float:
+def oi_expansion_component(
+    current_oi: float,
+    expected_oi: float,
+    vol_oi: Optional[float] = None,
+    max_pts: float = 15.0,
+) -> float:
     if current_oi <= 0:
         return 0.0
     growth_pct = (expected_oi - current_oi) / current_oi * 100.0
-    return round(_clamp(growth_pct / 20.0, 0.0, 1.0) * max_pts, 2)
+    pts = _clamp(growth_pct / 20.0, 0.0, 1.0) * max_pts
+    if vol_oi is not None and vol_oi > VOL_OI_HOT:
+        pts *= 0.25
+    elif vol_oi is not None and vol_oi > VOL_OI_ACTIVE:
+        pts *= 0.6
+    return round(pts, 2)
 
 
 def depth_component(bidask_liquidity_score_0_100: Optional[float], max_pts: float = 10.0) -> float:
@@ -394,9 +469,10 @@ def compute_liquidity_score(
         "vol_oi": vol_oi_component(vol_oi),
         "spread": spread_component(spread_ratio),
         "oi_rank": oi_rank_component(oi_rank, chain_size),
-        "oi_expansion": oi_expansion_component(current_oi, expected_oi),
+        "oi_expansion": oi_expansion_component(current_oi, expected_oi, vol_oi),
         "depth": depth_component(bidask_depth_score),
     }
     score = round(sum(components.values()), 2)
     band = classify_score_band(score)
-    return LiquidityScoreResult(score=score, band=band, components=components, entry_size=entry)
+    sized = apply_band_to_entry(entry, band)
+    return LiquidityScoreResult(score=score, band=band, components=components, entry_size=sized)

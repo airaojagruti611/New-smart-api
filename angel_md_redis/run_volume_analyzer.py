@@ -272,7 +272,7 @@ def main():
                     f"Buy:{result.buy_pct:.1f}%",
                     f"Sell:{result.sell_pct:.1f}%",
                     f"Surge:{result.volume_surge}",
-                    f"→ {result.signal}",
+                    f"-> {result.signal}",
                 )
 
                 candle.reset()

@@ -18,6 +18,8 @@ import redis
 
 from app.candle_types import Candle
 from app.candles_store import CandlesStore
+from app.config import load_symbols
+from app.history_bootstrap import seed_pivots_from_daily
 from app.pivots import classic_pivots
 
 
@@ -75,14 +77,17 @@ def main():
     r = redis.from_url(REDIS_URL, decode_responses=True)
     ensure_group(r, IN_1D_STREAM, GROUP)
     store = CandlesStore()
+    symbols = load_symbols()
 
-    # Keep last daily candle per symbol so we can compute pivots for the next day.
-    prev_day_by_symbol: Dict[str, Tuple[str, Candle]] = {}
+    # Latest written daily ts so we do not re-emit identical bars.
+    last_ts_by_symbol: Dict[str, int] = {}
 
     print(
         f"[PIVOTS] reading {IN_1D_STREAM} -> writing md:pivots:prevday:{{SYMBOL}} "
         f"and stream {OUT_STREAM}"
     )
+    n = seed_pivots_from_daily(r, symbols, store=store)
+    print(f"[PIVOTS] seeded {n} symbols from existing daily candles")
 
     while True:
         resp = r.xreadgroup(
@@ -104,29 +109,28 @@ def main():
                     continue
 
                 sym, date_str, day_candle = parsed
+                if last_ts_by_symbol.get(sym) == day_candle.ts_ms:
+                    continue
 
-                # When we receive a new daily candle, compute pivots from the previous one (if exists)
-                if sym in prev_day_by_symbol:
-                    prev_date, prev_candle = prev_day_by_symbol[sym]
-                    p = classic_pivots(prev_candle, date=prev_date or date_str or "")
-                    store.write_pivots_prevday(f"md:pivots:prevday:{sym}", p)
-                    r.xadd(
-                        OUT_STREAM,
-                        {
-                            "ts_ms": str(int(prev_candle.ts_ms)),
-                            "symbol": sym,
-                            "date": p.date,
-                            "P": f"{p.P:.2f}",
-                            "R1": f"{p.R1:.2f}",
-                            "S1": f"{p.S1:.2f}",
-                            "R2": f"{p.R2:.2f}",
-                            "S2": f"{p.S2:.2f}",
-                        },
-                        maxlen=OUT_MAXLEN,
-                        approximate=True,
-                    )
-
-                prev_day_by_symbol[sym] = (date_str, day_candle)
+                # Closed daily bar is the source for the NEXT session's pivots.
+                p = classic_pivots(day_candle, date=date_str or "")
+                store.write_pivots_prevday(f"md:pivots:prevday:{sym}", p)
+                r.xadd(
+                    OUT_STREAM,
+                    {
+                        "ts_ms": str(int(day_candle.ts_ms)),
+                        "symbol": sym,
+                        "date": p.date,
+                        "P": f"{p.P:.2f}",
+                        "R1": f"{p.R1:.2f}",
+                        "S1": f"{p.S1:.2f}",
+                        "R2": f"{p.R2:.2f}",
+                        "S2": f"{p.S2:.2f}",
+                    },
+                    maxlen=OUT_MAXLEN,
+                    approximate=True,
+                )
+                last_ts_by_symbol[sym] = day_candle.ts_ms
 
             if ack_ids:
                 r.xack(IN_1D_STREAM, GROUP, *ack_ids)

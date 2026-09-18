@@ -11,15 +11,17 @@ It does not modify or depend on existing regime/volume workers.
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 import time
 from typing import Dict, Optional
 
 import redis
 
-from app.config import load_symbols
 from app.candle_builder import CandleBuilder1d, CandleBuilder1m
 from app.candles_store import CandlesStore
+from app.config import load_symbols
+from app.history_bootstrap import seed_history_if_needed
 
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -69,6 +71,9 @@ def main():
 
     r = redis.from_url(REDIS_URL, decode_responses=True)
     ensure_group(r, EQ_STREAM, GROUP)
+
+    print("[CANDLES] seeding historical 1d/1m/5m/10m/30m if streams are short...")
+    seed_history_if_needed(r, list(symbols))
 
     store = CandlesStore()
 
@@ -131,7 +136,8 @@ def main():
 
                 closed_1d = cb_1d[sym].update_tick(ts_ms=ts_ms, ltp=ltp, vol_delta=tick_vol)
                 if closed_1d is not None:
-                    store.write_candle(OUT_1D_STREAM, OUT_MAXLEN_1D, sym, "1d", closed_1d)
+                    date_str = dt.datetime.fromtimestamp(closed_1d.ts_ms / 1000.0).date().isoformat()
+                    store.write_candle(OUT_1D_STREAM, OUT_MAXLEN_1D, sym, "1d", closed_1d, date=date_str)
 
             if ack_ids:
                 r.xack(EQ_STREAM, GROUP, *ack_ids)

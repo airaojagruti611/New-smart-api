@@ -110,7 +110,7 @@ def _start_threads(names: list[str]) -> None:
         t.start()
         threads.append(t)
 
-    print(f"[ARCH_LAYERS] {len(threads)} parquet archivers running → {OUT_DIR}/")
+    print(f"[ARCH_LAYERS] {len(threads)} parquet archivers running -> {OUT_DIR}/")
     for t in threads:
         t.join()
 

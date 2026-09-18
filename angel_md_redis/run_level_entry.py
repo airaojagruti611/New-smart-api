@@ -17,6 +17,7 @@ from typing import Dict, Optional
 import redis
 
 from app.config import load_symbols
+from app.candle_io import read_last_candles
 from app.level_entry import level_entry, parse_pivots_payload
 from app.logging_setup import setup_logger
 
@@ -92,6 +93,12 @@ def main():
         OUT_STREAM,
         len(symbols),
     )
+
+    for sym in symbols:
+        bars = read_last_candles(r, IN_1M, sym, limit=1, scan=2000)
+        if bars:
+            prev_close_by_symbol[sym] = bars[-1].c
+            log.info("SEED prev_close symbol=%s close=%.4f", sym, bars[-1].c)
 
     while True:
         resp = r.xreadgroup(

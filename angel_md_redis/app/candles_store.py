@@ -7,8 +7,8 @@ from .redis_store import RedisStore
 from .candle_types import Candle, PivotLevels
 
 
-def candle_to_payload(symbol: str, tf: str, c: Candle) -> Dict[str, str]:
-    return {
+def candle_to_payload(symbol: str, tf: str, c: Candle, date: str = "") -> Dict[str, str]:
+    payload = {
         "ts_ms": str(int(c.ts_ms)),
         "symbol": str(symbol).upper(),
         "tf": tf,
@@ -18,6 +18,9 @@ def candle_to_payload(symbol: str, tf: str, c: Candle) -> Dict[str, str]:
         "c": f"{c.c:.2f}",
         "v": f"{c.v:.0f}",
     }
+    if date:
+        payload["date"] = date
+    return payload
 
 
 def pivots_to_json(p: PivotLevels) -> str:
@@ -36,8 +39,10 @@ class CandlesStore:
     def __init__(self):
         self.rs = RedisStore()
 
-    def write_candle(self, stream: str, maxlen: int, symbol: str, tf: str, c: Candle) -> None:
-        self.rs.xadd(stream, candle_to_payload(symbol, tf, c), maxlen=maxlen)
+    def write_candle(
+        self, stream: str, maxlen: int, symbol: str, tf: str, c: Candle, date: str = ""
+    ) -> None:
+        self.rs.xadd(stream, candle_to_payload(symbol, tf, c, date=date), maxlen=maxlen)
 
     def write_pivots_prevday(self, key: str, p: PivotLevels, ex_sec: int = 7 * 24 * 3600) -> None:
         self.rs.set_latest(key, pivots_to_json(p), ex_sec=ex_sec)

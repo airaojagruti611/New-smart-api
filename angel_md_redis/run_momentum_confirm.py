@@ -5,6 +5,7 @@ import time
 import redis
 
 from app.config import load_symbols
+from app.indicator_score import compute_indicator_score
 from app.logging_setup import setup_logger
 from app.momentum_confirm import momentum_confirm
 
@@ -16,6 +17,8 @@ IN_EMA = os.getenv("STREAM_EMA_CROSS", "md:ema:cross")
 
 ST_LATEST_PREFIX = os.getenv("SUPERTREND_BIAS_LATEST_PREFIX", "md:supertrend:bias:latest:")
 EMA_LATEST_PREFIX = os.getenv("EMA_CROSS_LATEST_PREFIX", "md:ema:cross:latest:")
+LEVEL_LATEST_PREFIX = os.getenv("LEVEL_ENTRY_LATEST_PREFIX", "md:level:entry:latest:")
+INDICATOR_SCORE_LATEST_PREFIX = os.getenv("INDICATOR_SCORE_LATEST_PREFIX", "md:indicator:score:latest:")
 
 OUT_STREAM = os.getenv("STREAM_MOMENTUM_CONFIRM", "md:momentum:confirm")
 OUT_MAXLEN = int(os.getenv("STREAM_MAXLEN_MOMENTUM_CONFIRM", "200000"))
@@ -140,6 +143,17 @@ def main():
             ema_state = str(ema.get("state") or "").strip()
             signal = momentum_confirm(st_bias, ema_state)
 
+            level = _load_latest(r, f"{LEVEL_LATEST_PREFIX}{sym}") or {}
+            scored = compute_indicator_score(
+                st_bias=st_bias,
+                ema_state=ema_state,
+                st_bullish=st.get("bullish") or 0,
+                st_bearish=st.get("bearish") or 0,
+                level_signal=str(level.get("signal") or ""),
+                level=str(level.get("level") or ""),
+                strength=str(level.get("strength") or ""),
+            )
+
             payload = {
                 "ts_ms": str(now_ms),
                 "symbol": sym,
@@ -153,20 +167,40 @@ def main():
                 "st_10m": str(st.get("st_10m") or ""),
                 "st_5m": str(st.get("st_5m") or ""),
                 "st_1m": str(st.get("st_1m") or ""),
+                "indicator_score": f"{scored.score:.1f}",
+                "indicator_label": scored.label,
+                "indicator_reason": scored.reason,
             }
 
             log.info(
-                "LOGIC symbol=%s st=%s ema=%s -> signal=%s",
+                "LOGIC symbol=%s st=%s ema=%s -> signal=%s score=%s (%s)",
                 sym,
                 st_bias,
                 ema_state,
                 signal,
+                scored.score,
+                scored.label,
             )
 
             r.xadd(OUT_STREAM, payload, maxlen=OUT_MAXLEN, approximate=True)
             r.set(
                 f"{LATEST_KEY_PREFIX}{sym}",
                 json.dumps(payload, separators=(",", ":")),
+                ex=3600,
+            )
+            score_payload = {
+                "ts_ms": str(now_ms),
+                "symbol": sym,
+                "score": f"{scored.score:.1f}",
+                "label": scored.label,
+                "reason": scored.reason,
+                "signal": signal,
+                "st_bias": st_bias,
+                "ema_state": ema_state,
+            }
+            r.set(
+                f"{INDICATOR_SCORE_LATEST_PREFIX}{sym}",
+                json.dumps(score_payload, separators=(",", ":")),
                 ex=3600,
             )
 

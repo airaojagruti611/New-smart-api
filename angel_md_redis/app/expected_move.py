@@ -12,11 +12,12 @@ Inputs (all optional except a valid spot for a numeric range):
   indicator_score (-2..+2), volume_score (-2..+2),
   bidask_score (-1..+1), oi_score (-2..+2)
 
-Two inputs have NO upstream source anywhere in this pipeline today:
-  - indicator_score      (no Indicator module publishes a -2..+2 score)
+Two inputs historically had no upstream source:
+  - indicator_score      now published by run_momentum_confirm.py
+                         (md:indicator:score:latest:{SYMBOL})
   - realized_volatility  (no RV calculator publishes a vol number)
-Callers MUST pass these as None. They are flagged in data_quality_flags
-and treated as 0.0 / unused — never fabricated.
+Callers pass None only when the key is missing. Missing values are flagged
+in data_quality_flags and treated as 0.0 / unused — never fabricated.
 
 IV-based 1-sigma magnitude (annualized IV, NSE session):
   iv_move = spot * σ * sqrt(horizon_minutes / (trading_minutes_per_day * 252))

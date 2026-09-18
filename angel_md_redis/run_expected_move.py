@@ -15,10 +15,10 @@ producer changes required anywhere):
       -> volume_score (adapted from the string signal)
   md:oi:underlying:latest:{SYM}                      (run_oi_analysis.py)
       -> oi_score (adapted from the positioning string)
+  md:indicator:score:latest:{SYM}                    (run_momentum_confirm.py)
+      -> indicator_score (-2..+2 from Supertrend + EMA + pivot strength)
 
-indicator_score has no upstream source anywhere in this pipeline and is
-passed as None (flagged in data_quality_flags, not fabricated).
-realized_volatility likewise has no source and is passed as None.
+realized_volatility has no source and is passed as None.
 
 Emits:
   Stream : md:expected_move:signal
@@ -56,6 +56,7 @@ BIDASK_LATEST_PREFIX = os.getenv("BIDASK_LATEST_PREFIX", "md:bidask:latest:")
 IMBALANCE_LATEST_PREFIX = os.getenv("IMBALANCE_LATEST_PREFIX", "md:imbalance:latest:")
 VOLUME_LATEST_KEY = os.getenv("VOLUME_LATEST_KEY", "md:volume:latest")
 OI_UNDERLYING_LATEST_PREFIX = os.getenv("OI_UNDERLYING_LATEST_PREFIX", "md:oi:underlying:latest:")
+INDICATOR_SCORE_LATEST_PREFIX = os.getenv("INDICATOR_SCORE_LATEST_PREFIX", "md:indicator:score:latest:")
 
 OUT_STREAM = os.getenv("STREAM_EXPECTED_MOVE", "md:expected_move:signal")
 OUT_MAXLEN = int(os.getenv("STREAM_MAXLEN_EXPECTED_MOVE", "50000"))
@@ -202,8 +203,8 @@ def main() -> None:
             oi_positioning = oi_doc.get("positioning")
             oi_score = normalize_oi_signal(oi_positioning) if oi_positioning is not None else None
 
-            # No upstream source anywhere in this pipeline for either of these:
-            indicator_score = None
+            ind_doc = _load_json(r, f"{INDICATOR_SCORE_LATEST_PREFIX}{sym}") or {}
+            indicator_score = _safe_float(ind_doc.get("score"))
             realized_volatility = None
 
             result = compute_expected_move(

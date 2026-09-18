@@ -185,10 +185,11 @@ def main():
                     fresh_vol,
                 )
 
-                # HTF and OI are slow-moving: require key present, not 120s freshness.
-                if not fresh_st or not fresh_ema or not htf or not oi or not fresh_vol:
+                # Module 1 needs fresh ST + EMA. HTF / volume / OI / Greeks
+                # are confirmation gates — still evaluate so module1_signal is visible.
+                if not fresh_st or not fresh_ema:
                     log.info(
-                        "SKIP stale_or_missing symbol=%s fresh_st=%s fresh_ema=%s "
+                        "SKIP stale_st_or_ema symbol=%s fresh_st=%s fresh_ema=%s "
                         "htf_present=%s oi_present=%s fresh_vol=%s",
                         sym,
                         fresh_st,
@@ -247,23 +248,25 @@ def main():
                     "ema26": str(ema.get("ema26") or ""),
                     "bar_ts_ms": str(fields.get("bar_ts_ms") or now_ms),
                     "reason": result.reason,
+                    "module1_signal": result.module1_signal,
+                    "module1_reason": result.module1_reason,
                     "oi_positioning": oi_positioning,
                     "oi_target_strike": "" if result.oi_target_strike is None else str(result.oi_target_strike),
                 }
 
                 log.info(
-                    "LOGIC symbol=%s in=(htf=%s st=%s ema=%s vol=%s lvl_sig=%s lvl=%s) "
-                    "out=(signal=%s strength=%s reason=%s)",
+                    "LOGIC symbol=%s module1=%s final=%s reason=%s "
+                    "in=(htf=%s st=%s ema=%s vol=%s lvl_sig=%s lvl=%s)",
                     sym,
+                    result.module1_signal,
+                    result.signal,
+                    result.reason,
                     htf_bias,
                     st_bias,
                     ema_state,
                     volume_signal,
                     level_signal,
                     level,
-                    result.signal,
-                    result.strength,
-                    result.reason,
                 )
 
                 r.xadd(OUT_STREAM, payload, maxlen=OUT_MAXLEN, approximate=True)

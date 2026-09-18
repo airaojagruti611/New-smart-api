@@ -4,7 +4,6 @@ from app.angel_auth import login
 from app.redis_store import RedisStore
 from app.greeks_poller import GreeksPoller
 
-# If you already have these in app/config.py, import them from there instead
 try:
     from app.config import GREEKS_POLL_SEC
 except Exception:
@@ -22,20 +21,26 @@ def main():
     poller = GreeksPoller(auth_token=auth_token)
 
     print("[GREEKS] started. Waiting for md:active_expiry from producer...")
+    waiting_logged = True
 
     while True:
         try:
             active = rs.hgetall("md:active_expiry")  # {"IOC": "2026-01-27", ...}
 
             if not active:
-                # Producer has not published yet
+                if not waiting_logged:
+                    print("[GREEKS] still waiting for md:active_expiry...")
+                    waiting_logged = True
                 time.sleep(2)
                 continue
 
-            # Poll greeks once for all active underlyings/expiries
-            poller.poll_once(active_expiry=active, per_request_sleep=PER_REQUEST_SLEEP)
+            if waiting_logged:
+                print(f"[GREEKS] active_expiry ready: {active}")
+                waiting_logged = False
 
-            # Sleep between cycles
+            ok = poller.poll_once(active_expiry=active, per_request_sleep=PER_REQUEST_SLEEP)
+            print(f"[GREEKS] poll cycle ok={ok}/{len(active)} underlyings")
+
             time.sleep(GREEKS_POLL_SEC)
 
         except KeyboardInterrupt:

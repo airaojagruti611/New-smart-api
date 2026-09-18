@@ -5,6 +5,7 @@ from collections import defaultdict, deque
 
 import redis
 
+from app.candle_io import parse_candle_fields, read_last_candles
 from app.candle_types import Candle
 from app.config import load_symbols
 from app.ema_cross import last_ema_cross_signal
@@ -37,35 +38,11 @@ def ensure_group(r: redis.Redis, stream: str, group: str) -> None:
             raise
 
 
-def _safe_float(v):
-    try:
-        if v is None or v == "":
-            return None
-        return float(v)
-    except Exception:
-        return None
-
-
-def _safe_int(v):
-    try:
-        if v is None or v == "":
-            return None
-        return int(float(v))
-    except Exception:
-        return None
-
-
 def _parse_candle(fields: dict) -> Candle | None:
-    sym = str(fields.get("symbol") or "").strip().upper()
-    ts_ms = _safe_int(fields.get("ts_ms"))
-    o = _safe_float(fields.get("o"))
-    h = _safe_float(fields.get("h"))
-    l = _safe_float(fields.get("l"))
-    c = _safe_float(fields.get("c"))
-    v = _safe_float(fields.get("v")) or 0.0
-    if not sym or ts_ms is None or o is None or h is None or l is None or c is None:
+    parsed = parse_candle_fields(fields)
+    if parsed is None:
         return None
-    return Candle(ts_ms=ts_ms, o=o, h=h, l=l, c=c, v=v)
+    return parsed[1]
 
 
 def main():
@@ -87,6 +64,37 @@ def main():
         WINDOW,
         len(symbols),
     )
+
+    now_ms = int(time.time() * 1000)
+    for sym in symbols:
+        bars = read_last_candles(r, IN_1M, sym, WINDOW)
+        if bars:
+            windows[sym].extend(bars)
+        pt = last_ema_cross_signal(list(windows[sym]), fast=EMA_FAST, slow=EMA_SLOW)
+        if pt is None:
+            log.info("WARMUP symbol=%s bars=%d need=%d", sym, len(windows[sym]), EMA_SLOW)
+            continue
+        last_state[sym] = pt.state
+        payload = {
+            "ts_ms": str(now_ms),
+            "symbol": sym,
+            "tf": "1m",
+            "signal": pt.signal,
+            "state": pt.state,
+            "ema9": f"{pt.ema_fast:.6f}",
+            "ema26": f"{pt.ema_slow:.6f}",
+            "bar_ts_ms": str(pt.ts_ms),
+        }
+        log.info(
+            "WARMUP_READY symbol=%s bars=%d state=%s ema9=%.6f ema26=%.6f",
+            sym,
+            len(windows[sym]),
+            pt.state,
+            pt.ema_fast,
+            pt.ema_slow,
+        )
+        r.xadd(OUT_STREAM, payload, maxlen=OUT_MAXLEN, approximate=True)
+        r.set(f"{LATEST_KEY_PREFIX}{sym}", json.dumps(payload, separators=(",", ":")), ex=3600)
 
     while True:
         resp = r.xreadgroup(
@@ -128,7 +136,9 @@ def main():
                 slow=EMA_SLOW,
             )
             if pt is None:
-                log.debug("SKIP warmup symbol=%s bars=%d", sym, len(windows[sym]))
+                if last_state.get(sym) != "warmup":
+                    last_state[sym] = "warmup"
+                    log.info("WARMUP symbol=%s bars=%d need=%d", sym, len(windows[sym]), EMA_SLOW)
                 continue
 
             payload = {

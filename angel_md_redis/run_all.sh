@@ -12,6 +12,8 @@ export ARCHIVE_TZ="Asia/Kolkata"
 
 # better logs
 export PYTHONUNBUFFERED=1
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
+export PYTHONUTF8="${PYTHONUTF8:-1}"
 # DEBUG = every skip/input/output; INFO = decisions + emits (default)
 export LOG_LEVEL="${LOG_LEVEL:-DEBUG}"
 # FileHandler off: nohup already appends stdout to logs/<date>/<name>.log
@@ -32,6 +34,11 @@ start() {
   nohup "$@" >> "$LOGDIR/$name.log" 2>&1 &
   echo $! > "$PIDDIR/$name.pid"
 }
+
+echo "Seeding candle history for Indicator Signals..."
+python3 run_history_bootstrap.py >> "$LOGDIR/history_bootstrap.log" 2>&1 || echo "WARNING: history bootstrap failed; see $LOGDIR/history_bootstrap.log"
+echo "Waiting 8s so the next Angel login uses a fresh TOTP..."
+sleep 8
 
 # 1) Producer: WS -> Redis (eq + opt ticks)
 start "producer" python3 run_producer.py

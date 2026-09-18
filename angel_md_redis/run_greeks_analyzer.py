@@ -82,7 +82,7 @@ def main() -> None:
     ensure_group(r, FEATURES_STREAM, GROUP)
 
     spot_by_sym: Dict[str, float] = {}
-    prev_close_by_sym: Dict[str, float] = {}
+    last_spot_by_sym: Dict[str, float] = {}  # prior EQ LTP for recent move %
     trackers: Dict[str, GreeksPhaseTracker] = {}
     last_action: Dict[str, str] = {}
 
@@ -114,11 +114,11 @@ def main() -> None:
                     if not sym or sym not in symbols:
                         continue
                     ltp = _safe_float(fields.get("ltp"))
-                    c = _safe_float(fields.get("c"))
                     if ltp:
+                        prev_spot = spot_by_sym.get(sym)
+                        if prev_spot is not None:
+                            last_spot_by_sym[sym] = prev_spot
                         spot_by_sym[sym] = ltp
-                    if c:
-                        prev_close_by_sym[sym] = c
                     continue
 
                 # md:features:opt tick
@@ -136,13 +136,15 @@ def main() -> None:
                 iv = _safe_float(fields.get("iv"))
 
                 spot = spot_by_sym.get(und)
-                prev_close = prev_close_by_sym.get(und)
+                prev_spot = last_spot_by_sym.get(und)
+                # Recent underlying move (tick-to-tick), not day-change vs prev close.
                 price_change_pct = None
-                if spot is not None and prev_close:
-                    price_change_pct = round((spot - prev_close) / prev_close * 100.0, 4)
+                if spot is not None and prev_spot and prev_spot != 0:
+                    price_change_pct = round((spot - prev_spot) / prev_spot * 100.0, 4)
 
+                # None = pivots unavailable -> do not block Markup.
                 pivots = _load_pivots(r, und)
-                breakout = False
+                breakout: Optional[bool] = None
                 if spot is not None and pivots is not None:
                     if cp == "CE":
                         breakout = spot > pivots.R1
@@ -165,6 +167,14 @@ def main() -> None:
                     res.phase, res.action, res.reason,
                 )
 
+                def _f(v: Optional[float]) -> str:
+                    return "" if v is None else str(v)
+
+                if breakout is None:
+                    breakout_s = ""
+                else:
+                    breakout_s = "1" if breakout else "0"
+
                 payload = {
                     "ts_ms": str(now_ms),
                     "tradingsymbol": tsym,
@@ -173,17 +183,17 @@ def main() -> None:
                     "phase": res.phase,
                     "action": res.action,
                     "side": res.side,
-                    "delta": str(res.delta),
-                    "gamma": str(res.gamma),
-                    "theta": str(res.theta),
-                    "vega": str(res.vega),
-                    "iv": str(res.iv),
-                    "delta_pct": "" if res.delta_pct is None else str(res.delta_pct),
-                    "gamma_pct": "" if res.gamma_pct is None else str(res.gamma_pct),
-                    "iv_pct": "" if res.iv_pct is None else str(res.iv_pct),
-                    "theta_pct": "" if res.theta_pct is None else str(res.theta_pct),
-                    "price_change_pct": "" if price_change_pct is None else str(price_change_pct),
-                    "breakout": "1" if breakout else "0",
+                    "delta": _f(res.delta),
+                    "gamma": _f(res.gamma),
+                    "theta": _f(res.theta),
+                    "vega": _f(res.vega),
+                    "iv": _f(res.iv),
+                    "delta_pct": _f(res.delta_pct),
+                    "gamma_pct": _f(res.gamma_pct),
+                    "iv_pct": _f(res.iv_pct),
+                    "theta_pct": _f(res.theta_pct),
+                    "price_change_pct": _f(price_change_pct),
+                    "breakout": breakout_s,
                     "reason": res.reason,
                 }
                 r.xadd(OUT_STREAM, payload, maxlen=OUT_MAXLEN, approximate=True)

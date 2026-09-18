@@ -27,11 +27,15 @@ if ($env:VIRTUAL_ENV -and (Test-Path "$env:VIRTUAL_ENV\Scripts\python.exe")) {
 
 # 2. Environment Variables
 $env:PYTHONUNBUFFERED = "1"
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
 $env:LOG_LEVEL = "INFO"
 $env:ARCHIVE_TZ = "Asia/Kolkata"
+# Match run_all.sh: Start-Worker already redirects stdout into logs\<date>\<name>.log
+$env:LOG_TO_FILE = "0"
 
 # 3. Start Redis Container
-Write-Host "`n[1/3] Ensuring Redis Docker Container is running..." -ForegroundColor Yellow
+Write-Host "`n[1/4] Ensuring Redis Docker Container is running..." -ForegroundColor Yellow
 docker compose up -d
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: Failed to start Redis Docker container. Make sure Docker Desktop is running." -ForegroundColor Red
@@ -44,7 +48,19 @@ $logDir = Join-Path $PSScriptRoot "logs\$date"
 $pidDir = Join-Path $logDir "pids"
 New-Item -ItemType Directory -Force -Path $pidDir | Out-Null
 
-Write-Host "`n[2/3] Spawning Background Workers..." -ForegroundColor Yellow
+Write-Host "`n[2/4] Seeding candle history for Indicator Signals..." -ForegroundColor Yellow
+$histLog = Join-Path $logDir "history_bootstrap.log"
+$histErr = Join-Path $logDir "history_bootstrap.err.log"
+& $VenvPython "run_history_bootstrap.py" 1> $histLog 2> $histErr
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "WARNING: history bootstrap failed (see $histErr). Supertrend/EMA/HTF/pivots may stay NEUTRAL until live bars accumulate." -ForegroundColor Yellow
+} else {
+    Write-Host "  History seed complete." -ForegroundColor Green
+}
+Write-Host "Waiting 8s so the next Angel login uses a fresh TOTP..." -ForegroundColor Gray
+Start-Sleep -Seconds 8
+
+Write-Host "`n[3/4] Spawning Background Workers..." -ForegroundColor Yellow
 
 function Start-Worker {
     param (
@@ -109,7 +125,7 @@ Start-Worker "greeks_change" "run_greeks_change.py"
 # --- Archiver: all Angel One + layer streams -> data_lake/*.parquet ---
 Start-Worker "arch_layers" "run_archiver_layers.py" "all"
 
-Write-Host "`n[3/3] Success! Pipeline is running." -ForegroundColor Cyan
+Write-Host "`n[4/4] Success! Pipeline is running." -ForegroundColor Cyan
 Write-Host "Logs are being recorded in: $logDir" -ForegroundColor Gray
 Write-Host "To stop all processes, run: .\stop_all.ps1" -ForegroundColor Yellow
 Write-Host "Dashboard (Linux): ./run_dashboard.sh  →  http://127.0.0.1:8501" -ForegroundColor Gray

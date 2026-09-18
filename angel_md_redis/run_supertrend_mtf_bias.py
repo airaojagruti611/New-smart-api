@@ -5,6 +5,7 @@ from collections import defaultdict, deque
 
 import redis
 
+from app.candle_io import parse_candle_fields, read_last_candles
 from app.candle_types import Candle
 from app.config import load_symbols
 from app.logging_setup import setup_logger
@@ -41,35 +42,11 @@ def ensure_group(r: redis.Redis, stream: str, group: str) -> None:
             raise
 
 
-def _safe_float(v):
-    try:
-        if v is None or v == "":
-            return None
-        return float(v)
-    except Exception:
-        return None
-
-
-def _safe_int(v):
-    try:
-        if v is None or v == "":
-            return None
-        return int(float(v))
-    except Exception:
-        return None
-
-
 def _parse_candle(fields: dict) -> Candle | None:
-    sym = str(fields.get("symbol") or "").strip().upper()
-    ts_ms = _safe_int(fields.get("ts_ms"))
-    o = _safe_float(fields.get("o"))
-    h = _safe_float(fields.get("h"))
-    l = _safe_float(fields.get("l"))
-    c = _safe_float(fields.get("c"))
-    v = _safe_float(fields.get("v")) or 0.0
-    if not sym or ts_ms is None or o is None or h is None or l is None or c is None:
+    parsed = parse_candle_fields(fields)
+    if parsed is None:
         return None
-    return Candle(ts_ms=ts_ms, o=o, h=h, l=l, c=c, v=v)
+    return parsed[1]
 
 
 def main():
@@ -91,6 +68,7 @@ def main():
         tf: defaultdict(lambda: deque(maxlen=WINDOW)) for tf in by_tf
     }
     last_bias: dict[str, str] = {}
+    warmup_done: set[str] = set()
 
     log.info(
         "START reading 1m/5m/10m/30m candles, writing %s "
@@ -102,6 +80,45 @@ def main():
         WINDOW,
         len(symbols),
     )
+
+    now_ms = int(time.time() * 1000)
+    for sym in symbols:
+        bar_counts = {}
+        for tf, stream in by_tf.items():
+            bars = read_last_candles(r, stream, sym, WINDOW)
+            if bars:
+                windows[tf][sym].extend(bars)
+            bar_counts[tf] = len(windows[tf][sym])
+        candles_by_tf = {tf: list(windows[tf][sym]) for tf in windows}
+        res = mtf_supertrend_bias(
+            candles_by_tf=candles_by_tf,
+            atr_period=ST_ATR,
+            multiplier=ST_MULT,
+            majority=ST_MAJORITY,
+        )
+        payload = {
+            "ts_ms": str(now_ms),
+            "symbol": sym,
+            "bias": res.bias,
+            "bullish": str(res.bullish),
+            "bearish": str(res.bearish),
+            "st_30m": res.per_tf.get("30m", "na"),
+            "st_10m": res.per_tf.get("10m", "na"),
+            "st_5m": res.per_tf.get("5m", "na"),
+            "st_1m": res.per_tf.get("1m", "na"),
+        }
+        log.info(
+            "WARMUP symbol=%s bars=%s per_tf=%s bias=%s",
+            sym,
+            bar_counts,
+            res.per_tf,
+            res.bias,
+        )
+        if all(v != "na" for v in res.per_tf.values()):
+            warmup_done.add(sym)
+        last_bias[sym] = res.bias
+        r.xadd(OUT_STREAM, payload, maxlen=OUT_MAXLEN, approximate=True)
+        r.set(f"{LATEST_KEY_PREFIX}{sym}", json.dumps(payload, separators=(",", ":")), ex=3600)
 
     while True:
         resp = r.xreadgroup(
@@ -203,6 +220,9 @@ def main():
                     res.bearish,
                     res.per_tf,
                 )
+            if sym not in warmup_done and all(v != "na" for v in res.per_tf.values()):
+                warmup_done.add(sym)
+                log.info("WARMUP_READY symbol=%s per_tf=%s bias=%s", sym, res.per_tf, res.bias)
 
             r.xadd(OUT_STREAM, payload, maxlen=OUT_MAXLEN, approximate=True)
             r.set(f"{LATEST_KEY_PREFIX}{sym}", json.dumps(payload, separators=(",", ":")), ex=3600)

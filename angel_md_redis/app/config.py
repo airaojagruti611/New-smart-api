@@ -2,9 +2,15 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# Prefer local angel_md_redis/.env, then fall back to workspace ../.env
+# (this repo keeps credentials in smartapi_new/.env).
+_BASE = Path(__file__).resolve().parent.parent
+_ROOT = _BASE.parent
+load_dotenv(_BASE / ".env")
+load_dotenv(_ROOT / ".env", override=False)
+load_dotenv(override=False)  # cwd fallback
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = _BASE
 SYMBOLS_FILE = BASE_DIR / "symbols.txt"
 
 def env_int(name: str, default: int) -> int:

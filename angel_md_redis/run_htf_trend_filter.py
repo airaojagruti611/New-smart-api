@@ -182,6 +182,10 @@ def main():
         len(symbols),
     )
     _bootstrap(r, symbols, daily_by_sym)
+    if not any(len(buf) >= 2 for buf in daily_by_sym.values()):
+        log.info("bootstrap empty, waiting 20s for history seed then retry")
+        time.sleep(20)
+        _bootstrap(r, symbols, daily_by_sym)
 
     while True:
         resp = r.xreadgroup(

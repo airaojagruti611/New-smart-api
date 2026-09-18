@@ -418,7 +418,7 @@ def build_rows(r: redis.Redis, symbols: List[str], data: Dict[str, dict]) -> Lis
         (
             "1.3 Volatility",
             "Expected move (prediction only)",
-            "Does not pick strike. Empty IV is a data gap until REST greeks populate. indicator_score is not sourced yet.",
+            "Does not pick strike. Empty IV is a data gap until REST greeks populate. indicator_score is Supertrend + EMA + pivot strength (-2..+2).",
             "spot, volume score, OI score, imbalance, IV if any",
             lambda d: {
                 "spot": (d["tick"] or {}).get("ltp") or (d["oi_und"] or {}).get("spot"),

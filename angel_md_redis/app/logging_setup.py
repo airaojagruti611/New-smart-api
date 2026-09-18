@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from datetime import date
 from pathlib import Path
 
@@ -16,12 +17,20 @@ def setup_logger(name: str) -> logging.Logger:
     Env:
       LOG_LEVEL   - DEBUG / INFO / WARNING / ERROR (default INFO)
       LOG_DIR     - base log directory (default: logs)
-      LOG_TO_FILE - 1/0 write FileHandler (default 1). Set 0 under run_all.sh
-                    because nohup already redirects stdout into the same file.
+      LOG_TO_FILE - 1/0 write FileHandler. If unset, FileHandler is on only
+                    when stdout is a TTY. Set 0 under run_all.sh / run_all.ps1
+                    because those already redirect stdout into the log file.
     """
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
-    to_file = os.getenv("LOG_TO_FILE", "1").strip() not in ("0", "false", "False", "no")
+    # Under run_all, stdout is already redirected to logs/<date>/<name>.log.
+    # Default FileHandler off when stdout is not a TTY so we do not lock the
+    # same file twice on Windows. Explicit LOG_TO_FILE still wins.
+    log_to_file_env = os.getenv("LOG_TO_FILE")
+    if log_to_file_env is None:
+        to_file = sys.stdout.isatty()
+    else:
+        to_file = log_to_file_env.strip() not in ("0", "false", "False", "no")
 
     logger = logging.getLogger(name)
     logger.setLevel(level)
@@ -36,7 +45,9 @@ def setup_logger(name: str) -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    sh = logging.StreamHandler()
+    # stdout (not stderr) so run_all.ps1 RedirectStandardError stays real errors
+    # instead of filling *.err.log with INFO EMITs.
+    sh = logging.StreamHandler(sys.stdout)
     sh.setLevel(level)
     sh.setFormatter(fmt)
     logger.addHandler(sh)
