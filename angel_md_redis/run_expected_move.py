@@ -1,32 +1,32 @@
 """
 run_expected_move.py
 ───────────────────────
-Module 8 — Expected Move Calculator. Reads live spot from md:ticks:eq,
-plus already-published latest: keys from FIVE existing modules (no
-producer changes required anywhere):
+Module 8 — Expected Move Calculator (Word spec: Expected Move Engine).
+
+Reads live spot from md:ticks:eq plus already-published latest: keys:
 
   md:greeks:phase:underlying:latest:{SYM}:CE / :PE  (run_greeks_analyzer.py)
-      -> implied_volatility, and the ATM CE/PE tradingsymbol to look up
+      -> ATM delta, gamma_pct / iv_pct (momentum multiplier), IV diagnostic
   md:bidask:latest:{tradingsymbol}                  (run_bidask_analyzer.py)
-      -> atm_call_mid / atm_put_mid (the "mid" field)
+      -> atm_call_mid / atm_put_mid (diagnostic straddle only)
   md:imbalance:latest:{SYMBOL}                      (run_bidask_imbalance.py)
-      -> bidask_score (final_score is already -1..+1, used directly)
+      -> bidask_score (final_score is already -1..+1)
   md:volume:latest                                  (run_volume_analyzer.py)
       -> volume_score (adapted from the string signal)
   md:oi:underlying:latest:{SYM}                      (run_oi_analysis.py)
-      -> oi_score (adapted from the positioning string)
+      -> oi_score + primary_resistance (strong_resistance_nearby)
   md:indicator:score:latest:{SYM}                    (run_momentum_confirm.py)
       -> indicator_score (-2..+2 from Supertrend + EMA + pivot strength)
 
+vacuum_zone has no upstream publisher and is passed as None (flagged).
 realized_volatility has no source and is passed as None.
 
 Emits:
   Stream : md:expected_move:signal
   Key    : md:expected_move:latest:{SYMBOL}
 
-Evaluated on a periodic cycle (like run_composite.py / run_strike_flow.py)
-since it synthesizes several independently-updating cached signals rather
-than reacting to a single stream.
+Evaluated on a periodic cycle since it synthesizes several independently-
+updating cached signals rather than reacting to a single stream.
 """
 
 from __future__ import annotations
@@ -41,10 +41,17 @@ import redis
 
 from app.config import load_symbols
 from app.expected_move import (
+    RESISTANCE_NEAR_PCT,
+    classify_pct_trend,
     clip_bidask_score,
+    combine_trend,
     compute_expected_move,
+    GAMMA_TREND_UP_PCT,
+    IV_TREND_UP_PCT,
     normalize_oi_signal,
     normalize_volume_signal,
+    pick_atm_delta,
+    resistance_is_nearby,
 )
 from app.logging_setup import setup_logger
 
@@ -68,7 +75,6 @@ CONSUMER = os.getenv("EXPECTED_MOVE_CONSUMER", "expected-move-1")
 EVAL_INTERVAL_SEC = float(os.getenv("EXPECTED_MOVE_EVAL_INTERVAL_SEC", "5.0"))
 LATEST_TTL_SEC = int(os.getenv("EXPECTED_MOVE_LATEST_TTL_SEC", "3600"))
 
-# Spec example uses 60 minutes; override per-deployment via env.
 HORIZON_MINUTES = float(os.getenv("EXPECTED_MOVE_HORIZON_MINUTES", "60"))
 TRADING_MINUTES_PER_DAY = float(os.getenv("EXPECTED_MOVE_TRADING_MINUTES_PER_DAY", "375"))
 
@@ -136,9 +142,9 @@ def main() -> None:
     next_eval = time.time() + EVAL_INTERVAL_SEC
 
     log.info(
-        "START reading %s + greeks-phase/bidask/imbalance/volume/oi latest -> %s + %s{{SYMBOL}} "
-        "(eval_interval=%ss horizon_min=%s symbols=%d)",
-        EQ_STREAM, OUT_STREAM, LATEST_KEY_PREFIX, EVAL_INTERVAL_SEC, HORIZON_MINUTES, len(symbols),
+        "START reading %s + greeks-phase/bidask/imbalance/volume/oi/indicator latest -> %s + %s{{SYMBOL}} "
+        "(eval_interval=%ss spec_engine=score*multiplier*0.02 symbols=%d)",
+        EQ_STREAM, OUT_STREAM, LATEST_KEY_PREFIX, EVAL_INTERVAL_SEC, len(symbols),
     )
 
     while True:
@@ -182,6 +188,24 @@ def main() -> None:
             iv_vals = [v for v in (iv_ce, iv_pe) if v is not None and v > 0]
             implied_volatility = round(sum(iv_vals) / len(iv_vals), 6) if iv_vals else None
 
+            gamma_trend = combine_trend(
+                classify_pct_trend(_safe_float(gp_ce.get("gamma_pct")), GAMMA_TREND_UP_PCT),
+                classify_pct_trend(_safe_float(gp_pe.get("gamma_pct")), GAMMA_TREND_UP_PCT),
+            )
+            iv_trend = combine_trend(
+                classify_pct_trend(_safe_float(gp_ce.get("iv_pct")), IV_TREND_UP_PCT),
+                classify_pct_trend(_safe_float(gp_pe.get("iv_pct")), IV_TREND_UP_PCT),
+            )
+            # gamma_pct/iv_pct of 0.0 is a real reading ("flat"), not missing.
+            if gamma_trend is None and (gp_ce or gp_pe):
+                if _safe_float(gp_ce.get("gamma_pct")) is not None or _safe_float(gp_pe.get("gamma_pct")) is not None:
+                    gamma_trend = "flat"
+            if iv_trend is None and (gp_ce or gp_pe):
+                if _safe_float(gp_ce.get("iv_pct")) is not None or _safe_float(gp_pe.get("iv_pct")) is not None:
+                    iv_trend = "flat"
+
+            delta = pick_atm_delta(_safe_float(gp_ce.get("delta")), _safe_float(gp_pe.get("delta")))
+
             atm_call_mid = None
             atm_put_mid = None
             tsym_ce = str(gp_ce.get("tradingsymbol") or "").strip().upper()
@@ -199,13 +223,20 @@ def main() -> None:
             volume_signal = _load_volume_signal_for_symbol(r, sym)
             volume_score = normalize_volume_signal(volume_signal) if volume_signal is not None else None
 
-            oi_doc = _load_json(r, f"{OI_UNDERLYING_LATEST_PREFIX}{sym}") or {}
-            oi_positioning = oi_doc.get("positioning")
-            oi_score = normalize_oi_signal(oi_positioning) if oi_positioning is not None else None
+            oi_doc = _load_json(r, f"{OI_UNDERLYING_LATEST_PREFIX}{sym}")
+            oi_score = None
+            strong_resistance_nearby: Optional[bool] = None
+            if oi_doc:
+                oi_positioning = oi_doc.get("positioning")
+                oi_score = normalize_oi_signal(oi_positioning) if oi_positioning is not None else None
+                resistance = _safe_float(oi_doc.get("primary_resistance"))
+                nearby = resistance_is_nearby(spot, resistance, RESISTANCE_NEAR_PCT)
+                strong_resistance_nearby = False if nearby is None else nearby
 
             ind_doc = _load_json(r, f"{INDICATOR_SCORE_LATEST_PREFIX}{sym}") or {}
             indicator_score = _safe_float(ind_doc.get("score"))
             realized_volatility = None
+            vacuum_zone = None  # no vacuum-zone publisher in this pipeline
 
             result = compute_expected_move(
                 spot_price=spot,
@@ -218,16 +249,22 @@ def main() -> None:
                 volume_score=volume_score,
                 bidask_score=bidask_score,
                 oi_score=oi_score,
+                gamma_trend=gamma_trend,
+                iv_trend=iv_trend,
+                delta=delta,
+                vacuum_zone=vacuum_zone,
+                strong_resistance_nearby=strong_resistance_nearby,
                 trading_minutes_per_day=TRADING_MINUTES_PER_DAY,
             )
 
             log.debug(
-                "LOGIC symbol=%s spot=%s iv=%s call_mid=%s put_mid=%s bidask=%s vol=%s oi=%s -> "
-                "final_move=%s direction=%s(%.4f) quality=%s flags=%s",
-                sym, spot, implied_volatility, atm_call_mid, atm_put_mid,
-                bidask_score, volume_score, oi_score,
-                result.final_expected_move, result.direction, result.direction_score,
-                result.magnitude_quality, result.data_quality_flags,
+                "LOGIC symbol=%s spot=%s ind=%s vol=%s ba=%s oi=%s gamma=%s iv_tr=%s delta=%s res=%s "
+                "-> pct=%s move=%s target=%s conf=%s dir=%s(%.4f) mult=%s quality=%s flags=%s",
+                sym, spot, indicator_score, volume_score, bidask_score, oi_score,
+                gamma_trend, iv_trend, delta, strong_resistance_nearby,
+                result.expected_move_pct, result.expected_move, result.target_price,
+                result.confidence, result.direction, result.direction_score,
+                result.multiplier, result.move_quality, result.data_quality_flags,
             )
 
             payload = _payload_to_dict(result)
@@ -241,11 +278,12 @@ def main() -> None:
                 ex=LATEST_TTL_SEC,
             )
 
-            if result.final_expected_move is not None:
+            if result.expected_move is not None:
                 log.info(
-                    "EMIT symbol=%s direction=%s move=%.2f range=[%.2f,%.2f] quality=%s",
-                    sym, result.direction, result.final_expected_move,
-                    result.lower_range or 0.0, result.upper_range or 0.0, result.magnitude_quality,
+                    "EMIT symbol=%s direction=%s pct=%.4f move=%.2f target=%.2f conf=%s quality=%s",
+                    sym, result.direction, result.expected_move_pct,
+                    result.expected_move, result.target_price or 0.0,
+                    result.confidence, result.move_quality,
                 )
 
 

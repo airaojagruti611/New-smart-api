@@ -5,7 +5,7 @@ from collections import defaultdict, deque
 
 import redis
 
-from app.candle_io import parse_candle_fields, read_last_candles
+from app.candle_io import parse_candle_fields, read_last_candles, upsert_candle_window
 from app.candle_types import Candle
 from app.config import load_symbols
 from app.logging_setup import setup_logger
@@ -168,7 +168,7 @@ def main():
                     c.ts_ms,
                     c.c,
                 )
-                windows[tf][sym].append(c)
+                upsert_candle_window(windows[tf][sym], c)
                 touched.add(sym)
 
             if ack_ids:

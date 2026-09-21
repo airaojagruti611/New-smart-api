@@ -85,6 +85,7 @@ def main() -> None:
     last_spot_by_sym: Dict[str, float] = {}  # prior EQ LTP for recent move %
     trackers: Dict[str, GreeksPhaseTracker] = {}
     last_action: Dict[str, str] = {}
+    atm_strike: Dict[tuple, float] = {}
 
     log.info(
         "START reading %s + %s -> %s + %s{{TRADINGSYMBOL}} symbols=%d",
@@ -134,6 +135,10 @@ def main() -> None:
                 theta = _safe_float(fields.get("theta"))
                 vega = _safe_float(fields.get("vega"))
                 iv = _safe_float(fields.get("iv"))
+                strike = _safe_float(fields.get("strike"))
+                greeks_source = str(
+                    fields.get("greeks_source") or fields.get("source") or ""
+                ).strip()
 
                 spot = spot_by_sym.get(und)
                 prev_spot = last_spot_by_sym.get(und)
@@ -180,6 +185,7 @@ def main() -> None:
                     "tradingsymbol": tsym,
                     "underlying": und,
                     "cp": cp,
+                    "strike": _f(strike),
                     "phase": res.phase,
                     "action": res.action,
                     "side": res.side,
@@ -188,6 +194,7 @@ def main() -> None:
                     "theta": _f(res.theta),
                     "vega": _f(res.vega),
                     "iv": _f(res.iv),
+                    "greeks_source": greeks_source,
                     "delta_pct": _f(res.delta_pct),
                     "gamma_pct": _f(res.gamma_pct),
                     "iv_pct": _f(res.iv_pct),
@@ -203,22 +210,19 @@ def main() -> None:
                     ex=LATEST_TTL_SEC,
                 )
 
-                # Also publish the ATM contract's phase at the underlying
-                # level (mirrors oi_analysis's ATM-CE dominant_buildup
-                # convention) so entry_trigger/composite can gate on it
-                # without needing to know which strike is ATM themselves.
+                # Publish the nearest-to-spot contract per (underlying, CE/PE)
+                # so entry_trigger/composite gate on ATM, not the last strike seen.
                 if spot is not None:
-                    strike = _safe_float(fields.get("strike"))
-                    # crude ATM check: closest strike seen this tick isn't
-                    # known here without full chain state, so approximate
-                    # "near spot" — good enough since ws_producer already
-                    # only subscribes strikes within STRIKES_AROUND of ATM.
-                    if strike is not None:
-                        r.set(
-                            f"{UNDERLYING_LATEST_KEY_PREFIX}{und}:{cp}",
-                            json.dumps(payload, separators=(",", ":")),
-                            ex=LATEST_TTL_SEC,
-                        )
+                    if strike is not None and cp in ("CE", "PE"):
+                        key = (und, cp)
+                        prev_k = atm_strike.get(key)
+                        if prev_k is None or strike == prev_k or abs(strike - spot) < abs(prev_k - spot):
+                            atm_strike[key] = strike
+                            r.set(
+                                f"{UNDERLYING_LATEST_KEY_PREFIX}{und}:{cp}",
+                                json.dumps(payload, separators=(",", ":")),
+                                ex=LATEST_TTL_SEC,
+                            )
 
                 prev_action = last_action.get(tsym)
                 if res.action != "HOLD" or prev_action not in (None, "HOLD"):

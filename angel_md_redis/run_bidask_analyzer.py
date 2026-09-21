@@ -8,10 +8,13 @@ ws_producer.py, and emits liquidity signals:
   Stream : md:bidask:signal
   Key    : md:bidask:latest:{SYMBOL}          (equities)
   Key    : md:bidask:latest:{TRADINGSYMBOL}   (options)
+  Hist   : md:bidask:spread_hist:{TRADINGSYMBOL}  (up to 10 daily avg spread%)
 
 Stock path : fixed spread% thresholds (HIGH_LIQUIDITY / MODERATE_LIQUIDITY / THIN_AVOID)
-Option path: spread% normalized against the CONTRACT'S OWN rolling average
-             spread% (NORMAL / CAUTION / EXIT_TERRITORY)
+Option path: spread% normalized against the CONTRACT'S OWN 10-day average
+             spread% (NORMAL / CAUTION / EXIT_TERRITORY). Until daily history
+             exists, uses the session mean — not a 20-tick window — so a
+             single tick-size change cannot flip EXIT_TERRITORY.
 
 Both paths also carry a 0-100 liquidity_score: top-5 size-weighted depth
 normalized against its own rolling average depth.
@@ -26,11 +29,17 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import redis
 
-from app.bidask_analyzer import BidAskAnalyzer, BidAskResult
+from app.bidask_analyzer import (
+    OPTION_SPREAD_DAYS,
+    SESSION_MIN_SAMPLES,
+    BidAskAnalyzer,
+    BidAskResult,
+    ist_today,
+)
 from app.config import load_symbols
 from app.logging_setup import setup_logger
 
@@ -42,20 +51,21 @@ OPT_STREAM = os.getenv("STREAM_OPT", "md:ticks:opt")
 OUT_STREAM = os.getenv("STREAM_BIDASK_SIGNAL", "md:bidask:signal")
 OUT_MAXLEN = int(os.getenv("STREAM_MAXLEN_BIDASK", "200000"))
 LATEST_KEY_PREFIX = os.getenv("BIDASK_LATEST_PREFIX", "md:bidask:latest:")
+SPREAD_HIST_PREFIX = os.getenv("BIDASK_SPREAD_HIST_PREFIX", "md:bidask:spread_hist:")
 
 GROUP = os.getenv("BIDASK_GROUP", "bidask")
 CONSUMER = os.getenv("BIDASK_CONSUMER", "bidask-1")
 
 DEPTH_AVG_WINDOW = int(os.getenv("BIDASK_DEPTH_AVG_WINDOW", "20"))
-# NOTE: brief specifies "10-day average spread" for options. This is a
-# rolling SAMPLE window (in-memory, resets on restart), not a calendar-day
-# store — consistent with VOLUME_AVG_WINDOW / ST_WINDOW_BARS elsewhere in
-# this pipeline. For a true multi-day EOD version, mirror run_daily_pivots.py
-# (daily snapshot -> Redis list, capped at 10).
-SPREAD_AVG_WINDOW = int(os.getenv("BIDASK_SPREAD_AVG_WINDOW", "20"))
+SPREAD_HIST_DAYS = int(os.getenv("BIDASK_SPREAD_HIST_DAYS", str(OPTION_SPREAD_DAYS)))
+SESSION_MIN = int(os.getenv("BIDASK_SESSION_MIN_SAMPLES", str(SESSION_MIN_SAMPLES)))
+SPREAD_HIST_TTL_SEC = int(os.getenv("BIDASK_SPREAD_HIST_TTL_SEC", str(14 * 24 * 3600)))
+HIST_FLUSH_SEC = float(os.getenv("BIDASK_HIST_FLUSH_SEC", "60"))
 
 LIVE_THROTTLE_SEC = float(os.getenv("BIDASK_LIVE_THROTTLE_SEC", "1.0"))
-LATEST_TTL_SEC = int(os.getenv("BIDASK_LATEST_TTL_SEC", "3600"))
+# Keep latest keys short-lived so illiquid option CAUTION/EXIT cannot sit
+# unread for tens of minutes. Equity ticks every second so this is plenty.
+LATEST_TTL_SEC = int(os.getenv("BIDASK_LATEST_TTL_SEC", "120"))
 
 log = setup_logger("bidask_analyzer")
 
@@ -88,6 +98,63 @@ def _parse_depth5(raw: str) -> List[float]:
     return out
 
 
+def load_spread_hist(r: redis.Redis, key: str) -> List[Dict[str, Any]]:
+    raw = r.get(f"{SPREAD_HIST_PREFIX}{key}")
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        date = str(row.get("date") or "").strip()
+        avg = _safe_float(row.get("avg"))
+        n = int(row.get("n") or 0)
+        if date and avg and avg > 0:
+            out.append({"date": date, "avg": avg, "n": n})
+    return out[-SPREAD_HIST_DAYS:]
+
+
+def upsert_spread_day(r: redis.Redis, key: str, date: str, avg: float, n: int) -> None:
+    hist = [h for h in load_spread_hist(r, key) if h.get("date") != date]
+    hist.append({"date": date, "avg": round(float(avg), 6), "n": int(n)})
+    hist = hist[-SPREAD_HIST_DAYS:]
+    r.set(
+        f"{SPREAD_HIST_PREFIX}{key}",
+        json.dumps(hist, separators=(",", ":")),
+        ex=SPREAD_HIST_TTL_SEC,
+    )
+
+
+def prior_daily_avgs(hist: List[Dict[str, Any]], today: str) -> List[float]:
+    return [float(h["avg"]) for h in hist if h.get("date") and h["date"] != today]
+
+
+def flush_option_hist(
+    r: redis.Redis,
+    analyzers: Dict[str, BidAskAnalyzer],
+) -> int:
+    """Persist closed days + today's running session mean. Returns rows written."""
+    written = 0
+    for key, az in analyzers.items():
+        rolled = az.roll_if_new_day()
+        if rolled:
+            date, avg, n = rolled
+            upsert_spread_day(r, key, date, avg, n)
+            written += 1
+        snap = az.session_snapshot()
+        if snap:
+            date, avg, n = snap
+            upsert_spread_day(r, key, date, avg, n)
+            written += 1
+    return written
+
+
 def _to_payload(key: str, kind: str, res: BidAskResult, now_ms: int) -> Dict[str, str]:
     return {
         "ts_ms": str(now_ms),
@@ -102,6 +169,9 @@ def _to_payload(key: str, kind: str, res: BidAskResult, now_ms: int) -> Dict[str
         "liquidity_score": f"{res.liquidity_score:.2f}",
         "signal": res.signal,
         "spread_ratio": "" if res.spread_ratio is None else f"{res.spread_ratio:.2f}",
+        "spread_avg": "" if res.spread_avg is None else f"{res.spread_avg:.4f}",
+        "spread_avg_source": res.spread_avg_source or "",
+        "spread_days": str(int(res.spread_days or 0)),
     }
 
 
@@ -116,17 +186,22 @@ def main() -> None:
     opt_analyzers: Dict[str, BidAskAnalyzer] = {}
 
     last_publish: Dict[str, float] = {}
+    last_hist_flush = 0.0
 
     log.info(
         "START reading %s + %s -> %s + %s{{KEY}} "
-        "(depth_avg_window=%s spread_avg_window=%s throttle=%ss symbols=%d)",
+        "(depth_avg_window=%s spread_hist_days=%s session_min=%s "
+        "hist_flush=%ss throttle=%ss latest_ttl=%ss symbols=%d)",
         EQ_STREAM,
         OPT_STREAM,
         OUT_STREAM,
         LATEST_KEY_PREFIX,
         DEPTH_AVG_WINDOW,
-        SPREAD_AVG_WINDOW,
+        SPREAD_HIST_DAYS,
+        SESSION_MIN,
+        HIST_FLUSH_SEC,
         LIVE_THROTTLE_SEC,
+        LATEST_TTL_SEC,
         len(symbols),
     )
 
@@ -138,11 +213,18 @@ def main() -> None:
             count=2000,
             block=2000,
         )
+        now = time.time()
+        if now - last_hist_flush >= HIST_FLUSH_SEC:
+            n = flush_option_hist(r, opt_analyzers)
+            last_hist_flush = now
+            if n:
+                log.debug("HIST_FLUSH rows=%d analyzers=%d", n, len(opt_analyzers))
+
         if not resp:
             continue
 
-        now = time.time()
         now_ms = int(now * 1000)
+        today = ist_today()
 
         for stream, msgs in resp:
             ack_ids = []
@@ -174,17 +256,30 @@ def main() -> None:
                 ask_sizes = _parse_depth5(fields.get("ask_depth5") or "")
 
                 if key not in analyzers:
+                    daily = []
+                    if kind == "opt":
+                        daily = prior_daily_avgs(load_spread_hist(r, key), today)
                     analyzers[key] = BidAskAnalyzer(
                         depth_avg_window=DEPTH_AVG_WINDOW,
-                        spread_avg_window=SPREAD_AVG_WINDOW,
                         is_option=(kind == "opt"),
+                        daily_spread_avgs=daily,
+                        session_min_samples=SESSION_MIN,
+                        max_spread_days=SPREAD_HIST_DAYS,
                     )
+                    if kind == "opt":
+                        log.debug(
+                            "INIT key=%s kind=opt prior_days=%d avgs=%s",
+                            key,
+                            len(daily),
+                            [round(x, 4) for x in daily],
+                        )
 
                 res = analyzers[key].analyze(bid, ask, bid_sizes, ask_sizes)
 
                 log.debug(
                     "LOGIC key=%s kind=%s bid=%.2f ask=%.2f spread_pct=%.4f "
-                    "depth=%.0f liq_score=%.2f signal=%s ratio=%s",
+                    "depth=%.0f liq_score=%.2f signal=%s ratio=%s "
+                    "avg=%s src=%s days=%s",
                     key,
                     kind,
                     res.bid,
@@ -194,6 +289,9 @@ def main() -> None:
                     res.liquidity_score,
                     res.signal,
                     res.spread_ratio,
+                    res.spread_avg,
+                    res.spread_avg_source,
+                    res.spread_days,
                 )
 
                 prev_t = last_publish.get(key, 0.0)

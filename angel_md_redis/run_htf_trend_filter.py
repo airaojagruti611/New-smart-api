@@ -182,9 +182,18 @@ def main():
         len(symbols),
     )
     _bootstrap(r, symbols, daily_by_sym)
-    if not any(len(buf) >= 2 for buf in daily_by_sym.values()):
-        log.info("bootstrap empty, waiting 20s for history seed then retry")
-        time.sleep(20)
+    retries = int(os.getenv("HTF_BOOTSTRAP_RETRIES", "8"))
+    wait_sec = float(os.getenv("HTF_BOOTSTRAP_WAIT_SEC", "15"))
+    attempt = 0
+    while not any(len(buf) >= 2 for buf in daily_by_sym.values()) and attempt < retries:
+        attempt += 1
+        log.info(
+            "bootstrap empty, waiting %.0fs for history seed then retry %s/%s",
+            wait_sec,
+            attempt,
+            retries,
+        )
+        time.sleep(wait_sec)
         _bootstrap(r, symbols, daily_by_sym)
 
     while True:

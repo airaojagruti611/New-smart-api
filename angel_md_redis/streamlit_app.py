@@ -253,8 +253,13 @@ with c5:
     kpi("Composite", _fmt(comp.get("score"), 3), str(comp.get("status") or ""))
 with c6:
     em = d.get("expected") or {}
-    move = em.get("final_expected_move") or em.get("expected_move_pct") or em.get("expected_move")
-    kpi("Expected move", _fmt(move, 2), str(em.get("direction") or ""))
+    pct = fnum(em.get("expected_move_pct"))
+    move_label = f"{pct * 100:.2f}%" if pct is not None else _fmt(em.get("final_expected_move") or em.get("expected_move"), 2)
+    kpi(
+        "Expected move",
+        move_label,
+        f"tgt={_fmt(em.get('target_price'), 2)}  {em.get('direction') or ''}  conf={em.get('confidence') or '—'}",
+    )
 
 st.markdown(
     f"**Gate** {_pill(signal, kind)} &nbsp; **HTF** {_pill(str((d.get('htf') or {}).get('bias') or 'EMPTY'), decision_kind(str((d.get('htf') or {}).get('bias'))))} &nbsp; "
@@ -434,10 +439,10 @@ with tabs[5]:
     with e1:
         st.markdown("**Expected move (prediction only — no strike)**")
         st.json(d.get("expected") or {"status": "EMPTY"})
-        st.caption("Empty IV means REST greeks have not populated yet. indicator_score comes from Supertrend + EMA + pivot strength.")
+        st.caption("Score × Greeks/liquidity multiplier × 2%. target_price = spot + expected_move. indicator_score is Supertrend + EMA + pivot strength.")
     with e2:
-        st.markdown("**Greeks change (needs a selected option)**")
-        st.json(d.get("greeks_change") or {"status": "EMPTY until strike_select OK"})
+        st.markdown("**Greeks change (Expected Move × candidate strike)**")
+        st.json(d.get("greeks_change") or {"status": "EMPTY until expected_move + ATM/strikeflow"})
         st.markdown("**Last 1m candle**")
         st.json(d.get("c1m") or {"status": "EMPTY"})
 

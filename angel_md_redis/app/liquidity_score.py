@@ -7,29 +7,27 @@ Liquidity Score Module for Option Chain — Module 1 (Entry Size Calculator)
 Deliberately reuses signals this pipeline already computes rather than
 re-deriving them:
   - spread% vs rolling average  -> from run_bidask_analyzer.py (md:bidask:latest)
-  - book depth top-5             -> from md:ticks:opt / bidask liquidity_score
+  - book depth top-3            -> from md:ticks:opt bid_depth5[:3]
 
-Data approximations (flagged, not silently assumed away):
-  - "Average daily volume" (multi-day). No historical daily-volume archive
-    exists yet -> volume cap uses session cumulative volume (today's
-    `volume_trade_for_the_day`) x 5%. Swap in a real ADV store if you build one.
-  - "OI jumped >20% overnight" (gamma proxy). No prior-calendar-day OI
-    snapshot exists -> approximated with SESSION-OPEN OI vs current OI.
+Persist-backed inputs (wired in run_liquidity_score.py):
+  - Average daily volume: mean of prior session volumes (fallback: today).
+  - Overnight OI jump (gamma proxy): previous calendar-day OI vs current
+    (fallback: first OI persisted for today, survives worker restarts).
 
-No I/O here — pure dataclasses + functions/classes. Redis wiring lives in
-run_liquidity_score.py.
+Sizes are in contracts/lots when the caller converts Angel quantity by
+lot size. No I/O here — Redis wiring lives in run_liquidity_score.py.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, replace
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # ── Module 1: Entry Size ────────────────────────────────────────────────
 
 OI_CAP_PCT = 0.015          # 1.5% of OI (brief's "1-2%" -> mid-point default)
-VOLUME_CAP_PCT = 0.05       # 5% of session / average daily volume
+VOLUME_CAP_PCT = 0.05       # 5% of average daily volume
 BOOK_DEPTH_MULT = 10.0      # 10x top-3 bid size
 
 VOL_OI_HOT = 3.0
@@ -52,6 +50,10 @@ BAND_SIZE_MULT = {
     "ORANGE": 0.2,   # probe size
     "RED": 0.0,      # do not enter
 }
+
+YELLOW_CLUSTER_N = 2        # Yellow: scale-out in 2 tranches only
+DEFAULT_CLUSTER_N = 3
+YELLOW_EXIT_CAP = 40        # 2-tranche cap (3-of-5 matrix)
 
 
 def vol_oi_ratio(volume: float, oi: float) -> Optional[float]:
@@ -105,6 +107,14 @@ def estimate_opening_ratio(ratio: Optional[float], price_moving_toward_strike: O
 def expected_oi_change(current_oi: float, volume: float, opening_ratio: float) -> float:
     """Expected new OI = current_oi + (today's volume x opening_ratio)."""
     return round(current_oi + (volume * opening_ratio), 2)
+
+
+def qty_to_lots(qty: float, lot_size: Optional[float]) -> float:
+    """Angel FO quantity is shares; spec entry size is contracts/lots."""
+    lot = float(lot_size or 0.0)
+    if lot <= 0:
+        return float(qty or 0.0)
+    return round(float(qty or 0.0) / lot, 4)
 
 
 def _confidence_multiplier(ratio: Optional[float], spread_ratio: Optional[float]) -> float:
@@ -165,8 +175,11 @@ def entry_size(
     oi = max(oi, 0.0)
     today_volume = max(today_volume, 0.0)
     bid_top3_size = max(bid_top3_size, 0.0)
-    # Session cumulative volume is the ADV proxy until a multi-day store exists.
-    volume_for_cap = max(float(avg_daily_volume or 0.0), today_volume)
+    # Spec: 5% of average daily volume. Today is only the fallback.
+    if avg_daily_volume and avg_daily_volume > 0:
+        volume_for_cap = float(avg_daily_volume)
+    else:
+        volume_for_cap = today_volume
 
     oi_cap = round(oi * OI_CAP_PCT, 2)
     volume_cap = round(volume_for_cap * VOLUME_CAP_PCT, 2)
@@ -212,42 +225,116 @@ def apply_band_to_entry(entry: EntrySizeResult, band: str) -> EntrySizeResult:
     return replace(entry, final_entry_size=final, band_size_mult=band_mult)
 
 
-# ── Session-open OI tracker (for the gamma-jump proxy) ──────────────────
+def cluster_top_n_for_band(band: str) -> int:
+    if band == "YELLOW":
+        return YELLOW_CLUSTER_N
+    return DEFAULT_CLUSTER_N
+
+
+# ── Daily OI / volume history (overnight gamma + ADV) ───────────────────
 
 def _today_str() -> str:
     return dt.date.today().isoformat()
 
 
-class SessionOpenOI:
-    """First OI value seen for a contract each trading day; resets daily."""
+ADV_LOOKBACK_DAYS = 5
+HIST_MAX_DAYS = 10
+
+
+@dataclass(frozen=True)
+class DaySnap:
+    date: str
+    oi: float
+    vol: float
+    open_oi: float
+
+
+class ContractDayHist:
+    """
+    Per-contract daily OI/volume snapshots.
+
+    Overnight gamma: (today OI - previous date's last OI) / previous OI.
+    If no prior date exists, fall back to today's first persisted OI
+    (survives worker restarts, unlike a pure in-memory session open).
+
+    ADV: mean of up to ADV_LOOKBACK_DAYS prior session volumes.
+    """
 
     def __init__(self):
-        self._day = _today_str()
-        self._open_oi: Dict[str, float] = {}
+        self._rows: Dict[str, List[DaySnap]] = {}
 
-    def observe(self, tradingsymbol: str, oi: float) -> float:
-        today = _today_str()
-        if today != self._day:
-            self._day = today
-            self._open_oi = {}
-        if tradingsymbol not in self._open_oi and oi > 0:
-            self._open_oi[tradingsymbol] = oi
-        return self._open_oi.get(tradingsymbol, oi)
+    def hydrate(self, tradingsymbol: str, rows: List[dict]) -> None:
+        out: List[DaySnap] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            date = str(row.get("date") or "").strip()
+            try:
+                oi = float(row.get("oi") or 0.0)
+                vol = float(row.get("vol") or 0.0)
+                open_oi = float(row.get("open_oi") or oi or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if date:
+                out.append(DaySnap(date=date, oi=oi, vol=vol, open_oi=open_oi))
+        out.sort(key=lambda x: x.date)
+        self._rows[tradingsymbol] = out[-HIST_MAX_DAYS:]
 
-    def jump_pct(self, tradingsymbol: str, current_oi: float) -> Optional[float]:
-        open_oi = self._open_oi.get(tradingsymbol)
-        if not open_oi or open_oi <= 0:
+    def dump(self, tradingsymbol: str) -> List[dict]:
+        return [
+            {"date": s.date, "oi": s.oi, "vol": s.vol, "open_oi": s.open_oi}
+            for s in self._rows.get(tradingsymbol, [])
+        ]
+
+    def observe(self, tradingsymbol: str, oi: float, vol: float, day: Optional[str] = None) -> DaySnap:
+        day = day or _today_str()
+        oi = max(float(oi or 0.0), 0.0)
+        vol = max(float(vol or 0.0), 0.0)
+        rows = self._rows.setdefault(tradingsymbol, [])
+        if rows and rows[-1].date == day:
+            prev = rows[-1]
+            open_oi = prev.open_oi if prev.open_oi > 0 else (oi if oi > 0 else 0.0)
+            snap = DaySnap(date=day, oi=oi, vol=vol, open_oi=open_oi)
+            rows[-1] = snap
+        else:
+            open_oi = oi if oi > 0 else 0.0
+            snap = DaySnap(date=day, oi=oi, vol=vol, open_oi=open_oi)
+            rows.append(snap)
+            self._rows[tradingsymbol] = rows[-HIST_MAX_DAYS:]
+        return snap
+
+    def overnight_jump_pct(
+        self, tradingsymbol: str, current_oi: float, day: Optional[str] = None,
+    ) -> Tuple[Optional[float], str]:
+        day = day or _today_str()
+        rows = self._rows.get(tradingsymbol) or []
+        prior = [x for x in rows if x.date < day and x.oi > 0]
+        if prior and current_oi >= 0:
+            base = prior[-1].oi
+            if base > 0:
+                return round((current_oi - base) / base * 100.0, 2), "prev_day"
+        today = next((x for x in rows if x.date == day), None)
+        if today and today.open_oi > 0:
+            return round((current_oi - today.open_oi) / today.open_oi * 100.0, 2), "session_open"
+        return None, "no_data"
+
+    def adv(self, tradingsymbol: str, day: Optional[str] = None) -> Optional[float]:
+        day = day or _today_str()
+        rows = self._rows.get(tradingsymbol) or []
+        vols = [x.vol for x in rows if x.date < day and x.vol > 0][-ADV_LOOKBACK_DAYS:]
+        if not vols:
             return None
-        return round((current_oi - open_oi) / open_oi * 100.0, 2)
+        return round(sum(vols) / len(vols), 4)
 
 
 # ── Module 2: Scale-Out Levels ───────────────────────────────────────────
 
-GAMMA_JUMP_PCT = 20.0            # overnight/session OI jump -> "gamma building here"
+GAMMA_JUMP_PCT = 20.0            # overnight OI jump -> "gamma building here"
 OI_WALL_MULT = 2.0               # next strike OI > 2x current -> "wall ahead"
 SPREAD_SCALE_TRIGGER = 1.4       # spread% > 1.4x session avg -> scale-out check
 PRICE_NEAR_STRIKE_PCT = 0.5      # price within 0.5% of a target strike -> "approaching"
 VOL_OI_DROP_PCT = 5.0            # Vol/OI must fall at least 5% vs prior eval
+DEGRADATION_SCALE_TRIGGER = 1.5  # Method C: modeled spread >= 1.5x entry
 
 # Liquidity degradation curve multipliers by underlying-move band (Method C)
 _DEGRADATION_BANDS = [
@@ -278,7 +365,7 @@ def gamma_speed_bump_strikes(
     strikes_oi_jump_pct: Dict[float, Optional[float]],
     threshold_pct: float = GAMMA_JUMP_PCT,
 ) -> List[float]:
-    """Method B proxy. Strikes whose session OI jump exceeds threshold."""
+    """Method B proxy. Strikes whose overnight (or session-open fallback) OI jump exceeds threshold."""
     return sorted(
         strike for strike, jump in strikes_oi_jump_pct.items()
         if jump is not None and jump > threshold_pct
@@ -292,12 +379,26 @@ def approaching_strike(spot: Optional[float], strike: float, pct: float = PRICE_
 
 
 def degradation_multiplier(underlying_move_pct: float) -> float:
-    """Method C. underlying_move_pct is the ABS % move since entry."""
+    """Method C. underlying_move_pct is the ABS % move since entry (or session open)."""
     mult = _DEGRADATION_BANDS[0][1]
     for band_pct, band_mult in _DEGRADATION_BANDS:
         if underlying_move_pct >= band_pct:
             mult = band_mult
     return mult
+
+
+def degradation_exit_floor(deg_mult: float) -> int:
+    """
+    Spec Method C: begin exiting when modeled spread crosses 1.5x entry.
+    Map the degradation curve onto the same tranche grid as the 2-of-5 matrix.
+    """
+    if deg_mult >= 2.5:      # +30% underlying → 2.75x
+        return 65
+    if deg_mult >= 1.8:      # +20% → 1.8x
+        return 40
+    if deg_mult >= DEGRADATION_SCALE_TRIGGER:
+        return 25
+    return 0
 
 
 def vol_oi_is_dropping(
@@ -312,12 +413,23 @@ def vol_oi_is_dropping(
     return drop_pct >= min_drop_pct
 
 
+def net_delta_is_flattening(current_bias: str, previous_bias: Optional[str]) -> bool:
+    """
+    Spec condition 5: net delta flattening = momentum was directional
+    and has now gone NEUTRAL. Always-NEUTRAL is not 'flattening'.
+    """
+    cur = (current_bias or "").upper()
+    prev = (previous_bias or "").upper()
+    return cur == "NEUTRAL" and prev in ("UP", "DOWN")
+
+
 @dataclass(frozen=True)
 class ScaleOutCheck:
     conditions: Dict[str, bool]
     conditions_met: int
-    exit_pct: int  # 0 / 25 / 40 / 65 (midpoint of "60-70")
+    exit_pct: int  # 0 / 25 / 40 / 65 / 100
     reason: str
+    advisory: bool = False
 
 
 def scale_out_decision(
@@ -328,12 +440,17 @@ def scale_out_decision(
     net_delta_flattening: bool,
     in_position: bool = False,
     approaching_gamma_bump: bool = False,
+    band: str = "GREEN",
+    degradation_mult: float = 1.0,
 ) -> ScaleOutCheck:
     """
     Decision matrix: 2-of-5 met -> 25%, 3-of-5 -> 40%, 4+/5 -> 65%.
-    Scale-out % is 0 unless an actual position is open (spec is in-trade).
-    Approaching a Method-B gamma speed-bump counts as the OI-cluster condition
-    (scale out before price reaches that strike).
+    Method C independently floors the tranche when modeled spread >= 1.5x.
+    RED band: 100% immediate exit (spec: if already in, exit regardless of P&L).
+    YELLOW band: cap at 40% (2 tranches only).
+
+    This is a signal layer, not an OMS: the recommended tranche is always
+    computed. `advisory=True` when no live fill is open.
     """
     conditions = {
         "near_top_oi_strike": bool(price_near_top_oi_strike or approaching_gamma_bump),
@@ -341,13 +458,22 @@ def scale_out_decision(
         "oi_wall_ahead": next_strike_oi_is_wall,
         "vol_oi_dropping": vol_oi_dropping,
         "delta_flattening": net_delta_flattening,
+        "degradation_stretched": degradation_mult >= DEGRADATION_SCALE_TRIGGER,
     }
-    n = sum(1 for v in conditions.values() if v)
+    five = (
+        conditions["near_top_oi_strike"],
+        conditions["spread_widened"],
+        conditions["oi_wall_ahead"],
+        conditions["vol_oi_dropping"],
+        conditions["delta_flattening"],
+    )
+    n = sum(1 for v in five if v)
+    advisory = not in_position
 
-    if not in_position:
+    if (band or "").upper() == "RED":
         return ScaleOutCheck(
-            conditions=conditions, conditions_met=n, exit_pct=0,
-            reason="no_open_position",
+            conditions=conditions, conditions_met=n, exit_pct=100,
+            reason="red_force_exit", advisory=advisory,
         )
 
     if n >= 4:
@@ -359,9 +485,23 @@ def scale_out_decision(
     else:
         exit_pct = 0
 
+    floor = degradation_exit_floor(degradation_mult)
+    if floor > exit_pct:
+        exit_pct = floor
+        reason = f"method_c_degradation_{degradation_mult}x"
+    else:
+        reason = f"{n}_of_5_conditions_met"
+
+    if (band or "").upper() == "YELLOW" and exit_pct > YELLOW_EXIT_CAP:
+        exit_pct = YELLOW_EXIT_CAP
+        reason = f"{reason}_yellow_2_tranche_cap"
+
+    if advisory and exit_pct > 0:
+        reason = f"{reason}_advisory"
+
     return ScaleOutCheck(
         conditions=conditions, conditions_met=n, exit_pct=exit_pct,
-        reason=f"{n}_of_5_conditions_met",
+        reason=reason, advisory=advisory,
     )
 
 
@@ -430,11 +570,18 @@ def oi_expansion_component(
     return round(pts, 2)
 
 
-def depth_component(bidask_liquidity_score_0_100: Optional[float], max_pts: float = 10.0) -> float:
-    """Reuses run_bidask_analyzer.py's own 0-100 depth score, rescaled."""
-    if bidask_liquidity_score_0_100 is None:
+def depth_component(
+    bid_top3: Optional[float],
+    chain_max_bid_top3: Optional[float],
+    max_pts: float = 10.0,
+) -> float:
+    """
+    Spec 10 pts: book depth at top 3 bid levels, scored vs the deepest
+    top-3 book on the same side of the chain (full points = thickest book).
+    """
+    if not bid_top3 or bid_top3 <= 0 or not chain_max_bid_top3 or chain_max_bid_top3 <= 0:
         return 0.0
-    return round(_clamp(bidask_liquidity_score_0_100 / 100.0, 0.0, 1.0) * max_pts, 2)
+    return round(_clamp(bid_top3 / chain_max_bid_top3, 0.0, 1.0) * max_pts, 2)
 
 
 def classify_score_band(score: float) -> str:
@@ -462,7 +609,8 @@ def compute_liquidity_score(
     chain_size: int,
     current_oi: float,
     expected_oi: float,
-    bidask_depth_score: Optional[float],
+    bid_top3: Optional[float],
+    chain_max_bid_top3: Optional[float],
     entry: EntrySizeResult,
 ) -> LiquidityScoreResult:
     components = {
@@ -470,7 +618,7 @@ def compute_liquidity_score(
         "spread": spread_component(spread_ratio),
         "oi_rank": oi_rank_component(oi_rank, chain_size),
         "oi_expansion": oi_expansion_component(current_oi, expected_oi, vol_oi),
-        "depth": depth_component(bidask_depth_score),
+        "depth": depth_component(bid_top3, chain_max_bid_top3),
     }
     score = round(sum(components.values()), 2)
     band = classify_score_band(score)

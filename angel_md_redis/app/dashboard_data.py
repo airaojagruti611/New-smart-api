@@ -85,7 +85,9 @@ def collect_symbol(r: redis.Redis, sym: str) -> Dict[str, Any]:
     greeks_ce = load_json(r, f"md:greeks:phase:underlying:latest:{s}:CE") or {}
     tsym = str(strike.get("tradingsymbol") or greeks_ce.get("tradingsymbol") or "")
     liq = load_json(r, f"md:liquidity:score:latest:{tsym}") if tsym else None
-    gchg = load_json(r, f"md:greeks_change:latest:{tsym}") if tsym else None
+    gchg = load_json(r, f"md:greeks_change:latest:{s}") or {}
+    if not gchg and tsym:
+        gchg = load_json(r, f"md:greeks_change:latest:{tsym}") or {}
 
     return {
         "tick": pick_stream(r, "md:ticks:eq", s, 150),

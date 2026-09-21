@@ -1,13 +1,17 @@
-import os
 import json
+import os
 import time
 from typing import Any, Dict, Optional, Tuple
 
 import redis
 
+from app.config import GREEKS_DIVIDEND_YIELD, RISK_FREE_RATE
+from app.option_pricing import greeks_from_market_premium, time_to_expiry_years
+
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 TICKS_STREAM = os.getenv("TICKS_STREAM_OPT", "md:ticks:opt")
+EQ_STREAM = os.getenv("TICKS_STREAM_EQ", "md:ticks:eq")
 OUT_STREAM = os.getenv("FEATURES_STREAM_OPT", "md:features:opt")
 
 OUT_MAXLEN = int(os.getenv("FEATURES_STREAM_MAXLEN", "500000"))
@@ -16,6 +20,7 @@ CONSUMER = os.getenv("JOINER_CONSUMER", "joiner-1")
 
 # refresh greeks cache at most every N seconds per (underlying, expiry)
 GREEKS_REFRESH_SEC = float(os.getenv("GREEKS_REFRESH_SEC", "3.0"))
+SPOT_REFRESH_SEC = float(os.getenv("JOINER_SPOT_REFRESH_SEC", "1.0"))
 
 
 def _ensure_group(r: redis.Redis, stream: str, group: str):
@@ -58,6 +63,29 @@ def strike_cp_key(strike: Any, cp: Any) -> Optional[str]:
     return f"{s}:{c}"
 
 
+def _safe_float(v: Any) -> Optional[float]:
+    try:
+        if v is None or v == "":
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_present(*vals: Any) -> Any:
+    for v in vals:
+        if v is None or v == "":
+            continue
+        return v
+    return None
+
+
+def _fmt_num(v: Any) -> str:
+    if v is None or v == "":
+        return ""
+    return str(v)
+
+
 class OptionsGreeksJoiner:
     def __init__(self):
         self.r = redis.from_url(REDIS_URL, decode_responses=True)
@@ -68,6 +96,8 @@ class OptionsGreeksJoiner:
         # tradingsymbol is kept as a secondary key when present.
         self._cache: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
         self._cache_t: Dict[Tuple[str, str], float] = {}
+        self._spot: Dict[str, float] = {}
+        self._spot_t: float = 0.0
 
     def _load_greeks_map(self, underlying: str, expiry: str) -> Dict[str, Dict[str, Any]]:
         """
@@ -133,6 +163,44 @@ class OptionsGreeksJoiner:
             return cache[tsym]
         return {}
 
+    def _refresh_spot(self) -> None:
+        now = time.time()
+        if (now - self._spot_t) < SPOT_REFRESH_SEC:
+            return
+        try:
+            rows = self.r.xrevrange(EQ_STREAM, count=40)
+        except Exception:
+            return
+        for _mid, fields in rows:
+            sym = str(fields.get("symbol") or "").strip().upper()
+            ltp = _safe_float(fields.get("ltp"))
+            if sym and ltp:
+                self._spot[sym] = ltp
+        self._spot_t = now
+
+    def _local_greeks(
+        self,
+        underlying: str,
+        expiry: str,
+        strike: Any,
+        cp: Any,
+        ltp: Any,
+    ) -> Dict[str, Any]:
+        self._refresh_spot()
+        spot = self._spot.get(str(underlying or "").strip().upper())
+        k = _safe_float(strike)
+        p = _safe_float(ltp)
+        side = _norm_cp(cp)
+        tte = time_to_expiry_years(expiry) if expiry else None
+        if spot is None or k is None or p is None or p <= 0 or side not in ("CE", "PE") or not tte or tte <= 0:
+            return {}
+        g = greeks_from_market_premium(
+            spot, k, side, tte, p,
+            risk_free_rate=RISK_FREE_RATE,
+            dividend_or_carry=GREEKS_DIVIDEND_YIELD,
+        )
+        return g or {}
+
     def run_forever(self):
         print(f"[JOINER] reading {TICKS_STREAM} -> writing {OUT_STREAM}")
 
@@ -166,12 +234,36 @@ class OptionsGreeksJoiner:
                             strike=strike, cp=cp,
                         )
 
+                    delta = _first_present(greeks.get("delta"))
+                    gamma = _first_present(greeks.get("gamma"))
+                    theta = _first_present(greeks.get("theta"))
+                    vega = _first_present(greeks.get("vega"))
+                    iv = _first_present(greeks.get("iv"), greeks.get("impliedvolatility"))
+                    greeks_source = str(greeks.get("source") or "").strip()
+
+                    used_local = False
+                    if delta is None or gamma is None or iv is None:
+                        local = self._local_greeks(
+                            str(underlying), str(expiry), strike, cp, f.get("ltp"),
+                        )
+                        if local:
+                            used_local = True
+                            delta = _first_present(delta, local.get("delta"))
+                            gamma = _first_present(gamma, local.get("gamma"))
+                            theta = _first_present(theta, local.get("theta"))
+                            vega = _first_present(vega, local.get("vega"))
+                            iv = _first_present(iv, local.get("iv"), local.get("impliedvolatility"))
+
+                    if used_local:
+                        greeks_source = "theoretical_black_scholes"
+
                     out = dict(fields)  # keep original tick fields
-                    out["iv"] = str(greeks.get("iv") or greeks.get("impliedvolatility") or "")
-                    out["delta"] = str(greeks.get("delta") or "")
-                    out["gamma"] = str(greeks.get("gamma") or "")
-                    out["theta"] = str(greeks.get("theta") or "")
-                    out["vega"] = str(greeks.get("vega") or "")
+                    out["iv"] = _fmt_num(iv)
+                    out["delta"] = _fmt_num(delta)
+                    out["gamma"] = _fmt_num(gamma)
+                    out["theta"] = _fmt_num(theta)
+                    out["vega"] = _fmt_num(vega)
+                    out["greeks_source"] = greeks_source
 
                     self.r.xadd(OUT_STREAM, out, maxlen=OUT_MAXLEN, approximate=True)
                     ack_ids.append(msg_id)

@@ -35,8 +35,9 @@ in run_greeks_analyzer.py.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import Deque, Optional, Sequence
 
 from .logging_setup import setup_logger
 
@@ -46,6 +47,9 @@ log = setup_logger("greeks_phase")
 GAMMA_LOW_THRESHOLD = 0.02        # gamma below this -> "low gamma" (accumulation)
 GAMMA_RISING_PCT = 10.0           # gamma up >= this % vs previous reading -> "increasing"
 GAMMA_FALLING_PCT = -10.0         # gamma down >= this % vs previous reading -> "falling"
+TREND_WINDOW = 8                  # compare latest vs oldest in this window (not only last tick)
+DELTA_CONV_PCT = 2.0              # |delta| up this % over the window -> "steadily increasing"
+DELTA_CONV_MIN_SAMPLES = 3        # don't fire Markup on the first 1-2 ticks
 
 PRICE_CHANGE_SMALL_PCT = 0.15     # |recent underlying price change %| below this -> "low movement"
 
@@ -63,6 +67,16 @@ def _pct_change(curr: Optional[float], prev: Optional[float]) -> Optional[float]
     if curr is None or prev is None or prev == 0:
         return None
     return round((curr - prev) / abs(prev) * 100.0, 4)
+
+
+def _window_up(values: Sequence[float], rising_pct: float) -> bool:
+    """True when the last sample is `rising_pct`% above the first sample in the window."""
+    if len(values) < 2:
+        return False
+    first, last = float(values[0]), float(values[-1])
+    if first == 0:
+        return last > 0
+    return ((last - first) / abs(first)) * 100.0 >= rising_pct
 
 
 @dataclass(frozen=True)
@@ -116,6 +130,9 @@ class GreeksPhaseTracker:
         self._prev_iv: Optional[float] = None
         self._prev_theta: Optional[float] = None
         self._in_markup: bool = False  # gates DISTRIBUTION to only fire post-entry
+        self._gamma_hist: Deque[float] = deque(maxlen=TREND_WINDOW)
+        self._iv_hist: Deque[float] = deque(maxlen=TREND_WINDOW)
+        self._abs_delta_hist: Deque[float] = deque(maxlen=TREND_WINDOW)
 
     def analyze(
         self,
@@ -160,19 +177,34 @@ class GreeksPhaseTracker:
         prev_abs_delta = abs(self._prev_delta) if self._prev_delta is not None else None
         abs_delta_pct = _pct_change(abs_delta, prev_abs_delta)
 
-        gamma_rising = gamma_pct is not None and gamma_pct >= self.gamma_rising_pct
+        gamma_hist = list(self._gamma_hist) + [gamma]
+        iv_hist = list(self._iv_hist) + [iv]
+        abs_delta_hist = list(self._abs_delta_hist) + [abs_delta]
+
+        gamma_rising = (
+            (gamma_pct is not None and gamma_pct >= self.gamma_rising_pct)
+            or _window_up(gamma_hist, self.gamma_rising_pct)
+        )
         gamma_falling = gamma_pct is not None and gamma_pct <= self.gamma_falling_pct
-        iv_rising = iv_pct is not None and iv_pct >= self.iv_rising_pct
+        iv_rising = (
+            (iv_pct is not None and iv_pct >= self.iv_rising_pct)
+            or _window_up(iv_hist, self.iv_rising_pct)
+        )
         # IV "stable" requires a prior reading; first tick must not count as stable.
         iv_stable = iv_pct is not None and abs(iv_pct) <= self.iv_stable_band
         iv_dropping_sharply = iv_pct is not None and iv_pct <= self.iv_drop_sharp_pct
         # Magnitude: CE and PE both "weaken" when |delta| falls.
         delta_decreasing = abs_delta_pct is not None and abs_delta_pct < 0
+        delta_rising = (
+            (abs_delta_pct is not None and abs_delta_pct > 0)
+            or _window_up(abs_delta_hist, DELTA_CONV_PCT)
+        )
         theta_surging = theta_pct is not None and abs(theta_pct) >= self.theta_surge_pct
         price_small = price_change_pct is not None and abs(price_change_pct) < self.price_small_pct
         # breakout is optional context (price vs pivot); when the caller
         # doesn't have it, None means "not evaluated" -> doesn't block entry.
         breakout_ok = True if breakout is None else breakout
+        in_delta_band = self.delta_entry_min <= abs_delta <= self.delta_entry_max
 
         reasons = []
 
@@ -195,18 +227,37 @@ class GreeksPhaseTracker:
                 phase, action = "MARKUP", "HOLD"
                 reasons.append("in_trade_no_exit_trigger")
 
-        elif (
-            self.delta_entry_min <= abs_delta <= self.delta_entry_max
-            and gamma_rising
-            and iv_rising
-            and breakout_ok
-        ):
+        elif in_delta_band and gamma_rising and iv_rising and breakout_ok:
             phase = "MARKUP"
             action = "BUY CALL" if cp == "CE" else ("BUY PUT" if cp == "PE" else "HOLD")
             self._in_markup = True
             reasons.append("delta_in_range+gamma_rising+iv_rising+breakout")
 
-        elif gamma <= self.gamma_low and price_small and iv_stable:
+        elif (
+            in_delta_band
+            and breakout_ok
+            and delta_rising
+            and not gamma_falling
+            and not iv_dropping_sharply
+            and len(abs_delta_hist) >= DELTA_CONV_MIN_SAMPLES
+        ):
+            # Word-doc Markup: "steadily increasing call Delta" (PE mirrored on |delta|).
+            # Lets theoretical/local Greeks enter Markup when tick-to-tick gamma/IV
+            # % is ~0 but directional conviction is building with spot.
+            phase = "MARKUP"
+            action = "BUY CALL" if cp == "CE" else ("BUY PUT" if cp == "PE" else "HOLD")
+            self._in_markup = True
+            reasons.append("delta_in_range+delta_rising+breakout")
+
+        elif (
+            gamma <= self.gamma_low
+            and price_small
+            and iv_stable
+            and abs_delta < self.delta_entry_min
+        ):
+            # Accumulation is quiet near-ATM positioning (spec example delta ~0.40–0.50).
+            # Do NOT dump ATM 0.5–0.8 or deep-ITM delta=1.0 into NO_TRADE just because
+            # NSE stock-option gamma is typically < 0.02.
             phase = "ACCUMULATION"
             action = "NO_TRADE"
             reasons.append("low_gamma+low_price_move+iv_stable")
@@ -217,6 +268,9 @@ class GreeksPhaseTracker:
 
         self._prev_delta, self._prev_gamma = delta, gamma
         self._prev_iv, self._prev_theta = iv, theta
+        self._gamma_hist.append(gamma)
+        self._iv_hist.append(iv)
+        self._abs_delta_hist.append(abs_delta)
 
         result = PhaseResult(
             phase=phase, action=action, side=side,

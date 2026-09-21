@@ -162,7 +162,7 @@ LAYERS = [
                 "streams": ["md:volume:signal"],
                 "latest_prefix": None,
                 "latest_key": "md:volume:latest",
-                "description": "Buyer/seller dominance → Bullish/Bearish/Wrong Entry Volume",
+                "description": "1m OHLCV buyer/seller dominance → Bullish/Bearish/Wrong Entry Volume",
             },
             {
                 "name": "Module 3: Market Regime Detector",
@@ -178,7 +178,8 @@ LAYERS = [
                 "streams": [],
                 "latest_prefix": "md:bidask:latest:*",
                 "latest_key": None,
-                "description": "Spread%, liquidity score, S/R from depth",
+                "description": "Spread%, 0-100 depth score; options vs 10-day avg spread (1.5x caution / 2x exit)",
+                "extra_prefix": "md:bidask:spread_hist:*",
             },
             {
                 "name": "Module 4b: Smart Money Detection",
@@ -288,7 +289,7 @@ LAYERS = [
                 "streams": [],
                 "latest_prefix": "md:greeks_change:latest:*",
                 "latest_key": None,
-                "description": "Per-tick greeks acceleration/deceleration",
+                "description": "Scenario grid of predicted Greeks from Expected Move + ATM/strikeflow candidate",
             },
         ],
     },

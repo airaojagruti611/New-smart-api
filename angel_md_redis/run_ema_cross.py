@@ -5,7 +5,7 @@ from collections import defaultdict, deque
 
 import redis
 
-from app.candle_io import parse_candle_fields, read_last_candles
+from app.candle_io import parse_candle_fields, read_last_candles, upsert_candle_window
 from app.candle_types import Candle
 from app.config import load_symbols
 from app.ema_cross import last_ema_cross_signal
@@ -122,7 +122,7 @@ def main():
                     log.debug("SKIP unknown_symbol id=%s symbol=%r", msg_id, sym)
                     continue
                 log.debug("MSG_IN id=%s symbol=%s ts_ms=%s c=%.4f", msg_id, sym, c.ts_ms, c.c)
-                windows[sym].append(c)
+                upsert_candle_window(windows[sym], c)
                 touched.add(sym)
 
         if ack_ids:

@@ -2,9 +2,12 @@
 run_oi_analysis.py
 ───────────────────────
 Open Interest Analysis — full module (Steps 1-6). Reads md:ticks:opt
-(ltp, vol, oi) + md:ticks:eq (spot, for ATM/moneyness), tracks each
-contract's previous price/OI/volume snapshot across evaluation cycles,
-and emits two streams:
+(ltp, vol, oi) + md:ticks:eq (spot, for ATM/moneyness).
+
+Build-up (Steps 1, 3) uses a session-open baseline for previous_price /
+previous_open_interest (the feed does not publish prior-day OI; first
+print of the IST day is the spec's previous_* proxy). Smart money
+(Step 2) uses the 5s interval OI/volume delta vs a rolling average.
 
   Per-contract (Steps 1-3: OI change, smart money participation, buildup):
     Stream : md:oi:signal
@@ -14,21 +17,17 @@ and emits two streams:
     Stream : md:oi:underlying:signal
     Key    : md:oi:underlying:latest:{SYMBOL}
 
-Evaluated on a periodic cycle (OI updates far slower than tick rate; no
-reason to reclassify on every raw tick).
-
-Dominant buildup (feeding Step 6) is read from the ATM CALL contract's
-buildup_type — ATM is where positioning sentiment is most actively
-expressed. Not specified in the brief; change source_of_dominant_buildup()
-if you want the ATM PUT, or an OI-weighted vote across strikes, instead.
+Dominant buildup for Step 6 is an OI-change-weighted vote across the
+chain (CE/PE mapped to underlying direction), not ATM-CE only.
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import time
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import redis
 
@@ -44,8 +43,14 @@ from app.oi_analysis import (
     oi_concentration,
     positioning_signal,
     smart_money_participation,
+    vote_dominant_buildup,
 )
-from app.strike_flow import moneyness
+
+try:
+    from zoneinfo import ZoneInfo
+    IST = ZoneInfo("Asia/Kolkata")
+except Exception:
+    IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 EQ_STREAM = os.getenv("STREAM_EQ", "md:ticks:eq")
@@ -62,11 +67,14 @@ UNDERLYING_LATEST_KEY_PREFIX = os.getenv("OI_UNDERLYING_LATEST_PREFIX", "md:oi:u
 GROUP = os.getenv("OI_GROUP", "oi_analysis")
 CONSUMER = os.getenv("OI_CONSUMER", "oi-analysis-1")
 
-PRICE_CHANGE_THRESHOLD_PCT = float(os.getenv("OI_PRICE_THRESHOLD_PCT", "0.05"))
-OI_CHANGE_THRESHOLD_PCT = float(os.getenv("OI_CHANGE_THRESHOLD_PCT", "1.0"))
+# Spec uses raw sign of price/OI change. Keep env knobs; default 0.
+PRICE_CHANGE_THRESHOLD_PCT = float(os.getenv("OI_PRICE_THRESHOLD_PCT", "0"))
+OI_CHANGE_THRESHOLD_PCT = float(os.getenv("OI_CHANGE_THRESHOLD_PCT", "0"))
 AVG_VOLUME_WINDOW = int(os.getenv("OI_AVG_VOLUME_WINDOW", "20"))
 EVAL_INTERVAL_SEC = float(os.getenv("OI_EVAL_INTERVAL_SEC", "5.0"))
 LATEST_TTL_SEC = int(os.getenv("OI_LATEST_TTL_SEC", "3600"))
+SESSION_TTL_SEC = int(os.getenv("OI_SESSION_TTL_SEC", "43200"))
+SESSION_KEY_PREFIX = os.getenv("OI_SESSION_PREFIX", "md:oi:session:")
 
 log = setup_logger("oi_analysis")
 
@@ -86,6 +94,10 @@ def _safe_float(v) -> Optional[float]:
         return float(v)
     except Exception:
         return None
+
+
+def _ist_today() -> str:
+    return dt.datetime.now(IST).date().isoformat()
 
 
 def _to_contract_payload(
@@ -122,16 +134,46 @@ class ContractSnapshot:
         self.cum_vol = 0.0
 
 
-def _source_of_dominant_buildup(
-    book: Dict[str, ContractSnapshot],
-    buildups: Dict[str, str],
-    atm: float,
-) -> str:
-    """ATM CALL contract's buildup_type drives Step 6's positioning signal."""
-    for tsym, snap in book.items():
-        if snap.cp == "CE" and abs(snap.strike - atm) < 1e-6:
-            return buildups.get(tsym, "NEUTRAL")
-    return "NEUTRAL"
+def _copy_snap(snap: ContractSnapshot) -> ContractSnapshot:
+    out = ContractSnapshot()
+    out.underlying, out.cp, out.strike = snap.underlying, snap.cp, snap.strike
+    out.price, out.oi, out.cum_vol = snap.price, snap.oi, snap.cum_vol
+    return out
+
+
+def _load_session_baseline(r: redis.Redis, tsym: str, day: str) -> Optional[ContractSnapshot]:
+    raw = r.get(f"{SESSION_KEY_PREFIX}{day}:{tsym}")
+    if not raw:
+        return None
+    try:
+        doc = json.loads(raw)
+    except Exception:
+        return None
+    snap = ContractSnapshot()
+    snap.price = float(doc.get("price") or 0.0)
+    snap.oi = float(doc.get("oi") or 0.0)
+    snap.cum_vol = float(doc.get("cum_vol") or 0.0)
+    snap.strike = float(doc.get("strike") or 0.0)
+    snap.cp = str(doc.get("cp") or "")
+    snap.underlying = str(doc.get("underlying") or "")
+    return snap
+
+
+def _save_session_baseline(r: redis.Redis, tsym: str, day: str, snap: ContractSnapshot) -> None:
+    payload = {
+        "price": snap.price,
+        "oi": snap.oi,
+        "cum_vol": snap.cum_vol,
+        "strike": snap.strike,
+        "cp": snap.cp,
+        "underlying": snap.underlying,
+    }
+    r.set(
+        f"{SESSION_KEY_PREFIX}{day}:{tsym}",
+        json.dumps(payload, separators=(",", ":")),
+        ex=SESSION_TTL_SEC,
+        nx=True,
+    )
 
 
 def main() -> None:
@@ -143,7 +185,9 @@ def main() -> None:
     spot_by_sym: Dict[str, float] = {}
     current: Dict[str, ContractSnapshot] = {}
     previous: Dict[str, ContractSnapshot] = {}
+    session_open: Dict[str, ContractSnapshot] = {}
     period_volume_avg: Dict[str, RollingStat] = {}
+    session_day = _ist_today()
 
     next_eval = time.time() + EVAL_INTERVAL_SEC
 
@@ -205,42 +249,63 @@ def main() -> None:
         next_eval = now + EVAL_INTERVAL_SEC
         now_ms = int(now * 1000)
 
+        today = _ist_today()
+        if today != session_day:
+            log.info("SESSION_RESET prev=%s new=%s", session_day, today)
+            session_day = today
+            session_open.clear()
+            previous.clear()
+            period_volume_avg.clear()
+
         buildups: Dict[str, str] = {}
+        oi_change_abs: Dict[str, float] = {}
+        smart_by_tsym: Dict[str, bool] = {}
         by_underlying: Dict[str, Dict[str, ContractSnapshot]] = {}
 
         # ── Per-contract pass: Steps 1-3 ──────────────────────────────
         for tsym, snap in current.items():
+            if tsym not in session_open:
+                stored = _load_session_baseline(r, tsym, session_day)
+                if stored is None:
+                    stored = _copy_snap(snap)
+                    _save_session_baseline(r, tsym, session_day, stored)
+                session_open[tsym] = stored
+
+            baseline = session_open[tsym]
             prev = previous.get(tsym)
-            prev_price = prev.price if prev else snap.price
-            prev_oi = prev.oi if prev else snap.oi
             prev_cum_vol = prev.cum_vol if prev else snap.cum_vol
+            prev_cycle_oi = prev.oi if prev else snap.oi
 
             period_volume = max(0.0, snap.cum_vol - prev_cum_vol)
             vol_stat = period_volume_avg.setdefault(tsym, RollingStat(AVG_VOLUME_WINDOW))
             avg_volume = vol_stat.avg
+            interval_oi_chg = snap.oi - prev_cycle_oi
 
             res = classify_buildup(
                 symbol=tsym,
                 strike=snap.strike,
                 price=snap.price,
-                previous_price=prev_price,
+                previous_price=baseline.price,
                 volume=period_volume,
                 current_oi=snap.oi,
-                previous_oi=prev_oi,
+                previous_oi=baseline.oi,
                 price_threshold_pct=PRICE_CHANGE_THRESHOLD_PCT,
                 oi_threshold_pct=OI_CHANGE_THRESHOLD_PCT,
             )
-            smart_money = smart_money_participation(res.oi_change, period_volume, avg_volume)
+            smart_money = smart_money_participation(interval_oi_chg, period_volume, avg_volume)
             vol_stat.push(period_volume)
 
             buildups[tsym] = res.buildup_type
+            oi_change_abs[tsym] = abs(res.oi_change)
+            smart_by_tsym[tsym] = smart_money
             by_underlying.setdefault(snap.underlying, {})[tsym] = snap
 
             log.debug(
                 "LOGIC tsym=%s underlying=%s strike=%s cp=%s price=%s->%s oi=%s->%s "
-                "period_vol=%s avg_vol=%s smart_money=%s buildup=%s",
-                tsym, snap.underlying, snap.strike, snap.cp, prev_price, snap.price,
-                prev_oi, snap.oi, period_volume, avg_volume, smart_money, res.buildup_type,
+                "period_vol=%s avg_vol=%s interval_oi=%s smart_money=%s buildup=%s",
+                tsym, snap.underlying, snap.strike, snap.cp, baseline.price, snap.price,
+                baseline.oi, snap.oi, period_volume, avg_volume, interval_oi_chg,
+                smart_money, res.buildup_type,
             )
 
             payload = _to_contract_payload(tsym, snap.underlying, snap.cp, res, smart_money, now_ms)
@@ -250,10 +315,7 @@ def main() -> None:
             if res.buildup_type != "NEUTRAL" or smart_money:
                 log.info("EMIT tsym=%s buildup=%s smart_money=%s payload=%s", tsym, res.buildup_type, smart_money, payload)
 
-            snap_copy = ContractSnapshot()
-            snap_copy.underlying, snap_copy.cp, snap_copy.strike = snap.underlying, snap.cp, snap.strike
-            snap_copy.price, snap_copy.oi, snap_copy.cum_vol = snap.price, snap.oi, snap.cum_vol
-            previous[tsym] = snap_copy
+            previous[tsym] = _copy_snap(snap)
 
         # ── Per-underlying pass: Steps 4-6 ────────────────────────────
         for und, book in by_underlying.items():
@@ -278,16 +340,29 @@ def main() -> None:
             strikes_sorted = sorted(by_strike.keys())
             atm = min(strikes_sorted, key=lambda s: abs(s - spot))
 
-            concentration: OIConcentration = oi_concentration(levels)
+            concentration: OIConcentration = oi_concentration(levels, spot=spot)
             mp = max_pain(levels)
-            dominant_buildup = _source_of_dominant_buildup(book, buildups, atm)
-            positioning = positioning_signal(dominant_buildup, concentration)
+            vote = vote_dominant_buildup(
+                (snap.cp, buildups.get(tsym, "NEUTRAL"), oi_change_abs.get(tsym, 0.0))
+                for tsym, snap in book.items()
+            )
+            dominant_buildup = vote.buildup
+            volume_participation = any(smart_by_tsym.get(tsym) for tsym in book)
+            positioning = positioning_signal(
+                dominant_buildup,
+                concentration,
+                spot=spot,
+                max_pain_strike=mp,
+                volume_participation=volume_participation,
+            )
 
             log.debug(
                 "UNDERLYING underlying=%s spot=%s atm=%s max_pain=%s dominant_buildup=%s "
-                "resistance=%s support=%s positioning=%s",
+                "vote_bull=%s vote_bear=%s n_voted=%s resistance=%s support=%s positioning=%s reason=%s",
                 und, spot, atm, mp, dominant_buildup,
-                concentration.primary_resistance, concentration.primary_support, positioning.signal,
+                vote.bullish_weight, vote.bearish_weight, vote.n_voted,
+                concentration.primary_resistance, concentration.primary_support,
+                positioning.signal, positioning.reason,
             )
 
             payload = {

@@ -13,11 +13,14 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import redis
 
 from .angel_auth import login
-from .angel_rest import fetch_candle_data
+from .angel_rest import api_error_text, api_failed, candle_rows, fetch_candle_data
+from .candle_builder import resample_candles
 from .candle_io import count_symbol_candles, existing_ts_set
 from .candle_types import Candle
 from .candles_store import CandlesStore
 from .config import load_symbols
+from .history_moneycontrol import fetch_moneycontrol_nse_candles
+from .history_yahoo import fetch_yahoo_nse_candles
 from .pivots import classic_pivots
 from .scripmaster import load_scripmaster, resolve_eq_tokens
 
@@ -45,13 +48,11 @@ OUT_MAXLEN_PIVOTS = int(os.getenv("STREAM_MAXLEN_PIVOTS_PREVDAY", "200000"))
 
 SLEEP_SEC = float(os.getenv("HISTORY_SLEEP_SEC", "0.40"))
 
-# interval, stream, maxlen, lookback_days, min_bars_to_skip_fetch, skip_today
-INTERVALS: List[Tuple[str, str, str, int, int, int, bool]] = [
+# Remote fetch only 1d + 1m. 5m/10m/30m are resampled from 1m so we
+# do not hammer Yahoo / Angel with extra interval calls.
+FETCH_INTERVALS: List[Tuple[str, str, str, int, int, int, bool]] = [
     ("ONE_DAY", "1d", STREAM_1D, OUT_MAXLEN_1D, 220, 2, True),
     ("ONE_MINUTE", "1m", STREAM_1M, OUT_MAXLEN_1M, 3, 26, False),
-    ("FIVE_MINUTE", "5m", STREAM_5M, OUT_MAXLEN_5M, 10, 8, False),
-    ("TEN_MINUTE", "10m", STREAM_10M, OUT_MAXLEN_10M, 15, 8, False),
-    ("THIRTY_MINUTE", "30m", STREAM_30M, OUT_MAXLEN_30M, 25, 8, False),
 ]
 
 
@@ -74,15 +75,30 @@ def _parse_row_ts(value) -> Optional[dt.datetime]:
     s = str(value).strip()
     if not s:
         return None
+    if s.isdigit() or (s.replace(".", "", 1).isdigit() and s.count(".") < 2):
+        try:
+            raw = float(s)
+            if raw > 1e12:
+                raw = raw / 1000.0
+            if raw > 1e9:
+                return dt.datetime.fromtimestamp(raw, tz=IST)
+        except ValueError:
+            pass
     try:
         parsed = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        parsed = None
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S",
+            "%d-%m-%Y %H:%M:%S",
+            "%d %b %Y %H:%M:%S",
+        ):
             try:
-                parsed = dt.datetime.strptime(s[:19], fmt)
+                parsed = dt.datetime.strptime(s[:19] if len(s) >= 19 else s, fmt)
                 break
             except ValueError:
-                parsed = None
+                continue
         if parsed is None:
             return None
     if parsed.tzinfo is None:
@@ -91,14 +107,29 @@ def _parse_row_ts(value) -> Optional[dt.datetime]:
 
 
 def _row_to_candle(row) -> Optional[Candle]:
-    if not isinstance(row, (list, tuple)) or len(row) < 6:
+    if isinstance(row, dict):
+        when = _parse_row_ts(
+            row.get("timestamp") or row.get("time") or row.get("datetime") or row.get(0)
+        )
+        try:
+            o = float(row.get("open") if row.get("open") is not None else row.get("o"))
+            h = float(row.get("high") if row.get("high") is not None else row.get("h"))
+            l = float(row.get("low") if row.get("low") is not None else row.get("l"))
+            c = float(row.get("close") if row.get("close") is not None else row.get("c"))
+            v = float(row.get("volume") or row.get("v") or 0)
+        except (TypeError, ValueError):
+            return None
+        if when is None:
+            return None
+        return Candle(ts_ms=int(when.timestamp() * 1000), o=o, h=h, l=l, c=c, v=v)
+    if not isinstance(row, (list, tuple)) or len(row) < 5:
         return None
     when = _parse_row_ts(row[0])
     if when is None:
         return None
     try:
         o, h, l, c = float(row[1]), float(row[2]), float(row[3]), float(row[4])
-        v = float(row[5] or 0)
+        v = float(row[5] or 0) if len(row) > 5 else 0.0
     except (TypeError, ValueError):
         return None
     return Candle(ts_ms=int(when.timestamp() * 1000), o=o, h=h, l=l, c=c, v=v)
@@ -168,14 +199,135 @@ def seed_pivots_from_daily(r: redis.Redis, symbols: Sequence[str], store: Option
     return written
 
 
+def _write_candles(
+    r: redis.Redis,
+    store: CandlesStore,
+    stream: str,
+    maxlen: int,
+    sym: str,
+    tf: str,
+    candles: Sequence[Candle],
+    skip_today: bool,
+) -> int:
+    today = _now_ist().date()
+    now_ms = int(time.time() * 1000) + 120_000
+    existing = existing_ts_set(r, stream, sym, scan=20000)
+    n = 0
+    skip_d = 0
+    skip_fut = 0
+    for candle in candles:
+        if candle is None:
+            continue
+        if candle.ts_ms > now_ms:
+            skip_fut += 1
+            continue
+        if skip_today:
+            d = dt.datetime.fromtimestamp(candle.ts_ms / 1000.0, tz=IST).date()
+            if d >= today:
+                skip_d += 1
+                continue
+        if candle.ts_ms in existing:
+            continue
+        extra_date = ""
+        if tf == "1d":
+            extra_date = dt.datetime.fromtimestamp(
+                candle.ts_ms / 1000.0, tz=IST
+            ).date().isoformat()
+        store.write_candle(stream, maxlen, sym, tf, candle, date=extra_date)
+        existing.add(candle.ts_ms)
+        n += 1
+    if skip_d or skip_fut:
+        print(f"[HISTORY] {sym} {tf}: skipped_today={skip_d} skipped_future={skip_fut}")
+    return n
+
+
+def _angel_candles(
+    auth_token: str,
+    info: dict,
+    interval: str,
+    fromdate: str,
+    todate: str,
+) -> Tuple[List[Candle], str]:
+    body = fetch_candle_data(
+        auth_token,
+        exchange=info["exchange"],
+        symboltoken=info["token"],
+        interval=interval,
+        fromdate=fromdate,
+        todate=todate,
+    )
+    time.sleep(SLEEP_SEC)
+    if api_failed(body):
+        return [], api_error_text(body)
+    rows = candle_rows(body)
+    if not rows:
+        return [], f"empty data ({api_error_text(body)})"
+    ok = [c for c in (_row_to_candle(row) for row in rows) if c is not None]
+    if not ok:
+        sample = rows[0] if rows else None
+        return [], f"unparsed rows={len(rows)} sample={repr(sample)[:200]}"
+    return ok, ""
+
+
+def _fallback_candles(sym: str, tf: str) -> Tuple[List[Candle], str]:
+    if tf not in ("1d", "1m", "5m", "30m"):
+        return [], f"no public mapping for {tf}"
+    try:
+        bars = fetch_moneycontrol_nse_candles(sym, tf)
+        if bars:
+            time.sleep(0.25)
+            return bars, "moneycontrol"
+    except Exception as e:
+        print(f"[HISTORY] Moneycontrol FAIL {sym} {tf}: {e!r}")
+    try:
+        bars = fetch_yahoo_nse_candles(sym, tf)
+        if bars:
+            time.sleep(0.8)
+            return bars, "yahoo"
+    except Exception as e:
+        return [], f"yahoo {e!r}"
+    return [], "public empty"
+
+
+def _seed_htf_from_1m(
+    r: redis.Redis,
+    store: CandlesStore,
+    symbols: Sequence[str],
+    written: Dict[str, int],
+) -> None:
+    """Fill 5m/10m/30m from seeded 1m so Supertrend MTF has ATR history."""
+    from .candle_io import read_last_candles
+
+    targets = (
+        (5, STREAM_5M, OUT_MAXLEN_5M, "5m"),
+        (10, STREAM_10M, OUT_MAXLEN_10M, "10m"),
+        (30, STREAM_30M, OUT_MAXLEN_30M, "30m"),
+    )
+    for sym in symbols:
+        bars_1m = read_last_candles(r, STREAM_1M, sym, limit=4000, scan=20000)
+        if len(bars_1m) < 8:
+            print(f"[HISTORY] resample skip {sym}: only {len(bars_1m)} 1m bars")
+            continue
+        for minutes, stream, maxlen, tf in targets:
+            have = len(existing_ts_set(r, stream, sym, scan=8000))
+            ht = resample_candles(bars_1m, minutes)
+            n = _write_candles(r, store, stream, maxlen, sym, tf, ht, skip_today=False)
+            written[f"{sym}:{tf}:resample"] = n
+            print(
+                f"[HISTORY] resampled {n} {tf} bars for {sym} "
+                f"(from {len(bars_1m)} 1m, already={have})"
+            )
+
+
 def seed_history(
     r: Optional[redis.Redis] = None,
     symbols: Optional[Sequence[str]] = None,
     force: bool = False,
 ) -> Dict[str, int]:
     """
-    Fetch Angel history into candle streams. Skips an interval/symbol that
-    already has enough bars unless force=True.
+    Fetch candle history into Redis streams. Tries Angel first; on AG8004 /
+    empty / parse failure falls back to Yahoo NSE so Indicator Signals can
+    warm Supertrend, EMA, HTF and pivots on a midday start.
     """
     symbols = [s.upper() for s in (symbols or load_symbols())]
     if not symbols:
@@ -190,67 +342,67 @@ def seed_history(
         print(f"[HISTORY] skip fetch: daily candles already present; pivots_written={n}")
         return {"skipped": 1, "pivots": n}
 
-    print(f"[HISTORY] login + ScripMaster for {len(symbols)} symbols")
-    _obj, auth_token, _feed = login()
-    df = load_scripmaster()
-    tokens = resolve_eq_tokens(df, list(symbols))
-    store = CandlesStore()
-    today = _now_ist().date()
-    written: Dict[str, int] = {}
+    auth_token = None
+    tokens: Dict[str, dict] = {}
+    try:
+        print(f"[HISTORY] Angel login + ScripMaster for {len(symbols)} symbols")
+        _obj, auth_token, _feed = login(retries=1, delay_sec=2.0)
+        df = load_scripmaster()
+        tokens = resolve_eq_tokens(df, list(symbols))
+    except Exception as e:
+        print(f"[HISTORY] Angel login skipped: {e!r}; Yahoo NSE fallback for all TFs")
+        auth_token = None
 
-    for interval, tf, stream, maxlen, lookback_days, min_bars, skip_today in INTERVALS:
+    store = CandlesStore()
+    written: Dict[str, int] = {}
+    angel_usable = auth_token is not None
+
+    dailies_ready = all(
+        count_symbol_candles(r, STREAM_1D, list(symbols), per_symbol_limit=2).get(s, 0) >= 2
+        for s in symbols
+    )
+
+    for interval, tf, stream, maxlen, lookback_days, min_bars, skip_today in FETCH_INTERVALS:
         fromdate, todate = _range_for(interval, lookback_days)
         for sym in symbols:
-            info = tokens.get(sym)
-            if not info:
-                print(f"[HISTORY] SKIP no_eq_token symbol={sym}")
-                continue
-            have = len(existing_ts_set(r, stream, sym, scan=max(4000, min_bars * 20)))
-            if not force and have >= min_bars:
+            have = len(existing_ts_set(r, stream, sym, scan=max(8000, min_bars * 40)))
+            if not force and dailies_ready and have >= min_bars:
                 print(f"[HISTORY] skip {sym} {tf}: already {have} bars")
                 continue
 
-            body = fetch_candle_data(
-                auth_token,
-                exchange=info["exchange"],
-                symboltoken=info["token"],
-                interval=interval,
-                fromdate=fromdate,
-                todate=todate,
-            )
-            time.sleep(SLEEP_SEC)
-            if not body or body.get("status") is False:
-                print(
-                    f"[HISTORY] FAIL {sym} {tf}: {body.get('message') if body else 'empty'} "
-                    f"code={body.get('errorcode') if body else ''}"
-                )
-                continue
+            candles: List[Candle] = []
+            source = ""
+            if angel_usable:
+                info = tokens.get(sym)
+                if not info:
+                    print(f"[HISTORY] SKIP no_eq_token symbol={sym}")
+                else:
+                    candles, err = _angel_candles(auth_token, info, interval, fromdate, todate)
+                    if candles:
+                        source = "angel"
+                    else:
+                        print(f"[HISTORY] Angel FAIL {sym} {tf}: {err}")
+                        if "AG8004" in err or "Invalid API Key" in err:
+                            angel_usable = False
+                            print("[HISTORY] disabling further Angel candle calls this run")
 
-            rows = body.get("data") or []
-            existing = existing_ts_set(r, stream, sym, scan=12000)
-            n = 0
-            for row in rows:
-                candle = _row_to_candle(row)
-                if candle is None:
+            if not candles:
+                candles, err = _fallback_candles(sym, tf)
+                if candles:
+                    source = err
+                elif tf == "10m":
+                    written[f"{sym}:{tf}"] = 0
                     continue
-                if skip_today:
-                    d = dt.datetime.fromtimestamp(candle.ts_ms / 1000.0, tz=IST).date()
-                    if d >= today:
-                        continue
-                if candle.ts_ms in existing:
+                else:
+                    print(f"[HISTORY] public FAIL {sym} {tf}: {err}")
+                    written[f"{sym}:{tf}"] = 0
                     continue
-                extra_date = ""
-                if tf == "1d":
-                    extra_date = dt.datetime.fromtimestamp(
-                        candle.ts_ms / 1000.0, tz=IST
-                    ).date().isoformat()
-                store.write_candle(stream, maxlen, sym, tf, candle, date=extra_date)
-                existing.add(candle.ts_ms)
-                n += 1
-            key = f"{sym}:{tf}"
-            written[key] = n
-            print(f"[HISTORY] wrote {n} {tf} bars for {sym} (had={have})")
 
+            n = _write_candles(r, store, stream, maxlen, sym, tf, candles, skip_today)
+            written[f"{sym}:{tf}"] = n
+            print(f"[HISTORY] wrote {n} {tf} bars for {sym} via {source} (had={have})")
+
+    _seed_htf_from_1m(r, store, symbols, written)
     written["pivots"] = seed_pivots_from_daily(r, symbols, store=store)
     return written
 

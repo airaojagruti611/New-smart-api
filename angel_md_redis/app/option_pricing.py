@@ -3,12 +3,13 @@ app/option_pricing.py
 ───────────────────────
 Approved option-pricing model for Module 9 (Greeks Change Predictor).
 
-Nothing in this pipeline computes theoretical option prices/Greeks
-anywhere else -- every Greeks value elsewhere (run_greeks_analyzer.py,
-run_joiner.py) comes from Angel's REST Option Greeks endpoint (broker-
-supplied, external). Module 9 needs to REPRICE at hypothetical future
-scenarios, which requires an actual pricing model -- there is none to
-reuse, so this file is it.
+Broker Greeks (Angel REST optionGreek) are preferred when the API
+returns them. When that endpoint is down / AG8004, Module 6
+(greeks_poller + joiner) falls back to implying IV from the live
+option premium and computing Greeks here. Those values are tagged
+source="theoretical_black_scholes" so they are never silently mixed
+with broker_api numbers. Module 9 also reprices future scenarios
+with the same model.
 
 Model: Black-Scholes-Merton with a continuous dividend/carry yield q.
   d1 = (ln(S/K) + (r - q + 0.5*sigma^2)*T) / (sigma*sqrt(T))
@@ -41,12 +42,17 @@ No I/O here -- pure functions/dataclasses.
 
 from __future__ import annotations
 
+import datetime as dt
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 DAYS_PER_YEAR_PRICING = 365.0  # calendar-day convention for T; see module docstring
 MIN_TIME_YEARS = 1e-6           # floor to avoid division by zero at/after expiry
 MIN_IV = 1e-6                   # floor to avoid division by zero on degenerate IV
+MAX_IV = 5.0                    # 500% annualized — solver cap
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+EXPIRY_CLOSE_HHMM = "15:30"     # NSE F&O close on expiry day
 
 
 def _norm_cdf(x: float) -> float:
@@ -157,6 +163,113 @@ def bs_price_greeks(
         d2=round(d2, 6),
         intrinsic_fallback=False,
     )
+
+
+def time_to_expiry_years(
+    expiry_iso: str,
+    now: Optional[dt.datetime] = None,
+    close_hhmm: str = EXPIRY_CLOSE_HHMM,
+) -> Optional[float]:
+    """Calendar-year fraction from now to NSE expiry close on YYYY-MM-DD."""
+    try:
+        y, m, d = (int(x) for x in str(expiry_iso).split("-"))
+    except Exception:
+        return None
+    try:
+        hh, mm = (int(x) for x in str(close_hhmm).split(":"))
+    except Exception:
+        hh, mm = 15, 30
+    expiry_dt = dt.datetime(y, m, d, hh, mm, tzinfo=IST)
+    now_dt = now if now is not None else dt.datetime.now(tz=IST)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=IST)
+    return (expiry_dt - now_dt).total_seconds() / (DAYS_PER_YEAR_PRICING * 24.0 * 3600.0)
+
+
+def implied_vol(
+    spot: float,
+    strike: float,
+    option_type: str,
+    time_to_expiry_years: float,
+    premium: float,
+    risk_free_rate: float = 0.0,
+    dividend_or_carry: float = 0.0,
+    lo: float = 1e-4,
+    hi: float = MAX_IV,
+    tol: float = 1e-6,
+    max_iter: int = 60,
+) -> Optional[float]:
+    """
+    Invert bs_price_greeks for IV (annualized decimal) given a market premium.
+    Returns None when the quote cannot be solved (non-positive inputs / expired).
+    """
+    try:
+        s, k, p = float(spot), float(strike), float(premium)
+        t = float(time_to_expiry_years)
+    except (TypeError, ValueError):
+        return None
+    if s <= 0 or k <= 0 or p <= 0 or t <= 0:
+        return None
+
+    def _px(sigma: float) -> float:
+        return bs_price_greeks(
+            s, k, option_type, t, sigma, risk_free_rate, dividend_or_carry
+        ).premium
+
+    p_lo, p_hi = _px(lo), _px(hi)
+    if p <= p_lo:
+        return lo
+    if p >= p_hi:
+        return hi
+
+    a, b = lo, hi
+    for _ in range(max_iter):
+        mid = 0.5 * (a + b)
+        pm = _px(mid)
+        if abs(pm - p) < tol:
+            return mid
+        if pm < p:
+            a = mid
+        else:
+            b = mid
+    return 0.5 * (a + b)
+
+
+def greeks_from_market_premium(
+    spot: float,
+    strike: float,
+    option_type: str,
+    time_to_expiry_years: float,
+    premium: float,
+    risk_free_rate: float = 0.0,
+    dividend_or_carry: float = 0.0,
+) -> Optional[dict]:
+    """
+    Imply IV from LTP/mid, then return Angel-shaped Greeks.
+
+    impliedVolatility / iv are PERCENT (18.5) to match Angel REST so
+    Module 6 phase % changes stay on one scale.
+    """
+    iv = implied_vol(
+        spot, strike, option_type, time_to_expiry_years, premium,
+        risk_free_rate, dividend_or_carry,
+    )
+    if iv is None:
+        return None
+    pr = bs_price_greeks(
+        spot, strike, option_type, time_to_expiry_years, iv,
+        risk_free_rate, dividend_or_carry,
+    )
+    iv_pct = round(iv * 100.0, 4)
+    return {
+        "delta": pr.delta,
+        "gamma": pr.gamma,
+        "theta": pr.theta_per_day,
+        "vega": pr.vega_per_point,
+        "impliedvolatility": iv_pct,
+        "iv": iv_pct,
+        "source": "theoretical_black_scholes",
+    }
 
 
 def local_approximation(

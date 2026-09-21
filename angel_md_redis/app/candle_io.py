@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 import redis
 
@@ -40,6 +40,39 @@ def parse_candle_fields(fields: dict) -> Optional[Tuple[str, Candle]]:
     return sym, Candle(ts_ms=ts_ms, o=o, h=h, l=l, c=c, v=v)
 
 
+def sort_unique_candles(candles: List[Candle], limit: int = 0) -> List[Candle]:
+    """Oldest-first, last write wins on duplicate ts_ms. Optionally keep last `limit`."""
+    by_ts: Dict[int, Candle] = {}
+    for c in candles:
+        by_ts[int(c.ts_ms)] = c
+    ordered = [by_ts[k] for k in sorted(by_ts)]
+    if limit and limit > 0:
+        return ordered[-limit:]
+    return ordered
+
+
+def upsert_candle_window(window: Deque[Candle], candle: Candle) -> None:
+    """Keep an in-memory rolling window in timestamp order (seed can arrive after live)."""
+    if not window:
+        window.append(candle)
+        return
+    last = window[-1]
+    if candle.ts_ms == last.ts_ms:
+        window[-1] = candle
+        return
+    if candle.ts_ms > last.ts_ms:
+        window.append(candle)
+        return
+    by_ts = {c.ts_ms: c for c in window}
+    by_ts[candle.ts_ms] = candle
+    ordered = [by_ts[k] for k in sorted(by_ts)]
+    maxlen = window.maxlen
+    if maxlen:
+        ordered = ordered[-maxlen:]
+    window.clear()
+    window.extend(ordered)
+
+
 def read_last_candles(
     r: redis.Redis,
     stream: str,
@@ -47,12 +80,12 @@ def read_last_candles(
     limit: int,
     scan: int = 0,
 ) -> List[Candle]:
-    """Newest-first scan of `stream`, return oldest-first candles for `symbol`."""
+    """Scan `stream`, return oldest-first unique candles for `symbol` (by ts_ms)."""
     if limit <= 0:
         return []
-    count = scan if scan > 0 else max(2000, limit * 8)
+    count = scan if scan > 0 else max(8000, limit * 20)
     resp = r.xrevrange(stream, max="+", min="-", count=count)
-    out: List[Candle] = []
+    found: List[Candle] = []
     want = symbol.upper()
     for _msg_id, fields in resp:
         parsed = parse_candle_fields(fields)
@@ -61,10 +94,8 @@ def read_last_candles(
         sym, candle = parsed
         if sym != want:
             continue
-        out.append(candle)
-        if len(out) >= limit:
-            break
-    return list(reversed(out))
+        found.append(candle)
+    return sort_unique_candles(found, limit=limit)
 
 
 def existing_ts_set(

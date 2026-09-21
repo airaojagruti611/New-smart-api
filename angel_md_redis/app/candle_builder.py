@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from .candle_types import Candle
 
@@ -36,6 +36,46 @@ def _minute_bucket(ts_ms: int, minutes: int = 1) -> int:
 def _bucket_close_ts_ms(bucket: int, minutes: int = 1) -> int:
     # last millisecond of the bucket window
     return (bucket + 1) * (minutes * 60_000) - 1
+
+
+def resample_candles(candles: List[Candle], minutes: int) -> List[Candle]:
+    """Aggregate 1m (or any finer) bars into closed `minutes` candles, oldest-first."""
+    if minutes <= 1 or not candles:
+        return list(candles)
+    ordered = sorted(candles, key=lambda c: c.ts_ms)
+    out: List[Candle] = []
+    bucket: Optional[int] = None
+    o = h = l = c = None
+    v = 0.0
+    step = minutes * 60_000
+    now_ms = int(dt.datetime.now().timestamp() * 1000)
+
+    def _flush(b: int) -> None:
+        if o is None or h is None or l is None or c is None:
+            return
+        close_ts = _bucket_close_ts_ms(b, minutes)
+        if close_ts > now_ms:
+            return
+        out.append(Candle(ts_ms=close_ts, o=float(o), h=float(h), l=float(l), c=float(c), v=float(v)))
+
+    for bar in ordered:
+        b = bar.ts_ms // step
+        if bucket is None:
+            bucket = b
+            o, h, l, c, v = bar.o, bar.h, bar.l, bar.c, bar.v
+            continue
+        if b != bucket:
+            _flush(bucket)
+            bucket = b
+            o, h, l, c, v = bar.o, bar.h, bar.l, bar.c, bar.v
+        else:
+            h = max(h, bar.h)
+            l = min(l, bar.l)
+            c = bar.c
+            v += bar.v
+    if bucket is not None:
+        _flush(bucket)
+    return out
 
 
 def _date_str_local(ts_ms: int) -> str:

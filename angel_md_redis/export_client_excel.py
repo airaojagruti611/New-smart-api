@@ -173,7 +173,10 @@ def _liq_for_underlying(r: redis.Redis, sym: str) -> dict:
     return {}
 
 
-def _greeks_change(r: redis.Redis, strike_doc: dict) -> dict:
+def _greeks_change(r: redis.Redis, symbol: str, strike_doc: dict) -> dict:
+    doc = _load_json(r, f"md:greeks_change:latest:{symbol}") or {}
+    if doc:
+        return doc
     tsym = str((strike_doc or {}).get("tradingsymbol") or "")
     if not tsym:
         return {}
@@ -418,15 +421,17 @@ def build_rows(r: redis.Redis, symbols: List[str], data: Dict[str, dict]) -> Lis
         (
             "1.3 Volatility",
             "Expected move (prediction only)",
-            "Does not pick strike. Empty IV is a data gap until REST greeks populate. indicator_score is Supertrend + EMA + pivot strength (-2..+2).",
-            "spot, volume score, OI score, imbalance, IV if any",
+            "Does not pick strike. expected_move_pct = normalized_score × multiplier × 2%. target_price = spot + expected_move. confidence 0-100.",
+            "spot, indicator/volume/OI/imbalance scores, ATM delta + gamma/IV trend, OI resistance",
             lambda d: {
                 "spot": (d["tick"] or {}).get("ltp") or (d["oi_und"] or {}).get("spot"),
                 "volume": d["volume"],
                 "oi": d["oi_und"],
                 "imbalance": d["imbalance"],
+                "greeks_ce": d.get("greeks_ce"),
+                "indicator": d.get("indicator") or d.get("momentum"),
             },
-            "expected move, range, direction, confidence/flags",
+            "expected_move_pct, target_price, direction, confidence, move_quality",
             lambda d: d["expected"],
         ),
         (
@@ -566,7 +571,7 @@ def write_cover(wb: Workbook, symbols: List[str], when: dt.datetime, path: Path)
         ("• 5m / 10m / 30m Supertrend needs those candles to close.", None),
         ("• Previous-day pivots and D/W/M trend need a completed daily bar (often tomorrow).", None),
         ("• Entry trigger BUY CALL/PUT needs ALL of: HTF + Supertrend + EMA + pivot break + volume + OI + Greeks MARKUP. NEUTRAL with a reason is a valid output.", None),
-        ("• Strike / capital / greeks-change stay empty until a BUY fires.", None),
+        ("• Strike / capital stay empty until a BUY fires. Greeks-change runs off Expected Move + ATM/strikeflow (does not wait for BUY).", None),
         ("• Market regime on 3 names is NOT full NSE breadth — only those three stocks.", None),
         ("", None),
         ("How to verify (spot checks)", SECTION_FONT),
@@ -758,7 +763,7 @@ def main() -> None:
     for s in symbols:
         data[s] = collect_symbol(r, s)
         data[s]["liquidity"] = _liq_for_underlying(r, s)
-        data[s]["greeks_change"] = _greeks_change(r, data[s].get("strike") or {})
+        data[s]["greeks_change"] = _greeks_change(r, s, data[s].get("strike") or {})
 
     when = _now_ist()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
