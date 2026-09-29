@@ -346,6 +346,22 @@ Start **producer first**; signal workers need candles/ticks flowing (market hour
 
 ---
 
+## Auto-run during market hours (Windows)
+
+`market_scheduler.ps1` keeps the pipeline up **Mon–Fri 09:15–15:30 IST** and stops it outside that window. It checks every 30s, so switching the PC on mid-session starts the pipeline too.
+
+```powershell
+.\install_scheduler.ps1              # register "OptionRider Market Scheduler" task
+.\install_scheduler.ps1 -Uninstall   # remove it and stop the pipeline
+```
+
+- The task runs at user logon and daily at 09:05 IST, waking the PC from sleep. It doesn't run while you're signed out or the PC is off.
+- Starts Docker Desktop if needed. Gives up for the day after 3 failed starts.
+- Optional `market_holidays.txt` (one `yyyy-MM-dd` per line): those days are skipped.
+- Log: `logs\scheduler.log`
+
+---
+
 ## Stop services
 
 - Windows launcher: `.\stop_all.ps1`
