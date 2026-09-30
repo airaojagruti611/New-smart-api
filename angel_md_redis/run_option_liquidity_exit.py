@@ -182,7 +182,7 @@ def main() -> None:
                         log.info("EXIT_NOW tsym=%s payload=%s", tsym, payload)
                     elif res.exit_status == "ALREADY_TRAPPED":
                         log.info("ALREADY_TRAPPED tsym=%s payload=%s", tsym, payload)
-                    else:
+                    elif prev != res.exit_status:
                         log.info("STATUS_CHANGE tsym=%s %s -> %s", tsym, prev, res.exit_status)
                 last_status[tsym] = res.exit_status
 

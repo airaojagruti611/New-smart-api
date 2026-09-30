@@ -1,3 +1,5 @@
+import datetime as dt
+import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -7,7 +9,17 @@ from .config import (
     WS_WARMUP_SEC, STRIKES_AROUND, MAX_WS_SUBS, SUBSCRIBE_MODE,
     STREAM_EQ, STREAM_OPT,
     STREAM_MAXLEN_EQ, STREAM_MAXLEN_OPT,
+    WS_STALE_SEC,
 )
+
+_IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+
+
+def _in_market_hours() -> bool:
+    now = dt.datetime.now(_IST)
+    if now.weekday() >= 5:
+        return False
+    return "09:15" <= now.strftime("%H:%M") < "15:30"
 from .utils import now_ms, paise_to_rupees
 from .redis_store import RedisStore
 from .scripmaster import load_scripmaster, resolve_eq_tokens, build_atm_option_tokens
@@ -73,7 +85,9 @@ class MarketDataProducer:
 
         self.spot_ltp: Dict[str, float] = {}
         self.ws_open_t: Optional[float] = None
+        self.last_data_t: float = time.time()
         self.options_subscribed = False
+        self._stop_watchdog = threading.Event()
 
         self.sws = SmartWebSocketV2(
             auth_token=self.auth_token,
@@ -111,12 +125,47 @@ class MarketDataProducer:
         self.sws.on_close = self.on_close
 
     def start(self):
+        """Blocks until the socket is closed for good (max retries or stale feed)."""
         if not self.eq_map:
             raise RuntimeError("No NSE EQ tokens resolved from ScripMaster.")
         print(f"[WS] EQ tokens resolved: {len(self.eq_map)}")
-        self.sws.connect()
+        wd = threading.Thread(target=self._watchdog, name="ws-watchdog", daemon=True)
+        wd.start()
+        try:
+            self.sws.connect()
+        finally:
+            self._stop_watchdog.set()
+
+    def _watchdog(self):
+        """
+        A half-dead socket can stay silent for many minutes before the library
+        notices. During market hours, close it when no tick arrived for
+        WS_STALE_SEC; start() then returns and the caller reconnects.
+        """
+        while not self._stop_watchdog.wait(10):
+            if self.ws_open_t is None or not _in_market_hours():
+                continue
+            silent = time.time() - self.last_data_t
+            if silent > WS_STALE_SEC:
+                print(f"[WS] no ticks for {silent:.0f}s during market hours; closing socket to reconnect")
+                self._stop_watchdog.set()
+                try:
+                    self.sws.close_connection()
+                except Exception as e:
+                    print("[WS] close on stale feed failed:", repr(e))
+                return
 
     def on_open(self, wsapp):
+        # SmartWebSocketV2 reconnects by calling close_connection() (which clears
+        # RESUBSCRIBE_FLAG) and then connect(), so every reconnect lands here.
+        # Reset its bookkeeping: the retry counter otherwise never goes back to
+        # zero (10 drops per day and the socket closes for good), and its
+        # subscription record would keep growing with duplicates.
+        self.sws.current_retry_attempt = 0
+        self.sws.input_request_dict = {}
+        self.last_data_t = time.time()
+
+        reconnect = self.ws_open_t is not None
         self.ws_open_t = time.time()
         eq_tokens = [info["token"] for info in self.eq_map.values()]
 
@@ -130,7 +179,20 @@ class MarketDataProducer:
 
         token_list = [{"exchangeType": self.EXCH_NSE, "tokens": eq_tokens}]
         self.sws.subscribe(correlation_id="EQ01", mode=self.mode_eq, token_list=token_list)
-        print(f"[WS] opened; subscribed EQ={len(eq_tokens)} mode={SUBSCRIBE_MODE}")
+        print(f"[WS] {'re' if reconnect else ''}opened; subscribed EQ={len(eq_tokens)} mode={SUBSCRIBE_MODE}")
+
+        # Options were planned on the first connection; without this they are
+        # never subscribed again after a reconnect and md:ticks:opt goes silent.
+        if self.opt_meta:
+            self._subscribe_option_tokens(list(self.opt_meta.keys()))
+            print(f"[WS] resubscribed OPT={len(self.opt_meta)} after reconnect")
+
+    def _subscribe_option_tokens(self, tokens: List[str]) -> None:
+        BATCH = 50
+        for i in range(0, len(tokens), BATCH):
+            batch = tokens[i:i + BATCH]
+            token_list = [{"exchangeType": self.EXCH_NFO, "tokens": batch}]
+            self.sws.subscribe(correlation_id=f"OPT{i//BATCH:02d}", mode=self.mode_opt, token_list=token_list)
 
     def on_error(self, wsapp, error):
         print("[WS] error:", error)
@@ -141,8 +203,15 @@ class MarketDataProducer:
     def _publish_active_expiry(self):
         """
         ✅ Publish active expiries for greeks poller to Redis.
+
+        Replaces the hash: entries left from an older symbols.txt would
+        otherwise stay forever and the poller keeps querying expired contracts.
         """
-        self.rs.hset_meta("md:active_expiry", self.active_expiry_by_underlying)
+        pipe = self.rs.r.pipeline()
+        pipe.delete("md:active_expiry")
+        if self.active_expiry_by_underlying:
+            pipe.hset("md:active_expiry", mapping=self.active_expiry_by_underlying)
+        pipe.execute()
         self.rs.set_latest("md:active_expiry:ts_ms", str(now_ms()), ex_sec=3600)
 
     def _maybe_subscribe_options(self):
@@ -211,12 +280,7 @@ class MarketDataProducer:
                 "exchange": "NFO",
             })
 
-        # subscribe in batches
-        BATCH = 50
-        for i in range(0, len(tokens), BATCH):
-            batch = tokens[i:i + BATCH]
-            token_list = [{"exchangeType": self.EXCH_NFO, "tokens": batch}]
-            self.sws.subscribe(correlation_id=f"OPT{i//BATCH:02d}", mode=self.mode_opt, token_list=token_list)
+        self._subscribe_option_tokens(tokens)
 
         self.options_subscribed = True
 
@@ -343,6 +407,7 @@ class MarketDataProducer:
         self.rs.xadd(STREAM_OPT, payload, maxlen=STREAM_MAXLEN_OPT)
 
     def on_data(self, wsapp, data: Dict[str, Any]):
+        self.last_data_t = time.time()
         tok = str(data.get("token", ""))
 
         # equity tick

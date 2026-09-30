@@ -212,6 +212,11 @@ def _write_candles(
     today = _now_ist().date()
     now_ms = int(time.time() * 1000) + 120_000
     existing = existing_ts_set(r, stream, sym, scan=20000)
+    # Daily bars from different sources carry different timestamps for the
+    # same day, so dedupe 1d by IST date as well as by ts.
+    existing_dates = {
+        dt.datetime.fromtimestamp(ts / 1000.0, tz=IST).date() for ts in existing
+    } if tf == "1d" else set()
     n = 0
     skip_d = 0
     skip_fut = 0
@@ -230,9 +235,11 @@ def _write_candles(
             continue
         extra_date = ""
         if tf == "1d":
-            extra_date = dt.datetime.fromtimestamp(
-                candle.ts_ms / 1000.0, tz=IST
-            ).date().isoformat()
+            day = dt.datetime.fromtimestamp(candle.ts_ms / 1000.0, tz=IST).date()
+            if day in existing_dates:
+                continue
+            existing_dates.add(day)
+            extra_date = day.isoformat()
         store.write_candle(stream, maxlen, sym, tf, candle, date=extra_date)
         existing.add(candle.ts_ms)
         n += 1
@@ -319,6 +326,31 @@ def _seed_htf_from_1m(
             )
 
 
+def _topup_daily(r: redis.Redis, symbols: Sequence[str]) -> int:
+    """
+    Add any missing completed daily bars (before today) from the public
+    sources. The live publisher only writes today's bar if it is still running
+    at the close, so this fills gaps before pivots are computed. One request
+    per symbol; dates that already have a bar are left alone.
+    """
+    store = CandlesStore()
+    added = 0
+    for sym in symbols:
+        try:
+            candles, src = _fallback_candles(sym, "1d")
+        except Exception as e:
+            print(f"[HISTORY] daily top-up {sym} failed: {e!r}")
+            continue
+        if not candles:
+            print(f"[HISTORY] daily top-up {sym}: no data ({src})")
+            continue
+        n = _write_candles(r, store, STREAM_1D, OUT_MAXLEN_1D, sym, "1d", candles, skip_today=True)
+        if n:
+            print(f"[HISTORY] daily top-up {sym}: added {n} bars via {src}")
+        added += n
+    return added
+
+
 def seed_history(
     r: Optional[redis.Redis] = None,
     symbols: Optional[Sequence[str]] = None,
@@ -338,9 +370,10 @@ def seed_history(
         r = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
 
     if not force and not _needs_seed(r, symbols):
+        added = _topup_daily(r, symbols)
         n = seed_pivots_from_daily(r, symbols)
-        print(f"[HISTORY] skip fetch: daily candles already present; pivots_written={n}")
-        return {"skipped": 1, "pivots": n}
+        print(f"[HISTORY] skip full fetch: candles already present; daily_topup={added} pivots_written={n}")
+        return {"skipped": 1, "daily_topup": added, "pivots": n}
 
     auth_token = None
     tokens: Dict[str, dict] = {}

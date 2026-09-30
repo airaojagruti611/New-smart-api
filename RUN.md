@@ -404,4 +404,6 @@ Start **producer first**; signal workers need candles/ticks flowing (market hour
 | Empty signals | Wait for market hours / enough candle history |
 | No `data_lake` parquet | Confirm `arch_layers` is running; wait for a flush; do not run old archivers in parallel |
 | Empty `md:greeks_change:signal` | Needs `strike_select` OK events **and** `run_expected_move.py` |
+| `GREEKS_API_FAIL ... Invalid API Key code=AG8004` / history `Angel FAIL ... AG8004` | The API key isn't allowed to call Angel's option-Greeks / historical-candle APIs. Greeks fall back to local Black-Scholes and candles to Moneycontrol/Yahoo. For broker data, use an API key that has market-data / historical access in the SmartAPI dashboard. |
+| Option ticks stop after a websocket reconnect | Fixed: the producer resubscribes options on reconnect, reconnects if no tick arrives for `WS_STALE_SEC` (default 90s) in market hours, and logs in again if the socket closes for good. |
 | Duplicate / missing archive files | Stop old `arch_eq` / candle / CSV processes, then restart with `run_all` |
