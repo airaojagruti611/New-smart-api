@@ -312,6 +312,29 @@ Open **http://127.0.0.1:8501**
 
 `./run_all.sh` starts the dashboard as well (skip with `START_DASHBOARD=0`). Port: `DASHBOARD_PORT` (default 8501).
 
+**Windows:** `run_all.ps1` also starts it (same `START_DASHBOARD` / `DASHBOARD_PORT` switches), bound to `127.0.0.1`. The market-hours scheduler therefore starts and stops it together with the pipeline.
+
+### Password
+
+Add `DASHBOARD_PASSWORD=<something long>` to `.env` and restart the dashboard. Everyone then has to enter it before seeing anything. Leave it unset for local-only use.
+
+### Share with a few people (Cloudflare Tunnel + Access)
+
+This gives an HTTPS link like `https://dash.yourdomain.com` without opening router ports. Cloudflare checks each visitor's email before the page loads. You need a free Cloudflare account and a domain whose DNS is on Cloudflare.
+
+1. **Create the tunnel.** Cloudflare dashboard → Zero Trust → Networks → Tunnels → *Create a tunnel* → type *Cloudflared* → name it `option-rider`. Choose *Windows* and copy the `cloudflared.exe service install <TOKEN>` command it shows.
+2. **Install cloudflared on this PC** (admin PowerShell):
+   ```powershell
+   winget install --id Cloudflare.cloudflared
+   cloudflared.exe service install <TOKEN>
+   ```
+   This installs a Windows service that starts with the PC.
+3. **Public hostname.** In the tunnel → *Public Hostname* → add `dash.yourdomain.com` → service `HTTP` → `localhost:8501`.
+4. **Restrict who can open it.** Zero Trust → Access → Applications → *Add* → *Self-hosted* → domain `dash.yourdomain.com`. Add a policy: *Allow* → *Emails* → the addresses of the people who should see it. Visitors get a one-time code by email.
+5. Open the link from your phone to check. Outside 09:15–15:30 IST the dashboard is stopped, so the link shows a Cloudflare error page.
+
+Keep `DASHBOARD_PASSWORD` set as a second layer.
+
 ---
 
 ## Pipeline order (dependency map)

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import hmac
+import os
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -31,6 +33,27 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+def _require_password() -> None:
+    """Shared-password gate for when the dashboard is reachable from outside.
+
+    Set DASHBOARD_PASSWORD in .env to enable; unset = open (local use).
+    """
+    expected = os.getenv("DASHBOARD_PASSWORD", "")
+    if not expected or st.session_state.get("auth_ok"):
+        return
+    st.markdown("### Option Rider")
+    pw = st.text_input("Password", type="password")
+    if pw:
+        if hmac.compare_digest(pw.encode(), expected.encode()):
+            st.session_state["auth_ok"] = True
+            st.rerun()
+        st.error("Wrong password.")
+    st.stop()
+
+
+_require_password()
 
 CSS = """
 <style>

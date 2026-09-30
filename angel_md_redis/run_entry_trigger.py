@@ -200,6 +200,11 @@ def main():
                     )
                     continue
 
+                # Confirmation gates may not have published yet for this symbol.
+                htf = htf or {}
+                oi = oi or {}
+                vol = vol or {}
+
                 st_bias = str(st.get("bias") or "").strip()
                 ema_state = str(ema.get("state") or "").strip()
                 htf_bias = str(htf.get("bias") or "").strip()

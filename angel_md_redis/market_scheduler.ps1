@@ -107,13 +107,13 @@ try {
             } else {
                 $startsToday++
                 Write-Log "Market open and pipeline not running - starting (attempt $startsToday/$MaxStartsPerDay)"
-                & (Join-Path $PSScriptRoot "run_all.ps1") *>> $LogFile
+                & (Join-Path $PSScriptRoot "run_all.ps1") *>&1 | Out-File -FilePath $LogFile -Append -Encoding utf8
                 Set-Location $PSScriptRoot
                 Write-Log "run_all.ps1 finished; live workers: $(Get-LiveWorkerCount)"
             }
         } elseif (-not $inWindow -and $live -gt 0) {
             Write-Log "Outside market window - stopping $live live workers"
-            & (Join-Path $PSScriptRoot "stop_all.ps1") *>> $LogFile
+            & (Join-Path $PSScriptRoot "stop_all.ps1") *>&1 | Out-File -FilePath $LogFile -Append -Encoding utf8
             Set-Location $PSScriptRoot
         }
 
