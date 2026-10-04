@@ -32,6 +32,15 @@
 | 22 | Trade Journal Engine | 1.7 Monitoring Layer |
 | 23 | Accumulation Phase Detector | 1.7 Monitoring Layer |
 
+**Implemented from the later design brief** (see `DECISION.md`): Module 10 Strike Intelligence Engine,
+Module 12 Probability Engine, Modules 11 + 20 ICARE (lot sizing & capital/risk), Module 22 trade journal
+(paper trading) and the offline learning report. Module 13 is implemented as the **Trade Ranking Engine**
+(`app/trade_ranking/`, `run_trade_ranking.py`; DECISION.md §6), shadow mode by default.
+Module 18 is implemented as the **Adaptive Trailing Stop Loss & Re-entry Engine** (`app/adaptive_tsl.py`,
+`run_adaptive_tsl.py`; DECISION.md §5), shadow mode by default.
+Module 14 is implemented as the **Order Executor / Trade Entry Engine** (`app/order_executor/`,
+`run_order_executor.py`; DECISION.md §7): limit orders only, shadow / paper by default, live trading disabled.
+
 **Note:** Modules 1–8 have full design detail in the source material (reproduced below). Modules 9, 10–23 are named in the index but not yet specified in detail — flag these as TODO/backlog items for the coding agent; do not invent logic for them.
 
 ### Add-ons (backlog, not yet specified)

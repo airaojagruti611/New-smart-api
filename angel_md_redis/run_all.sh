@@ -123,6 +123,23 @@ start "entry_trigger" python3 run_entry_trigger.py
 # 3g) Strike select: entry signal -> ATM / slight-OTM option contract
 start "strike_select" python3 run_strike_select.py
 
+# 3g2) Strike Intelligence Engine (Module 10, shadow alongside strike_select): top-3 ranked strikes
+start "strike_intel" python3 run_strike_intel.py
+
+# 3g3) Decision layer (shadow, PAPER only — no broker orders):
+#      account snapshot -> Probability Engine -> Trade Ranking -> ICARE lots/risk -> paper-trade journal
+start "account" python3 run_account.py
+start "probability" python3 run_probability.py
+# Module 13 Trade Ranking (RANK_MODE=shadow by default: ICARE keeps reading md:probability)
+start "trade_ranking" python3 run_trade_ranking.py
+start "icare" python3 run_icare.py
+# Module 14 Order Executor (EXEC_MODE=shadow by default: simulated fills, journal unchanged;
+# live is refused without EXEC_LIVE_ENABLED=1 + a registered static IP — DECISION.md §7)
+start "order_executor" python3 run_order_executor.py
+start "trade_journal" python3 run_trade_journal.py
+# Module 18 Adaptive Trailing SL & Re-entry (TSL_MODE=shadow by default: observes only)
+start "adaptive_tsl" python3 run_adaptive_tsl.py
+
 # 3h) Capital alloc: regime bias + strike -> sized CALL/PUT notional
 start "capital_alloc" python3 run_capital_alloc.py
 

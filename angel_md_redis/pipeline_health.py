@@ -316,29 +316,57 @@ LAYERS = [
                 "sample_fields": ["status", "signal", "side", "strike", "tradingsymbol"],
             },
             {
-                "name": "Module 11: Lot Sizing",
-                "worker": None,
-                "description": "NOT IMPLEMENTED — spec backlog",
+                "name": "Module 10: Strike Intelligence Engine",
+                "worker": "run_strike_intel.py",
+                "streams": ["md:strike:intel"],
+                "latest_prefix": "md:strike:intel:latest:*",
+                "latest_key": None,
+                "description": "Ranks ATM±N strikes (liquidity/EM fit/Greeks) → top-3 + confidence",
+                "sample_fields": ["status", "side", "market_phase", "tradingsymbol", "strike_score", "confidence"],
             },
             {
-                "name": "Module 13: Probability Engine",
-                "worker": None,
-                "description": "NOT IMPLEMENTED — spec backlog (learning layer)",
+                "name": "Module 12: Probability Engine",
+                "worker": "run_probability.py",
+                "streams": ["md:probability"],
+                "latest_prefix": "md:probability:latest:*",
+                "latest_key": None,
+                "description": "8 weighted inputs + hard filters → probability 0-100, grade, decision",
+                "sample_fields": ["probability", "grade", "decision", "reject_reasons", "flags"],
             },
             {
-                "name": "Module 14: Trade Ranking Engine",
-                "worker": None,
-                "description": "NOT IMPLEMENTED — spec backlog",
+                "name": "Module 11: Lot Sizing (ICARE)",
+                "worker": "run_icare.py",
+                "streams": ["md:icare"],
+                "latest_prefix": "md:icare:latest:*",
+                "latest_key": None,
+                "description": "Trade quality → risk class → EV → MIN(margin, risk, capital, portfolio, liquidity) lots",
+                "sample_fields": ["status", "trade_quality", "risk_class", "expected_value", "recommended_lots", "limiting_factor"],
             },
             {
-                "name": "Module 15: Order Executor",
-                "worker": None,
-                "description": "NOT IMPLEMENTED — needs Broker Bridge",
+                "name": "Module 13: Trade Ranking Engine",
+                "worker": "run_trade_ranking.py",
+                "streams": ["md:ranking", "md:ranking:cycle"],
+                "latest_prefix": None,
+                "latest_key": "md:ranking:rank",
+                "description": "13 weighted scores × direction agreement × reward/risk × data quality, hard gates, "
+                               "rank + sector/underlying filter, NO_TRADE allowed (RANK_MODE shadow/active)",
+            },
+            {
+                "name": "Module 14: Order Executor / Trade Entry",
+                "worker": "run_order_executor.py",
+                "streams": ["md:exec", "md:exec:fill"],
+                "latest_prefix": "md:exec:latest:*",
+                "latest_key": None,
+                "description": "Fresh validation, capped limit-order ladder (no market orders), quantity MIN(), "
+                               "depth slicing, partial-fill cost check, timeout / kill switch, charges + slippage "
+                               "(EXEC_MODE shadow/paper; live disabled — no static IP)",
+                "sample_fields": ["execution_status", "filled_lots", "average_fill_price", "slippage", "total_execution_cost"],
             },
             {
                 "name": "Module 16: Circuit Breaker / Kill Switch",
                 "worker": None,
-                "description": "NOT IMPLEMENTED — spec backlog",
+                "description": "PARTIAL — manual kill switch `md:control:kill_switch`=1 blocks new trades in "
+                               "Trade Ranking; circuit-limit check flag-only (no data source)",
             },
         ],
     },
@@ -347,7 +375,15 @@ LAYERS = [
         "name": "Risk Layer",
         "modules": [
             {"name": "Module 17: Risk Management", "worker": None, "description": "NOT IMPLEMENTED"},
-            {"name": "Module 18: Smart Stop Loss", "worker": None, "description": "NOT IMPLEMENTED"},
+            {
+                "name": "Module 18: Adaptive Trailing SL & Re-entry",
+                "worker": "run_adaptive_tsl.py",
+                "streams": ["md:tsl", "md:tsl:reentry"],
+                "latest_prefix": "md:tsl:latest:*",
+                "latest_key": None,
+                "description": "Volatility + trend → dynamic TSL % (ratchet), confirmed exits, swing-break re-entry (TSL_MODE shadow/active)",
+                "sample_fields": ["status", "current_trailing_stop", "trailing_percentage", "tsl_rule", "reentry_state", "event"],
+            },
             {"name": "Module 19: Slippage Estimator", "worker": None, "description": "NOT IMPLEMENTED"},
         ],
     },
@@ -355,6 +391,14 @@ LAYERS = [
         "id": "1.6",
         "name": "Capital Layer",
         "modules": [
+            {
+                "name": "Account snapshot (ICARE input)",
+                "worker": "run_account.py",
+                "streams": [],
+                "latest_prefix": None,
+                "latest_key": "md:account:latest",
+                "description": "Paper ledger (default) or Angel getRMS — capital, margin, day PnL, open risk",
+            },
             {
                 "name": "Module 20: Capital Allocation",
                 "worker": "run_capital_alloc.py",
@@ -370,7 +414,14 @@ LAYERS = [
         "name": "Monitoring Layer",
         "modules": [
             {"name": "Module 21: Portfolio Exposure Monitor", "worker": None, "description": "NOT IMPLEMENTED"},
-            {"name": "Module 22: Trade Journal Engine", "worker": None, "description": "NOT IMPLEMENTED"},
+            {
+                "name": "Module 22: Trade Journal Engine (paper)",
+                "worker": "run_trade_journal.py",
+                "streams": ["md:journal"],
+                "latest_prefix": "md:position:open:*",
+                "latest_key": "md:journal:stats",
+                "description": "Paper entries from ICARE APPROVED, MFE/MAE, SL/target/time/EOD exits, bucket stats",
+            },
             {"name": "Module 23: Accumulation Phase Detector", "worker": None, "description": "NOT IMPLEMENTED"},
         ],
     },
@@ -520,6 +571,13 @@ def check_module(r: redis.Redis, mod: dict, sample_symbol: Optional[str] = None)
             result["details"].append(f"Keys {prefix}: {RED}ERROR {e}{RESET}")
 
     # Check single latest key
+    if latest_key and r.type(latest_key) == "zset":
+        ranked = r.zrevrange(latest_key, 0, 9, withscores=True)
+        has_any_data = has_any_data or bool(ranked)
+        result["details"].append(f"ZSet  {BOLD}{latest_key}{RESET}: {OK if ranked else FAIL}")
+        if ranked:
+            result["details"].append("  └─ " + ", ".join(f"{s} {int(v)}" for s, v in ranked))
+        latest_key = None
     if latest_key:
         try:
             raw = r.get(latest_key)

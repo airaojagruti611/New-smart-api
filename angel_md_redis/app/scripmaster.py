@@ -191,3 +191,29 @@ def build_atm_option_tokens(
             })
 
     return out, expiry.isoformat()
+
+
+def option_specs(df: pd.DataFrame, underlyings: List[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Per-contract order specs for NFO options of `underlyings` (DECISION.md §7 E6/E8):
+      tick       price tick in rupees (ScripMaster tick_size is in paise: 5 -> 0.05, 1 -> 0.01)
+      lot_size   units per lot
+      freeze_qty NSE quantity-freeze limit in UNITS per order (None if absent)
+      expiry     date
+      kind       OPTSTK / OPTIDX
+    """
+    names = {u.upper() for u in underlyings}
+    d = df[(df["exch_seg"] == "NFO") & df["instrumenttype"].isin(["OPTSTK", "OPTIDX"])]
+    d = d[d["name"].str.upper().isin(names)]
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in d.to_dict("records"):
+        tick_paise = to_float(row.get("tick_size"))
+        out[str(row["symbol"]).upper()] = {
+            "tick": round(tick_paise / 100.0, 4) if tick_paise else 0.05,
+            "lot_size": to_float(row.get("lotsize")),
+            "freeze_qty": to_float(row.get("freeze_qty")),
+            "expiry": row.get("expiry_date"),
+            "kind": row.get("instrumenttype"),
+            "token": str(row.get("token") or ""),
+        }
+    return out

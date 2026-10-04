@@ -14,6 +14,7 @@ from app.dashboard_data import (
     collect_symbol,
     connect,
     fnum,
+    load_json,
     redis_health,
     universe,
 )
@@ -298,6 +299,7 @@ tabs = st.tabs(
         "Bid-ask / flow",
         "Options / OI / Greeks",
         "Expected move",
+        "Strike · Probability · ICARE",
         "Raw payloads",
     ]
 )
@@ -446,8 +448,160 @@ with tabs[5]:
         st.markdown("**Last 1m candle**")
         st.json(d.get("c1m") or {"status": "EMPTY"})
 
-# Raw
+# Strike Intelligence -> Probability -> ICARE (shadow pipeline, paper trades only)
 with tabs[6]:
+    import json as _json
+
+    def _jl(v, default):
+        try:
+            return _json.loads(v) if isinstance(v, str) and v else (v or default)
+        except Exception:
+            return default
+
+    sie = d.get("strike_intel") or {}
+    prob = d.get("probability") or {}
+    ic = d.get("icare") or {}
+    k1, k2, k3, k4, k5 = st.columns(5)
+    with k1:
+        kpi("SIE best strike", str(sie.get("tradingsymbol") or "—"), f"{sie.get('market_phase') or ''} Δ {sie.get('delta_band') or ''}")
+    with k2:
+        kpi("Strike score", _fmt(sie.get("strike_score"), 1), f"confidence {_fmt(sie.get('confidence'), 1)}")
+    with k3:
+        kpi("Probability", f"{prob.get('probability') or '—'} {prob.get('grade') or ''}", str(prob.get("decision") or ""))
+    with k4:
+        kpi("ICARE", str(ic.get("status") or "—"), f"quality {_fmt(ic.get('trade_quality'), 1)} · class {ic.get('risk_class') or '—'}")
+    with k5:
+        kpi("Lots", str(ic.get("recommended_lots") or "0"), f"limit: {ic.get('limiting_factor') or '—'}")
+
+    s1, s2 = st.columns([1.2, 1])
+    with s1:
+        st.markdown("**Top ranked strikes (SIE)**")
+        top = _jl(sie.get("top"), [])
+        if top:
+            st.dataframe(pd.DataFrame([{
+                "Rank": t.get("rank"), "Contract": t.get("tradingsymbol"), "Score": t.get("strike_score"),
+                "Conf": t.get("confidence"), "Delta": t.get("delta"), "Theta risk %": t.get("theta_risk_pct"),
+                "Liquidity": t.get("liquidity_score"), "Exec Q": t.get("execution_quality"),
+                "Proj gain": (t.get("projection") or {}).get("premium_gain"),
+            } for t in top]), use_container_width=True, hide_index=True)
+            for line in _jl(sie.get("reasons"), []):
+                st.markdown(f"- {line}")
+        else:
+            st.info(f"No SIE output yet ({sie.get('reason') or 'waiting for a BUY entry trigger'}).")
+        st.markdown("**Probability components**")
+        comps = {k[2:]: prob.get(k) for k in prob if k.startswith("p_")}
+        st.json(comps or {"status": "EMPTY"})
+        st.caption(f"Rejects: {prob.get('reject_reasons') or '[]'} · Flags: {prob.get('flags') or '[]'} · history {prob.get('history_samples') or 0} trades")
+    with s2:
+        st.markdown("**ICARE execution report**")
+        if ic:
+            st.dataframe(pd.DataFrame([
+                ("Trade", f"BUY {ic.get('tradingsymbol')}"), ("Status", ic.get("status")),
+                ("Probability", ic.get("probability")), ("Expected value / lot", f"₹{_fmt(ic.get('expected_value'))} ({ic.get('ev_source')})"),
+                ("Risk class", ic.get("risk_class")), ("Allocation", f"{ic.get('allocation_pct')}% = ₹{_fmt(ic.get('max_capital'))}"),
+                ("Available margin", f"₹{_fmt(ic.get('available_margin'))}"), ("Margin / lot", f"₹{_fmt(ic.get('margin_per_lot'))}"),
+                ("Lots by margin / risk / capital / portfolio / liquidity",
+                 f"{ic.get('lots_by_margin')} / {ic.get('lots_by_risk')} / {ic.get('lots_by_capital')} / {ic.get('lots_by_portfolio')} / {ic.get('lots_by_liquidity') or '—'}"),
+                ("Recommended lots", ic.get("recommended_lots")), ("Entry / SL / Target", f"{ic.get('premium')} / {ic.get('stop_loss_premium')} / {ic.get('target_premium')}"),
+                ("Expected max loss", f"₹{_fmt(ic.get('expected_max_loss'))}"), ("Expected reward", f"₹{_fmt(ic.get('expected_reward'))}"),
+                ("Reward : Risk", ic.get("reward_risk")), ("Reasons", ic.get("reasons")), ("Flags", ic.get("flags")),
+            ], columns=["Field", "Value"]).astype(str), use_container_width=True, hide_index=True)
+        else:
+            st.info("No ICARE report yet.")
+
+    st.markdown("**Trade ranking (Module 13)**")
+    cyc = load_json(r, "md:ranking:cycle:latest") or {}
+    t1, t2 = st.columns([3, 1])
+    with t1:
+        if cyc:
+            st.caption(
+                f"Last cycle {_age(cyc)} ago · **{cyc.get('outcome')}** · scanned {cyc.get('scanned')} · "
+                f"insufficient {cyc.get('data_insufficient')} · rejected {cyc.get('rejected')} · watch {cyc.get('watch')} · "
+                f"eligible {cyc.get('eligible')} · taken {cyc.get('taken')} · profile {cyc.get('profile')} · mode {cyc.get('mode')}"
+            )
+        else:
+            st.caption("No ranking cycle yet (run_trade_ranking.py).")
+    with t2:
+        ks_on = str(r.get("md:control:kill_switch") or "") == "1"
+        ks_new = st.toggle("Kill switch", value=ks_on, help="Blocks every new trade in Trade Ranking (md:control:kill_switch)")
+        if ks_new != ks_on:
+            r.set("md:control:kill_switch", "1" if ks_new else "0")
+            st.rerun()
+    rk_rows = [load_json(r, k) or {} for k in r.scan_iter(match="md:ranking:latest:*", count=200)]
+    rk_rows = sorted((x for x in rk_rows if x), key=lambda x: (int(x.get("rank") or 999), str(x.get("tradingsymbol") or "")))
+    if rk_rows:
+        st.dataframe(pd.DataFrame([{
+            "Rank": x.get("rank"), "Contract": x.get("tradingsymbol"), "Score": x.get("trade_score"),
+            "Decision": x.get("rank_decision"), "Confidence": x.get("rank_confidence"), "Prob": x.get("probability"),
+            "Agree": x.get("rank_agreement"), "EV": x.get("rank_expected_value"), "EV/risk": x.get("rank_ev_per_risk"),
+            "RR": x.get("rank_reward_risk"), "Lots": x.get("rank_feasible_lots"), "SL %": x.get("rank_initial_stop_loss_pct"),
+            "TSL %": x.get("rank_trailing_stop_pct"), "Why": x.get("rank_reject_reasons"), "Emitted": x.get("rank_emit"),
+            "Age": _age({"ts_ms": x.get("rank_ts_ms")}),
+        } for x in rk_rows]), use_container_width=True, hide_index=True)
+
+    st.markdown("**Account · paper positions · journal**")
+    a1, a2, a3 = st.columns(3)
+    acct = load_json(r, "md:account:latest") or {}
+    with a1:
+        st.json({k: acct.get(k) for k in ("mode", "total_capital", "available_margin", "margin_utilization_pct",
+                                         "day_pnl", "open_positions", "open_risk", "error")} if acct else {"status": "run_account.py not running"})
+    with a2:
+        pos = [load_json(r, k) or {} for k in r.scan_iter(match="md:position:open:*", count=200)]
+        pos = [p for p in pos if p.get("trade_id")]
+        if pos:
+            st.dataframe(pd.DataFrame([{
+                "Contract": p.get("tradingsymbol"), "Lots": p.get("lots"), "Entry": p.get("entry_premium"),
+                "Last": p.get("last_premium"), "SL": p.get("sl_premium"), "Target": p.get("target_premium"),
+            } for p in pos]), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No open paper positions.")
+    with a3:
+        stats = load_json(r, "md:journal:stats") or {}
+        if stats:
+            st.dataframe(pd.DataFrame([{
+                "Bucket": k, "Trades": v.get("samples"), "Wins": v.get("wins"), "PnL": v.get("pnl"),
+            } for k, v in stats.items()]), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Journal empty — closed paper trades appear here.")
+
+    st.markdown("**Adaptive trailing stop & re-entry (Module 18)**")
+    tsl_rows = [load_json(r, k) or {} for k in r.scan_iter(match="md:tsl:latest:*", count=200)]
+    tsl_rows = sorted((t for t in tsl_rows if t), key=lambda t: str(t.get("ts_ms") or ""), reverse=True)
+    if tsl_rows:
+        st.caption(f"Mode: {tsl_rows[0].get('mode') or '—'} (shadow = observes only; active = closes trades and re-enters via ICARE)")
+        st.dataframe(pd.DataFrame([{
+            "Contract": t.get("tradingsymbol"), "Status": t.get("status"), "Bid": t.get("current_price"),
+            "High": t.get("highest_price"), "Stop": t.get("current_trailing_stop"), "TSL %": t.get("trailing_percentage"),
+            "Rule": t.get("tsl_rule"), "Trend": t.get("trend_strength"), "Vol": t.get("volatility_score"),
+            "Activated": t.get("activated"), "Re-entry": t.get("reentry_state"), "Watch": t.get("watch_price"),
+            "Why waiting": t.get("wait_reason"), "Virtual": t.get("virtual"), "Age": _age(t),
+        } for t in tsl_rows]), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No trailing-stop state yet — appears once a paper position is open (run_adaptive_tsl.py).")
+
+    st.markdown("**Order executor (Module 14)**")
+    ex_rows = [load_json(r, k) or {} for k in r.scan_iter(match="md:exec:latest:TRD_*", count=500)]
+    ex_rows = sorted((x for x in ex_rows if x), key=lambda x: int(x.get("timestamp") or 0), reverse=True)[:50]
+    working = r.hgetall("md:exec:active") or {}
+    if working:
+        st.caption(f"Executing now: {', '.join(f'{t} ({s})' for t, s in working.items())}")
+    if ex_rows:
+        st.caption(f"Mode: {ex_rows[0].get('mode') or '—'} (shadow = simulated, journal unchanged; "
+                   "paper = journal opens at the simulated fill; live is disabled)")
+        st.dataframe(pd.DataFrame([{
+            "Trade": x.get("trade_id"), "Contract": x.get("option_symbol"), "Status": x.get("execution_status"),
+            "Lots": f"{x.get('filled_lots')}/{x.get('requested_lots')}", "Avg fill": x.get("average_fill_price"),
+            "Ask (ref)": x.get("reference_price"), "Cap": x.get("price_cap"), "Slippage": x.get("slippage"),
+            "Slip %": x.get("slippage_pct"), "Charges": (x.get("charges") or {}).get("total"),
+            "Exec cost": x.get("total_execution_cost"), "Orders": x.get("orders_used"),
+            "ms": x.get("execution_duration_ms"),
+            "Why": ", ".join(x.get("reject_reasons") or []) or x.get("cancel_reason"),
+        } for x in ex_rows]), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No executions yet — run_order_executor.py executes ICARE approvals (EXEC_MODE=shadow by default).")
+
+# Raw
+with tabs[7]:
     st.caption("Full Redis snapshot for this symbol — for debugging / client questions.")
     pretty = {k: v for k, v in d.items() if k != "candles_1m"}
     st.json(pretty)

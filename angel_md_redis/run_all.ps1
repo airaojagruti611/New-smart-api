@@ -116,6 +116,14 @@ Start-Worker "liquidity_score" "run_liquidity_score.py"
 # --- Strategy Decision & Strike Selection ---
 Start-Worker "entry_trigger" "run_entry_trigger.py"
 Start-Worker "strike_select" "run_strike_select.py"
+Start-Worker "strike_intel" "run_strike_intel.py"
+Start-Worker "account" "run_account.py"
+Start-Worker "probability" "run_probability.py"
+Start-Worker "trade_ranking" "run_trade_ranking.py"
+Start-Worker "icare" "run_icare.py"
+Start-Worker "order_executor" "run_order_executor.py"
+Start-Worker "trade_journal" "run_trade_journal.py"
+Start-Worker "adaptive_tsl" "run_adaptive_tsl.py"
 Start-Worker "capital_alloc" "run_capital_alloc.py"
 
 # --- Volatility (Modules 8-9) ---

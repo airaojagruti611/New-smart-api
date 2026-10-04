@@ -155,7 +155,8 @@ def flush_option_hist(
     return written
 
 
-def _to_payload(key: str, kind: str, res: BidAskResult, now_ms: int) -> Dict[str, str]:
+def _to_payload(key: str, kind: str, res: BidAskResult, now_ms: int, tick: Optional[dict] = None) -> Dict[str, str]:
+    tick = tick or {}
     return {
         "ts_ms": str(now_ms),
         "key": key,
@@ -172,6 +173,14 @@ def _to_payload(key: str, kind: str, res: BidAskResult, now_ms: int) -> Dict[str
         "spread_avg": "" if res.spread_avg is None else f"{res.spread_avg:.4f}",
         "spread_avg_source": res.spread_avg_source or "",
         "spread_days": str(int(res.spread_days or 0)),
+        # raw book for the Order Executor (DECISION.md §7 E5): top-of-book sizes + 5 levels
+        "ltp": str(tick.get("ltp") or ""),
+        "bid_qty": str(tick.get("bid_sz") or ""),
+        "ask_qty": str(tick.get("ask_sz") or ""),
+        "bid_depth5": str(tick.get("bid_depth5") or ""),
+        "ask_depth5": str(tick.get("ask_depth5") or ""),
+        "bid_depth5_px": str(tick.get("bid_depth5_px") or ""),
+        "ask_depth5_px": str(tick.get("ask_depth5_px") or ""),
     }
 
 
@@ -299,7 +308,7 @@ def main() -> None:
                     continue
                 last_publish[key] = now
 
-                payload = _to_payload(key, kind, res, now_ms)
+                payload = _to_payload(key, kind, res, now_ms, fields)
                 r.xadd(OUT_STREAM, payload, maxlen=OUT_MAXLEN, approximate=True)
                 r.set(
                     f"{LATEST_KEY_PREFIX}{key}",

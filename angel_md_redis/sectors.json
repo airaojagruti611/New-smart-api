@@ -1,0 +1,6 @@
+{
+  "_comment": "Underlying -> sector for ICARE sector-exposure limit. Symbols missing here are flagged SECTOR_UNCHECKED.",
+  "RELIANCE": "ENERGY",
+  "TCS": "IT",
+  "INFY": "IT"
+}

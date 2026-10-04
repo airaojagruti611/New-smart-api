@@ -1,0 +1,14 @@
+{
+  "_comment": "DECISION.md §7 E10. Equity options on NSE, Angel One. Researched 2026-10-04 — VERIFY AGAINST A CONTRACT NOTE BEFORE LIVE (X-Q6). Percentages are of premium turnover.",
+  "_sources": [
+    "https://www.chittorgarh.com/brokerage_charges/angel-broking/14/",
+    "https://cleartax.in/s/securities-transaction-tax-stt",
+    "https://www.nseindia.com/static/invest/first-time-investor-sebi-turnover-fees-stt-other-levies"
+  ],
+  "brokerage_per_order": 20.0,
+  "stt_sell_pct": 0.15,
+  "exchange_txn_pct": 0.03503,
+  "sebi_per_crore": 10.0,
+  "stamp_buy_pct": 0.003,
+  "gst_pct": 18.0
+}

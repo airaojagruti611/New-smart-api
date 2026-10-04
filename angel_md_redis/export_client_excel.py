@@ -152,7 +152,61 @@ def collect_symbol(r: redis.Redis, sym: str) -> Dict[str, Any]:
         "entry": _load_json(r, f"md:entry:trigger:latest:{s}") or {},
         "strike": _load_json(r, f"md:strike:select:latest:{s}") or {},
         "capital": _load_json(r, f"md:capital:alloc:latest:{s}") or {},
+        "strike_intel": _load_json(r, f"md:strike:intel:latest:{s}") or {},
+        "probability": _load_json(r, f"md:probability:latest:{s}") or {},
+        "icare": _load_json(r, f"md:icare:latest:{s}") or {},
+        "ranking": _ranking_for(r, s),
+        "ranking_cycle": _load_json(r, "md:ranking:cycle:latest") or {},
+        "account": _load_json(r, "md:account:latest") or {},
+        "journal_stats": _load_json(r, "md:journal:stats") or {},
+        "tsl": _tsl_for(r, s),
+        "exec": _exec_for(r, s),
     }
+
+
+def _ranking_for(r: redis.Redis, sym: str) -> dict:
+    """Module 13 latest verdicts for this underlying (md:ranking:latest:{SYM}:{SIDE}), brief-shaped."""
+    out = {}
+    for side in ("CE", "PE"):
+        doc = _load_json(r, f"md:ranking:latest:{sym}:{side}") or {}
+        if doc:
+            obj = _load_json_str(doc.get("ranking_json")) or {}
+            out[side] = dict(obj, ts_ms=doc.get("rank_ts_ms"), reject_reasons=doc.get("rank_reject_reasons"),
+                             emitted=doc.get("rank_emit"), mode=doc.get("rank_mode"))
+    return out
+
+
+def _load_json_str(raw) -> dict:
+    try:
+        v = json.loads(raw) if raw else {}
+        return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def _tsl_for(r: redis.Redis, sym: str) -> List[dict]:
+    """Module 18 latest state for this underlying's contracts (md:tsl:latest:{TSYM})."""
+    out = []
+    for key in r.scan_iter(match="md:tsl:latest:*", count=200):
+        doc = _load_json(r, key) or {}
+        if str(doc.get("symbol") or "").upper() == sym.upper():
+            out.append(doc)
+    return out
+
+
+def _exec_for(r: redis.Redis, sym: str) -> dict:
+    """Module 14 last final execution report for this underlying (md:exec:latest:TRD_*)."""
+    best: dict = {}
+    for key in r.scan_iter(match="md:exec:latest:TRD_*", count=500):
+        doc = _load_json(r, key) or {}
+        if str(doc.get("symbol") or "").upper() == sym.upper() and int(doc.get("timestamp") or 0) > int(best.get("timestamp") or 0):
+            best = doc
+    if not best:
+        return {}
+    return {k: best.get(k) for k in ("trade_id", "option_symbol", "execution_status", "requested_lots", "filled_lots",
+                                     "average_fill_price", "reference_price", "price_cap", "slippage", "slippage_pct",
+                                     "brokerage", "total_execution_cost", "orders_used", "reject_reasons",
+                                     "cancel_reason", "mode")}
 
 
 def _liq_for_underlying(r: redis.Redis, sym: str) -> dict:
@@ -480,8 +534,82 @@ def build_rows(r: redis.Redis, symbols: List[str], data: Dict[str, dict]) -> Lis
             lambda d: d["capital"],
         ),
         (
+            "1.4 Decision",
+            "Strike Intelligence Engine (Module 10)",
+            "Ranks ATM±5 trade-side strikes: 25% liquidity, 25% expected-move fit, 20% delta, 15% theta, "
+            "10% gamma, 5% vega. Rejects liquidity < 70. Top-3 in `top`; best strike flat. Empty until a BUY entry trigger.",
+            "entry_trigger BUY + per-strike greeks/bid-ask/liquidity + expected_move",
+            lambda d: {"entry": d["entry"], "expected_move": d["expected"]},
+            "status, market_phase, delta_band, tradingsymbol, strike_score, confidence, reasons, top",
+            lambda d: {k: v for k, v in d["strike_intel"].items() if k not in ("ranked",)},
+        ),
+        (
+            "1.4 Decision",
+            "Probability Engine (Module 12)",
+            "Confluence 25 / direction 20 / intensity 15 / AMD 10 / historical 10 / OI 10 / liquidity 5 / greeks 5. "
+            "Hard filters can REJECT any score. Bands: <50 reject, 50-65 watchlist, 65-75 small, 75-85 trade, 85+ high conviction.",
+            "md:strike:intel OK + composite + greeks phase + regime + journal stats",
+            lambda d: {"strike_intel_status": d["strike_intel"].get("status"), "composite": d["composite"]},
+            "probability, grade, decision, p_* components, reject_reasons, flags",
+            lambda d: {k: v for k, v in d["probability"].items() if not k.startswith("projected") and k not in ("top", "reasons")},
+        ),
+        (
+            "1.4 Decision",
+            "ICARE — lot sizing & risk (Modules 11 + 20)",
+            "Trade quality → risk class (A+/A/B/C) → EV > 0 → lots = MIN(margin, risk, capital, portfolio, liquidity). "
+            "APPROVED trades are PAPER-traded only.",
+            "md:probability + md:account:latest + open paper positions",
+            lambda d: {"probability": d["probability"].get("probability"), "account": d["account"]},
+            "status, trade_quality, risk_class, expected_value, lots_by_*, recommended_lots, SL/target, reasons",
+            lambda d: d["icare"],
+        ),
+        (
+            "1.4 Decision",
+            "Trade Ranking Engine (Module 13)",
+            "13 weighted scores (probability 20 %, regime 10 %, …) × direction agreement × reward/risk × data quality. "
+            "Hard gates (probability, liquidity, spread, lot fit, kill switch, duplicate, daily loss, exposure) can never "
+            "be overridden. Ranks all candidates, one side per underlying, one new trade per sector; NO_TRADE is valid. "
+            "RANK_MODE=shadow: ICARE still reads md:probability.",
+            "md:probability candidates + live indicator / volume / regime / bid-ask / OI / EM / greeks keys + account",
+            lambda d: {"probability": d["probability"].get("probability"), "cycle": d["ranking_cycle"]},
+            "trade_score, rank, decision (TAKE_TRADE/WATCH/REJECT/DATA_INSUFFICIENT), confidence, EV, SL/TSL %, reasons",
+            lambda d: d["ranking"] or {"status": "no candidate in the last 2 minutes"},
+        ),
+        (
+            "1.7 Monitoring",
+            "Trade journal (paper) — Module 22",
+            "Closed paper trades with PnL, MFE, MAE, hold time; bucket stats feed Probability 'historical' and ICARE EV.",
+            "md:icare APPROVED + bid/ask marks",
+            lambda d: {},
+            "md:journal:stats buckets (samples, wins, pnl)",
+            lambda d: d["journal_stats"],
+        ),
+        (
+            "1.5 Risk",
+            "Adaptive trailing stop & re-entry — Module 18",
+            "Volatility + trend strength → dynamic trailing % that only tightens; exits need bid-ask / direction / EMA "
+            "confirmation (or distribution); re-entry only after a swing-high break with full confluence, max 2. "
+            "TSL_MODE=shadow observes only.",
+            "open paper positions + bid/ask, greeks, expected move, supertrend, EMA, OI, liquidity",
+            lambda d: {},
+            "status, current_trailing_stop, trailing_percentage, tsl_rule, reentry_state, watch_price",
+            lambda d: {"contracts": d["tsl"]} if d["tsl"] else {"status": "no open paper position"},
+        ),
+        (
+            "1.4 Execution",
+            "Order executor — Module 14",
+            "Each ICARE approval is re-validated (kill switch, hours, fresh quote, spread <= 1 %, drift, margin, "
+            "exposure), then bought with limit orders only: start at mid, step toward a cap of ask + 0.5 % "
+            "(never chased), sliced by visible depth; partial fills continue only if EV beats the extra cost. "
+            "EXEC_MODE=shadow simulates; live is disabled.",
+            "md:icare APPROVED + bid/ask/depth, account margin, open positions, kill switch",
+            lambda d: {},
+            "execution_status, filled/requested lots, average fill, slippage vs ask, charges, execution cost",
+            lambda d: d["exec"] or {"status": "no execution yet"},
+        ),
+        (
             "Backlog",
-            "Lot sizing / ranking / order executor / kill switch / risk / SL / slippage / journal",
+            "Circuit-limit data / slippage estimator (Module 19)",
             "Named in Option-rider-algo-specs.md but not implemented — no live output.",
             "n/a",
             lambda d: {},
