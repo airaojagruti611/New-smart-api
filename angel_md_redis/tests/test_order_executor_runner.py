@@ -68,7 +68,7 @@ class FakeRedis:
 
 
 def icare_msg(now_ms=T0, **over):
-    d = {"status": "APPROVED", "ts_ms": str(now_ms), "symbol": "SBIN", "tradingsymbol": TSYM, "side": "CE",
+    d = {"status": "APPROVED", "ts_ms": str(now_ms), "signal_ts_ms": str(now_ms - 2000), "symbol": "SBIN", "tradingsymbol": TSYM, "side": "CE",
          "strike": "900", "recommended_lots": "4", "lot_size": str(LOT), "premium": "100.5",
          "stop_loss_premium": "80", "target_premium": "130", "max_risk_allowed": "100000",
          "max_capital": "42000", "expected_value": "2000", "hold_minutes": "30", "spot": "905"}
@@ -112,7 +112,7 @@ class RunnerTest(unittest.TestCase):
         book(r, T0, 100.0, 101.0, [(101.0, 3 * LOT)])
         account(r, T0)
         rn = runner(r)
-        tid = rn.on_icare("1-0", icare_msg(), T0)
+        tid = rn.on_icare(f"{T0}-0", icare_msg(), T0)
         self.assertEqual(tid, "TRD_20261005_001")
         self.assertEqual(r.hgetall("md:exec:active"), {tid: "SBIN"})
         run_until_done(rn, r, T0 + 500, [(0, 100.60, 100.80, [(100.80, 3 * LOT)]),
@@ -128,7 +128,7 @@ class RunnerTest(unittest.TestCase):
         fill = r.streams["md:exec:fill"][0]
         self.assertEqual((fill["recommended_lots"], fill["icare_recommended_lots"]), ("4", "4"))
         with mock.patch.object(rtj, "is_eod", return_value=False):
-            rtj.handle_approval(r, fill, T0 + 9000)
+            rtj.handle_approval(r, fill, T0 + 9000, mode="paper")   # journal opens only same-mode fills
         pos = json.loads(r.get(f"md:position:open:{TSYM}"))
         self.assertAlmostEqual(pos["entry_premium"], 100.875)
         self.assertEqual(pos["lots"], 4)
@@ -148,7 +148,7 @@ class RunnerTest(unittest.TestCase):
         book(r, T0, 100.70, 100.80, [(100.80, 2 * LOT)])
         account(r, T0)
         rn = runner(r)
-        tid = rn.on_icare("1-0", icare_msg(), T0)
+        tid = rn.on_icare(f"{T0}-0", icare_msg(), T0)
         run_until_done(rn, r, T0 + 500, [(0, 100.70, 100.80, [(100.80, 2 * LOT)]), (500, 101.40, 101.90, [])])
         rep = json.loads(r.get(f"md:exec:latest:{tid}"))
         self.assertEqual((rep["execution_status"], rep["filled_lots"]), (S.PARTIAL_FILL_TIMEOUT, 2))
@@ -160,9 +160,9 @@ class RunnerTest(unittest.TestCase):
         book(r, T0, 100.70, 100.80, [(100.80, 4 * LOT)])
         account(r, T0)
         rn = runner(r)
-        self.assertIsNotNone(rn.on_icare("1-0", icare_msg(), T0))
-        self.assertIsNone(rn.on_icare("1-0", icare_msg(), T0))
-        self.assertIsNone(rn.on_icare("2-0", icare_msg(status="REJECTED"), T0))
+        self.assertIsNotNone(rn.on_icare(f"{T0}-0", icare_msg(), T0))
+        self.assertIsNone(rn.on_icare(f"{T0}-0", icare_msg(), T0))
+        self.assertIsNone(rn.on_icare(f"{T0}-1", icare_msg(status="REJECTED"), T0))
 
     def test_kill_switch_rejects_before_any_order(self):
         r = FakeRedis()
@@ -170,7 +170,7 @@ class RunnerTest(unittest.TestCase):
         account(r, T0)
         r.set("md:control:kill_switch", "1")
         rn = runner(r)
-        tid = rn.on_icare("1-0", icare_msg(), T0)
+        tid = rn.on_icare(f"{T0}-0", icare_msg(), T0)
         rep = json.loads(r.get(f"md:exec:latest:{tid}"))
         self.assertEqual(rep["execution_status"], S.REJECTED_BEFORE_EXECUTION)
         self.assertIn("KILL_SWITCH", rep["reject_reasons"])
@@ -181,8 +181,8 @@ class RunnerTest(unittest.TestCase):
         book(r, T0, 100.0, 101.0, [(101.0, LOT)])       # first order rests at mid, stays executing
         account(r, T0)
         rn = runner(r)
-        rn.on_icare("1-0", icare_msg(), T0)
-        tid2 = rn.on_icare("2-0", icare_msg(tradingsymbol=TSYM), T0)
+        rn.on_icare(f"{T0}-0", icare_msg(), T0)
+        tid2 = rn.on_icare(f"{T0}-1", icare_msg(tradingsymbol=TSYM), T0)
         rep = json.loads(r.get(f"md:exec:latest:{tid2}"))
         self.assertIn("DUPLICATE_UNDERLYING", rep["reject_reasons"])
 
@@ -193,7 +193,7 @@ class RunnerTest(unittest.TestCase):
         pos = open_position(icare_msg(), 100.8, T0 + 50)
         r.set(f"md:position:open:{TSYM}", json.dumps(pos.to_dict()))
         rn = runner(r, mode="shadow")
-        tid = rn.on_icare("1-0", icare_msg(), T0 + 100)
+        tid = rn.on_icare(f"{T0}-0", icare_msg(), T0 + 100)
         run_until_done(rn, r, T0 + 600, [(0, 100.70, 100.80, [(100.80, 4 * LOT)])])
         rep = json.loads(r.get(f"md:exec:latest:{tid}"))
         self.assertEqual(rep["execution_status"], S.FILLED)
@@ -209,7 +209,7 @@ class RunnerTest(unittest.TestCase):
         book(r, T0, 100.70, 100.80, [(100.80, LOT)])
         account(r, T0)
         rn = runner(r)
-        tid = rn.on_icare("1-0", icare_msg(), T0)
+        tid = rn.on_icare(f"{T0}-0", icare_msg(), T0)
         book(r, T0 + 500, 100.70, 100.80, [(100.80, LOT)])
         rn.tick(T0 + 500)                       # 1 lot filled, next slice working
         rn2 = runner(r)                         # process restart: memory and paper orders lost
@@ -224,7 +224,7 @@ class RunnerTest(unittest.TestCase):
         book(r, T0, 100.0, 103.0, [])
         account(r, T0)
         rn = runner(r)
-        tid = rn.on_icare("1-0", icare_msg(), T0)     # spread too wide -> rejected, no reference
+        tid = rn.on_icare(f"{T0}-0", icare_msg(), T0)     # spread too wide -> rejected, no reference
         self.assertNotIn(tid, r.hgetall("md:exec:missed"))
         r.hset("md:exec:missed", "X", json.dumps({"tsym": TSYM, "reference": 100.0, "done_ms": T0, "checked": []}))
         book(r, T0 + 5 * 60_000, 109.0, 111.0, [])

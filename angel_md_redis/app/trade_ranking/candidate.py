@@ -90,6 +90,7 @@ class Context:
     open_sectors: Dict[str, int] = field(default_factory=dict)    # sector -> open positions
     blocked: FrozenSet[str] = frozenset()                         # "SYM:SIDE" (Module 18)
     kill_switch: bool = False
+    day_pnl_known: bool = True                                    # False -> DAILY_LOSS_LIMIT (fail closed)
     # ICARE limits (one source of truth, read from the same env)
     max_risk_per_trade: float = 7500.0
     max_risk_pct: float = 2.0
@@ -137,6 +138,8 @@ class RankResult:
     reject_reasons: List[str]
     flags: List[str]
     sector: str = ""
+    gross_ev: Optional[float] = None            # per lot, before charges (expected_value is net)
+    charges: Optional[float] = None             # expected round-trip charges for feasible_lots
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -32,7 +32,9 @@ from typing import Dict, Optional
 import redis
 
 from app.config import load_symbols
+from app.freshness import env_ms
 from app.logging_setup import setup_logger
+from app.order_flow import newest_data_ts, prune_stale_book, tick_ts_ms
 from app.oi_analysis import (
     BuildupResult,
     OIConcentration,
@@ -75,6 +77,13 @@ EVAL_INTERVAL_SEC = float(os.getenv("OI_EVAL_INTERVAL_SEC", "5.0"))
 LATEST_TTL_SEC = int(os.getenv("OI_LATEST_TTL_SEC", "3600"))
 SESSION_TTL_SEC = int(os.getenv("OI_SESSION_TTL_SEC", "43200"))
 SESSION_KEY_PREFIX = os.getenv("OI_SESSION_PREFIX", "md:oi:session:")
+# Contracts not updated within this window are pruned (not republished as
+# fresh); payload ts_ms is the source tick time of the data used. OI stays
+# valid for the whole session and quiet strikes can go many minutes without a
+# tick, so the default keeps a full session (6h15m) — otherwise illiquid
+# strikes drop out of max pain / OI support-resistance. Previous-day ticks are
+# already rejected by the session-date guard and SESSION_RESET.
+BOOK_MAX_AGE_MS = env_ms("OI_BOOK_MAX_AGE_SEC", 22500)
 
 log = setup_logger("oi_analysis")
 
@@ -100,9 +109,23 @@ def _ist_today() -> str:
     return dt.datetime.now(IST).date().isoformat()
 
 
+def _ist_date_of_ms(ts_ms: int) -> str:
+    return dt.datetime.fromtimestamp(ts_ms / 1000.0, IST).date().isoformat()
+
+
+def tick_is_current_session(ts_ms: Optional[int], today: str) -> bool:
+    """A tick may update state / seed the day's baseline only if its source
+    time falls on today's IST session date (replayed old ticks must not
+    become today's previous_price / previous_oi)."""
+    if not ts_ms:
+        return False
+    return _ist_date_of_ms(ts_ms) == today
+
+
 def _to_contract_payload(
     tsym: str, underlying: str, cp: str, res: BuildupResult, smart_money: bool, now_ms: int
 ) -> Dict[str, str]:
+    # now_ms here is the SOURCE tick time of the contract snapshot.
     return {
         "ts_ms": str(now_ms),
         "tradingsymbol": tsym,
@@ -123,7 +146,7 @@ def _to_contract_payload(
 
 
 class ContractSnapshot:
-    __slots__ = ("underlying", "cp", "strike", "price", "oi", "cum_vol")
+    __slots__ = ("underlying", "cp", "strike", "price", "oi", "cum_vol", "data_ts_ms")
 
     def __init__(self):
         self.underlying = ""
@@ -132,12 +155,14 @@ class ContractSnapshot:
         self.price = 0.0
         self.oi = 0.0
         self.cum_vol = 0.0
+        self.data_ts_ms = 0
 
 
 def _copy_snap(snap: ContractSnapshot) -> ContractSnapshot:
     out = ContractSnapshot()
     out.underlying, out.cp, out.strike = snap.underlying, snap.cp, snap.strike
     out.price, out.oi, out.cum_vol = snap.price, snap.oi, snap.cum_vol
+    out.data_ts_ms = snap.data_ts_ms
     return out
 
 
@@ -235,10 +260,15 @@ def main() -> None:
                     cp = str(fields.get("cp") or "").strip().upper()
                     if ltp is None or oi is None:
                         continue
+                    tick_ms = tick_ts_ms(fields)
+                    if not tick_is_current_session(tick_ms, _ist_today()):
+                        log.debug("SKIP old_session_tick tsym=%s ts=%s", tsym, tick_ms)
+                        continue
 
                     snap = current.setdefault(tsym, ContractSnapshot())
                     snap.underlying, snap.cp, snap.strike = und, cp, strike
                     snap.price, snap.oi, snap.cum_vol = ltp, oi, cum_vol
+                    snap.data_ts_ms = tick_ms
 
                 if ack_ids:
                     r.xack(stream, GROUP, *ack_ids)
@@ -256,6 +286,11 @@ def main() -> None:
             session_open.clear()
             previous.clear()
             period_volume_avg.clear()
+            current.clear()  # yesterday's snapshots must not seed today's baseline
+
+        dropped = prune_stale_book(current, now_ms, BOOK_MAX_AGE_MS)
+        if dropped:
+            log.debug("PRUNE stale_contracts=%s", dropped)
 
         buildups: Dict[str, str] = {}
         oi_change_abs: Dict[str, float] = {}
@@ -308,7 +343,7 @@ def main() -> None:
                 smart_money, res.buildup_type,
             )
 
-            payload = _to_contract_payload(tsym, snap.underlying, snap.cp, res, smart_money, now_ms)
+            payload = _to_contract_payload(tsym, snap.underlying, snap.cp, res, smart_money, snap.data_ts_ms)
             r.xadd(OUT_STREAM, payload, maxlen=OUT_MAXLEN, approximate=True)
             r.set(f"{LATEST_KEY_PREFIX}{tsym}", json.dumps(payload, separators=(",", ":")), ex=LATEST_TTL_SEC)
 
@@ -366,7 +401,8 @@ def main() -> None:
             )
 
             payload = {
-                "ts_ms": str(now_ms),
+                "ts_ms": str(newest_data_ts(book.values()) or now_ms),
+                "eval_ts_ms": str(now_ms),
                 "underlying": und,
                 "spot": f"{spot:.2f}",
                 "atm": f"{atm:.2f}",

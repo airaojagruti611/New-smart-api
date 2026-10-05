@@ -13,7 +13,7 @@ class EmaCrossPoint:
     ema_fast: float
     ema_slow: float
     signal: str  # "bullish_cross" / "bearish_cross" / "none"
-    state: str  # "bullish" / "bearish"
+    state: str  # "bullish" / "bearish" / "neutral" (EMA9 == EMA26)
 
 
 def ema_cross(
@@ -29,7 +29,7 @@ def ema_cross(
       - bearish_cross: EMA_fast crosses below EMA_slow
       - none: no cross on this bar
     state:
-      - bullish if EMA_fast > EMA_slow else bearish
+      - bullish if EMA_fast > EMA_slow, bearish if EMA_fast < EMA_slow, else neutral
     """
     n = len(candles)
     out: List[Optional[EmaCrossPoint]] = [None] * n
@@ -49,7 +49,7 @@ def ema_cross(
         if f is None or s is None:
             continue
 
-        state = "bullish" if f > s else "bearish"
+        state = "bullish" if f > s else ("bearish" if f < s else "neutral")
         signal = "none"
 
         if prev_fast is not None and prev_slow is not None:

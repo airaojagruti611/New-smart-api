@@ -355,3 +355,66 @@ class OrderFlowDetector:
             resistance_events=resistance_events,
             refresh_events=refresh_events,
         )
+
+
+# ── Tick helpers (shared by the tick-level runners) ──────────────────────
+#
+# ltq on md:ticks:* is the LAST traded qty and REPEATS on quote-only
+# ticks, so summing it per tick multiplies one trade by the number of
+# quote updates that follow it. Traded qty is therefore derived from the
+# delta of the cumulative day volume (`vol`) per token instead.
+
+def tick_ts_ms(fields, fallback_ms: Optional[int] = None) -> Optional[int]:
+    """Source time of a tick: ts_exch (ms; seconds auto-scaled) -> ts_recv -> fallback."""
+    for name in ("ts_exch", "ts_recv"):
+        raw = (fields or {}).get(name)
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if v >= 1e12:          # epoch ms
+            return int(v)
+        if 1e9 <= v < 1e11:    # epoch seconds
+            return int(v * 1000)
+    return fallback_ms
+
+
+class CumVolTradeQty:
+    """Per-token traded qty from cumulative `vol` deltas.
+
+    First tick for a token and any reset (cum vol going DOWN, e.g. a new
+    session) only seed the baseline and return 0. A missing/invalid `vol`
+    returns 0 and leaves the baseline untouched. delta == 0 -> no new trade.
+    """
+
+    def __init__(self):
+        self._prev: Dict[str, float] = {}
+
+    def update(self, key: str, cum_vol) -> float:
+        try:
+            cv = float(cum_vol)
+        except (TypeError, ValueError):
+            return 0.0
+        if cv < 0:
+            return 0.0
+        prev = self._prev.get(key)
+        self._prev[key] = cv
+        if prev is None or cv < prev:
+            return 0.0
+        return cv - prev
+
+
+def prune_stale_book(book: Dict[str, object], now_ms: int, max_age_ms: int, attr: str = "data_ts_ms") -> List[str]:
+    """Drop entries whose `attr` source timestamp is older than max_age_ms
+    (or missing). Returns removed keys. max_age_ms <= 0 disables pruning."""
+    if max_age_ms <= 0:
+        return []
+    removed = [k for k, st in book.items() if not getattr(st, attr, 0) or now_ms - getattr(st, attr) > max_age_ms]
+    for k in removed:
+        del book[k]
+    return removed
+
+
+def newest_data_ts(items, attr: str = "data_ts_ms") -> Optional[int]:
+    ts = [getattr(x, attr, 0) for x in items if getattr(x, attr, 0)]
+    return max(ts) if ts else None

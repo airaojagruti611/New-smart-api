@@ -17,7 +17,8 @@ Step 3 (strike selection) — select_strike():
      (no real market-maker interest)
   3. reject strikes whose spread_ratio (current/avg spread%, from the
      bid-ask module) is >= 1.5x
-  4. among survivors: prefer a CONFIRMED sweep matching direction; tightest
+  4. among survivors: prefer a CONFIRMED SWEEP_BUY on the contract we'd buy
+     (CE for UP, PE for DOWN); tightest
      spread_ratio breaks ties
   5. else prefer ATM
   6. else allow one strike OTM only if Vol/OI > 3.0
@@ -37,6 +38,8 @@ VOL_OI_UNUSUAL = 2.0
 VOL_OI_STRONG_OTM = 3.0
 
 SPREAD_RATIO_OK = 1.5
+
+SWEEP_CONFIRM_SIGNAL = "SWEEP_BUY"  # smart_money sweep_signal that confirms a long option
 
 PCR_WINDOW = 10
 PCR_DROP_PCT = 15.0  # PCR drop >= 15% over the window -> "call demand rising"
@@ -115,7 +118,7 @@ class StrikeCandidate:
     oi: float
     vol_oi_ratio: Optional[float]
     vol_oi_class: str
-    sweep_signal: str        # from smart_money composite, e.g. "SMART_MONEY_BUY"
+    sweep_signal: str        # md:smartmoney:latest sweep_signal: SWEEP_BUY / SWEEP_SELL / NONE
     sweep_confirmed: bool
     spread_pct: float
     spread_ratio: Optional[float]  # from bidask module: current/avg spread%
@@ -164,12 +167,15 @@ def select_strike(
     if not survivors:
         return StrikeSelection("NO_CANDIDATE", underlying, bias, None, "no_survivors", rejected)
 
+    # Confirmed sweep in the direction WE trade: we only ever BUY options, so
+    # the confirmation is aggressive buyers lifting the asks of the contract
+    # we would buy — a SWEEP_BUY on the CE for an UP bias and a SWEEP_BUY on
+    # the PE for a DOWN bias. (A SWEEP_SELL on a put is put WRITING/dumping,
+    # i.e. the opposite of PE demand.) sweep_signal values come from
+    # app/smart_money.detect_sweep: SWEEP_BUY / SWEEP_SELL / NONE.
     sweeps = [
         c for c in survivors
-        if c.sweep_confirmed and (
-            (want_cp == "CE" and c.sweep_signal == "SMART_MONEY_BUY")
-            or (want_cp == "PE" and c.sweep_signal == "SMART_MONEY_SELL")
-        )
+        if c.sweep_confirmed and c.cp == want_cp and c.sweep_signal == SWEEP_CONFIRM_SIGNAL
     ]
     if sweeps:
         chosen = min(sweeps, key=lambda c: c.spread_ratio if c.spread_ratio is not None else 999.0)

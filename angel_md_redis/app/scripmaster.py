@@ -1,4 +1,5 @@
 import json
+import re
 import time
 import datetime as dt
 from pathlib import Path
@@ -42,8 +43,29 @@ def load_scripmaster(cache_path: Path = CACHE_PATH) -> pd.DataFrame:
         cache_path.write_bytes(r.content)
 
     data = json.loads(cache_path.read_text(encoding="utf-8"))
-    df = pd.DataFrame(data)
+    return prepare_scripmaster(pd.DataFrame(data))
 
+
+def option_type_of(symbol: Any, instrumenttype: Any = "") -> Optional[str]:
+    """CE/PE from the tradingsymbol's 2-char suffix (PETRONET27OCT26320CE -> CE).
+
+    Substring matching is wrong: PETRONET/PERSISTENT/HINDPETRO contain "PE".
+    Non-option instruments return None.
+    """
+    it = str(instrumenttype or "").upper()
+    if it and not it.startswith("OPT"):
+        return None
+    s = str(symbol or "").strip().upper()
+    if s.endswith("CE"):
+        return "CE"
+    if s.endswith("PE"):
+        return "PE"
+    return None
+
+
+def prepare_scripmaster(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize raw ScripMaster rows (columns, expiry/strike parsing, opt_type)."""
+    df = df.copy()
     df["exch_seg"] = df["exch_seg"].astype(str).str.upper()
 
     # token
@@ -73,10 +95,9 @@ def load_scripmaster(cache_path: Path = CACHE_PATH) -> pd.DataFrame:
     df["expiry_date"] = df.get("expiry", "").apply(parse_expiry)
     df["strike_f"] = df.get("strike", None).apply(to_float)
 
-    sym_u = df["symbol"].str.upper()
-    df["opt_type"] = None
-    df.loc[sym_u.str.contains("CE"), "opt_type"] = "CE"
-    df.loc[sym_u.str.contains("PE"), "opt_type"] = "PE"
+    df["opt_type"] = [
+        option_type_of(sym, it) for sym, it in zip(df["symbol"].tolist(), df["instrumenttype"].tolist())
+    ]
 
     return df
 
@@ -128,6 +149,23 @@ def detect_strike_scale(median_strike: float, spot: float) -> float:
     # some masters use 1000 scaling (rare) – you can extend later
     return 1.0
 
+def filter_underlying(d: pd.DataFrame, underlying: str) -> pd.DataFrame:
+    """Rows whose underlying is exactly `underlying`.
+
+    Uses the ScripMaster `name` column (LT != LTF/LTM, NIFTY != NIFTYNXT50,
+    PNB != PNBHOUSING). Rows with an empty name fall back to a strict
+    tradingsymbol pattern: UNDERLYING + DDMMMYY + strike + CE/PE.
+    """
+    u = str(underlying or "").strip().upper()
+    names = d["name"].astype(str).str.strip().str.upper() if "name" in d.columns else pd.Series("", index=d.index)
+    by_name = names == u
+    blank = names == ""
+    sym_u = d["symbol"].astype(str).str.upper()
+    pat = r"^" + re.escape(u) + r"\d{2}[A-Z]{3}\d{2}\d+(?:\.\d+)?(?:CE|PE)$"
+    by_sym = blank & sym_u.str.match(pat)
+    return d[by_name | by_sym]
+
+
 def build_atm_option_tokens(
     df: pd.DataFrame,
     underlying: str,
@@ -142,8 +180,7 @@ def build_atm_option_tokens(
     d = df[(df["exch_seg"] == "NFO") & (df["instrumenttype"].str.contains("OPT", na=False))].copy()
     d["sym_u"] = d["symbol"].str.upper()
 
-    # simple reliable match: tradingsymbol startswith underlying
-    d = d[d["sym_u"].str.startswith(underlying)]
+    d = filter_underlying(d, underlying)
     if d.empty:
         return [], None
 

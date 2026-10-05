@@ -5,8 +5,8 @@ Redis Streams → Parquet data_lake, same layout as Angel One ticks:
 
   data_lake/stream=<stream_with_underscores>/dt=YYYY-MM-DD/[symbol=...]/part-<ts>.parquet
 
-Covers Angel One market data plus every Option Rider layer through
-Module 9 (Greeks Change), including the streams those layers consume.
+Covers Angel One market data plus every stream produced by the pipeline
+workers (signal layers, decision layer, executor, TSL, capital allocation).
 
 Usage:
   python run_archiver_layers.py              # all streams
@@ -82,11 +82,20 @@ STREAMS: Dict[str, Tuple[str, str, int]] = {
     # Module 14 — Order Executor events (orders, fills, final reports, missed moves) + fills
     "exec": ("md:exec", "arch-exec-1", 2000),
     "exec_fill": ("md:exec:fill", "arch-exec-fill-1", 500),
+    # Live exit path (order executor): exit requests. Archiving a stream that no
+    # producer has written yet is harmless: the consumer group is created with
+    # MKSTREAM and the reader just idles until the first entry arrives.
+    "exec_exit_request": ("md:exec:exit_request", "arch-exec-exit-request-1", 500),
     # Module 18 — Adaptive trailing SL events + re-entry signals
     "tsl": ("md:tsl", "arch-tsl-1", 2000),
     "tsl_reentry": ("md:tsl:reentry", "arch-tsl-reentry-1", 200),
     # Module 9 — Greeks change
     "greeks_change": ("md:greeks_change:signal", "arch-greeks-change-1", 2000),
+    # Capital allocation (run_capital_alloc.py) — sized CALL/PUT notional
+    "capital_alloc": ("md:capital:alloc", "arch-capital-alloc-1", 2000),
+    # To archive a NEW stream: add one line here
+    #   "<name>": ("<redis stream>", "arch-<name>-1", <batch_size>),
+    # (consumer names must stay stable so restarts resume from the last ACK).
 }
 
 GROUP = "archive"

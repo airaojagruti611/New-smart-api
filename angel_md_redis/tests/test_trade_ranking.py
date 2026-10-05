@@ -58,6 +58,15 @@ class TestNormalisation(unittest.TestCase):
         self.assertEqual(label_alignment("NEUTRAL", "CE"), "NEUTRAL")
         self.assertIsNone(label_alignment("", "CE"))
 
+    def test_contract_imbalance_not_side_flipped(self):
+        """md:imbalance:latest:{TSYM} is the bought contract's book: BULLISH = FOR for CE and PE."""
+        pe_bull = normalize(_cand(side="PE", imbalance="BULLISH"), RankConfig())
+        pe_bear = normalize(_cand(side="PE", imbalance="BEARISH"), RankConfig())
+        self.assertEqual(pe_bull["bidask"], round(0.7 * 94 + 0.3 * 100, 4))   # 95.8
+        self.assertEqual(pe_bear["bidask"], round(0.7 * 94, 4))               # 65.8
+        self.assertEqual(analyze(_cand(side="PE", imbalance="BULLISH"), RankConfig()).votes["bidask"], "FOR")
+        self.assertEqual(analyze(_cand(side="PE", imbalance="BEARISH"), RankConfig()).votes["bidask"], "AGAINST")
+
     def test_em_opposing_zeroes_confidence(self):
         comps = normalize(_cand(em_direction="BEARISH", em_confidence=90.0, em_fit=80.0), RankConfig())
         self.assertEqual(comps["expected_move"], 40.0)
@@ -119,10 +128,17 @@ class TestDirection(unittest.TestCase):
 
 class TestEconomics(unittest.TestCase):
     def test_brief_ev_example(self):
-        """p 85 %, profit 4,000, loss 2,000 -> EV 3,100."""
+        """p 85 %, profit 4,000, loss 2,000 -> gross EV 3,100; net of charges for the 3 feasible lots.
+
+        Charges (charges.json), qty 300: buy @100 36.94; sell @140 104.01 (p .85), @80 69.55 (.15)
+        -> 36.94 + 98.84 = 135.78 total = 45.26 / lot -> net 3,054.74 / lot.
+        """
         c = _cand(probability=85.0, premium=100.0, lot_size=100.0, projected_gain=40.0, adverse_change=-20.0)
         e = economics(c, CTX, RankConfig(), ICFG)
-        self.assertEqual(e.ev_per_lot, 3100.0)
+        self.assertEqual(e.feasible_lots, 3)
+        self.assertEqual(e.gross_ev_per_lot, 3100.0)
+        self.assertEqual(e.charges, 135.78)
+        self.assertEqual(e.ev_per_lot, 3054.74)
         self.assertEqual(e.ev_source, "model")
         self.assertEqual(e.reward_risk, 2.0)
         self.assertEqual(e.risk_factor, 1.0)
@@ -172,7 +188,7 @@ class TestRankingExamples(unittest.TestCase):
     def test_one_side_per_underlying(self):
         ce = _cand(candidate_id="CE")
         pe = _cand(candidate_id="PE", side="PE", tradingsymbol="SBIN26OCT800PE", indicator_score=-1.6,
-                   volume_signal="Strong Bearish Volume", regime="BEARISH", imbalance="BEARISH",
+                   volume_signal="Strong Bearish Volume", regime="BEARISH", imbalance="BULLISH",   # put's own book
                    oi_positioning="BEARISH_POSITIONING", em_direction="BEARISH", htf_bias="PUT", st_bias="PUT",
                    probability=80.0, p_oi=80.0)
         ranked, summary = ENGINE.rank([pe, ce], CTX)

@@ -26,6 +26,7 @@ import redis
 
 from app.config import load_symbols
 from app.logging_setup import setup_logger
+from app.order_flow import CumVolTradeQty, tick_ts_ms
 from app.smart_money import DepthLevel, SmartMoneyDetector, SmartMoneySignal
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -103,7 +104,7 @@ def main() -> None:
     ensure_group(r, OPT_STREAM, GROUP)
 
     detectors: Dict[str, SmartMoneyDetector] = {}
-    prev_cum_vol: Dict[str, float] = {}
+    trade_qty_tracker = CumVolTradeQty()
     last_composite: Dict[str, str] = {}
 
     log.info(
@@ -148,6 +149,15 @@ def main() -> None:
                 ask_size = _safe_float(fields.get("ask_sz"))
                 ltp = _safe_float(fields.get("ltp"))
 
+                # Tick volume = delta of cumulative day volume (NOT ltq, which
+                # repeats on quote-only ticks). delta == 0 -> quote-only update:
+                # no trade print, so no trade_price for sweep/cluster detection.
+                tick_vol = trade_qty_tracker.update(key, fields.get("vol"))
+                trade_price = ltp if tick_vol > 0 else None
+                # Cluster windows are judged on the tick's own time, not one
+                # processing timestamp per batch.
+                tick_ms = tick_ts_ms(fields, now_ms)
+
                 if bid_price is None or ask_price is None or bid_size is None or ask_size is None:
                     log.debug("SKIP no_quote key=%s kind=%s", key, kind)
                     continue
@@ -159,26 +169,13 @@ def main() -> None:
                 bid_levels = _build_levels(bid_prices, bid_sizes)
                 ask_levels = _build_levels(ask_prices, ask_sizes)
 
-                # Tick volume: prefer ltq (last traded quantity) if the feed
-                # provides it, else derive from cumulative "vol" delta (same
-                # technique as candle_builder.py / run_volume_analyzer.py).
-                tick_vol = _safe_float(fields.get("ltq"))
-                if tick_vol is None:
-                    cum_vol = _safe_float(fields.get("vol"))
-                    prev = prev_cum_vol.get(key)
-                    if cum_vol is not None:
-                        tick_vol = max(0.0, cum_vol - prev) if prev is not None else 0.0
-                        prev_cum_vol[key] = cum_vol
-                    else:
-                        tick_vol = 0.0
-
                 if key not in detectors:
                     detectors[key] = SmartMoneyDetector()
 
                 sig = detectors[key].analyze(
-                    ts_ms=now_ms,
-                    trade_price=ltp,
-                    tick_vol=tick_vol or 0.0,
+                    ts_ms=tick_ms,
+                    trade_price=trade_price,
+                    tick_vol=tick_vol,
                     bid_price=bid_price, bid_size=bid_size,
                     ask_price=ask_price, ask_size=ask_size,
                     bid_levels=bid_levels, ask_levels=ask_levels,

@@ -149,7 +149,9 @@ def _request_json(url: str, auth_token: str, payload: dict, timeout: int) -> dic
 
     body = _post(force_public=False)
     code = str(body.get("errorcode") or body.get("errorCode") or "").upper()
-    if code == "AG8004":
+    # Retry only if forcing the public IP actually changes the headers; an
+    # identical retry just doubles calls against the rate limit.
+    if code == "AG8004" and build_headers(auth_token, force_public=True) != build_headers(auth_token):
         log.warning(
             "AG8004 retrying with public-IP headers url=%s err=%s",
             url, api_error_text(body),

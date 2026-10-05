@@ -1,3 +1,4 @@
+import os
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -11,6 +12,38 @@ from .config import (
 from .utils import now_ms, paise_to_rupees
 from .redis_store import RedisStore
 from .scripmaster import load_scripmaster, resolve_eq_tokens, build_atm_option_tokens
+
+
+# Equity ticks unchanged in every core field are still re-emitted after this
+# long, so freshness checks downstream don't age out a live-but-quiet book.
+EQ_HEARTBEAT_MS = int(float(os.getenv("EQ_TICK_HEARTBEAT_SEC", "5")) * 1000)
+
+_PRICE_FIELDS = ("ltp", "bid", "ask")
+_EXACT_FIELDS = ("c", "vol", "bid_sz", "ask_sz")
+
+
+def eq_core_changed(last: Optional[Dict[str, Any]], core: Dict[str, Any], eps: float,
+                    now: int, heartbeat_ms: int) -> bool:
+    """True when an equity tick should be emitted.
+
+    Prices compare with an ``eps`` noise guard; previous close, cumulative
+    volume and top-of-book sizes compare exactly. A heartbeat re-emits an
+    unchanged book every ``heartbeat_ms`` (0 disables it).
+    """
+    if last is None:
+        return True
+    for k in _PRICE_FIELDS:
+        a, b = core.get(k), last.get(k)
+        if a is None or b is None:
+            if a != b:
+                return True
+        elif abs(a - b) > eps:
+            return True
+    for k in _EXACT_FIELDS:
+        if core.get(k) != last.get(k):
+            return True
+    emitted = last.get("emitted_ms")
+    return bool(heartbeat_ms > 0 and (emitted is None or now - emitted >= heartbeat_ms))
 
 
 def _extract_top5(levels: Any) -> Tuple[Optional[float], Optional[float], List[float], List[float]]:
@@ -73,7 +106,9 @@ class MarketDataProducer:
 
         self.spot_ltp: Dict[str, float] = {}
         self.ws_open_t: Optional[float] = None
-        self.options_subscribed = False
+        self.options_subscribed = False          # first option pass done (run_greeks waits on it)
+        self.options_planned: set = set()        # symbols whose option chain has been planned
+        self._opt_batch_no = 0
 
         self.sws = SmartWebSocketV2(
             auth_token=self.auth_token,
@@ -146,22 +181,27 @@ class MarketDataProducer:
         self.rs.set_latest("md:active_expiry:ts_ms", str(now_ms()), ex_sec=3600)
 
     def _maybe_subscribe_options(self):
-        if self.options_subscribed:
-            return
+        """
+        First pass after warm-up (enough spots or WS_WARMUP_SEC); afterwards any
+        symbol whose first spot tick arrives late is planned and subscribed on
+        its own, so a slow symbol never ends up with no option chain.
+        """
         if self.ws_open_t is None:
             return
-
-        elapsed = time.time() - self.ws_open_t
-        enough = (len(self.spot_ltp) >= max(10, int(0.5 * len(self.eq_map)))) or (elapsed >= WS_WARMUP_SEC)
-        if not enough:
+        if not self.options_subscribed:
+            elapsed = time.time() - self.ws_open_t
+            enough = (len(self.spot_ltp) >= max(10, int(0.5 * len(self.eq_map)))) or (elapsed >= WS_WARMUP_SEC)
+            if not enough:
+                return
+        pending = [s for s in self.symbols if s in self.spot_ltp and s not in self.options_planned]
+        if not pending:
             return
+        first = not self.options_subscribed
 
         # build option token plan
         planned: List[dict] = []
-        for sym in self.symbols:
-            if sym not in self.spot_ltp:
-                continue
-
+        for sym in pending:
+            self.options_planned.add(sym)
             contracts, expiry_iso = build_atm_option_tokens(self.df, sym, self.spot_ltp[sym], STRIKES_AROUND)
             if not contracts:
                 continue
@@ -171,8 +211,8 @@ class MarketDataProducer:
 
             planned.extend(contracts)
 
-        # dedupe by token
-        seen = set()
+        # dedupe by token (also against contracts already subscribed)
+        seen = set(self.opt_meta)
         unique = []
         for c in planned:
             t = c["token"]
@@ -181,17 +221,18 @@ class MarketDataProducer:
                 unique.append(c)
 
         eq_count = len(self.eq_map)
-        total = eq_count + len(unique)
+        total = eq_count + len(self.opt_meta) + len(unique)
 
         if total > MAX_WS_SUBS:
-            cap = max(0, MAX_WS_SUBS - eq_count)
+            cap = max(0, MAX_WS_SUBS - eq_count - len(self.opt_meta))
             unique = unique[:cap]
             print(f"[WS] capped option tokens to {len(unique)} to stay under MAX_WS_SUBS={MAX_WS_SUBS}")
 
-        if not unique:
-            print("[WS] no option contracts planned (many symbols may not have options)")
-            self.options_subscribed = True
+        self.options_subscribed = True
 
+        if not unique:
+            if first:
+                print("[WS] no option contracts planned (many symbols may not have options)")
             # ✅ publish active expiries (even if partial/empty)
             self._publish_active_expiry()
             return
@@ -211,19 +252,19 @@ class MarketDataProducer:
                 "exchange": "NFO",
             })
 
-        # subscribe in batches
+        # subscribe in batches (correlation ids unique across passes)
         BATCH = 50
         for i in range(0, len(tokens), BATCH):
             batch = tokens[i:i + BATCH]
             token_list = [{"exchangeType": self.EXCH_NFO, "tokens": batch}]
-            self.sws.subscribe(correlation_id=f"OPT{i//BATCH:02d}", mode=self.mode_opt, token_list=token_list)
-
-        self.options_subscribed = True
+            self._opt_batch_no += 1
+            self.sws.subscribe(correlation_id=f"OPT{self._opt_batch_no:03d}", mode=self.mode_opt, token_list=token_list)
 
         # ✅ publish active expiries for greeks poller
         self._publish_active_expiry()
 
-        print(f"[WS] subscribed OPT={len(tokens)} mode={SUBSCRIBE_MODE} (EQ={eq_count}, total={eq_count+len(tokens)})")
+        print(f"[WS] subscribed OPT={len(tokens)} for {pending} mode={SUBSCRIBE_MODE} "
+              f"(EQ={eq_count}, total={eq_count+len(self.opt_meta)})")
 
     def _emit_eq(self, sym: str, tok: str, data: Dict[str, Any]):
         ltp = paise_to_rupees(data.get("last_traded_price"))
@@ -241,44 +282,18 @@ class MarketDataProducer:
         ask, ask_qty, ask_sizes, ask_prices = _extract_top5(data.get("best_5_sell_data"))
         ltq_raw = data.get("last_traded_quantity")
 
-        # Only emit when core fields used by downstream jobs actually change.
-        last = self._last_eq_core.get(sym)
-        changed = False
-        if last is None:
-            changed = True
-        else:
-            last_ltp = last.get("ltp")
-            last_c = last.get("c")
-            last_vol = last.get("vol")
-            last_bid = last.get("bid")
-
-            if ltp is None or last_ltp is None:
-                if ltp != last_ltp:
-                    changed = True
-            else:
-                if abs(ltp - last_ltp) > self._ltp_eps:
-                    changed = True
-
-            if not changed:
-                if prev_close != last_c:
-                    changed = True
-
-            if not changed:
-                if cum_vol != last_vol:
-                    changed = True
-
-            if not changed:
-                if bid is None or last_bid is None:
-                    if bid != last_bid:
-                        changed = True
-                elif abs(bid - last_bid) > self._ltp_eps:
-                    changed = True
-
+        # Only emit when core fields used by downstream jobs actually change,
+        # plus a heartbeat so a live-but-quiet book keeps a fresh source time
+        # (downstream quote-age checks use the tick time).
+        core = {"ltp": ltp, "c": prev_close, "vol": cum_vol, "bid": bid, "ask": ask,
+                "bid_sz": bid_qty, "ask_sz": ask_qty}
+        now = now_ms()
+        changed = eq_core_changed(self._last_eq_core.get(sym), core, self._ltp_eps, now, EQ_HEARTBEAT_MS)
         if not changed:
             return
 
         payload = {
-            "ts_recv": str(now_ms()),
+            "ts_recv": str(now),
             "ts_exch": str(data.get("exchange_timestamp") or ""),
             "token": tok,
             "symbol": sym,
@@ -301,7 +316,7 @@ class MarketDataProducer:
             "ltq": str(ltq_raw if ltq_raw not in (None, "") else ""),
         }
         self.rs.xadd(STREAM_EQ, payload, maxlen=STREAM_MAXLEN_EQ)
-        self._last_eq_core[sym] = {"ltp": ltp, "c": prev_close, "vol": cum_vol, "bid": bid}
+        self._last_eq_core[sym] = dict(core, emitted_ms=now)
 
     def _emit_opt(self, tok: str, data: Dict[str, Any]):
         meta = self.opt_meta.get(tok)

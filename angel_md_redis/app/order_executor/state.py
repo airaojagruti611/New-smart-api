@@ -64,6 +64,7 @@ class ExecState:
     block_reason: str = ""                                # last reason no order was working
     decision: dict = field(default_factory=dict)          # last continue/stop detail
     lpp_rejects: int = 0
+    lpp_last_price: Optional[float] = None                # last limit the exchange refused (price band)
     reject_reasons: List[str] = field(default_factory=list)
     finished_ms: int = 0
     report: dict = field(default_factory=dict)

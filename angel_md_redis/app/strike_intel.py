@@ -66,8 +66,13 @@ DELTA_DECAY_WIDTH = 0.25         # |delta| this far outside the band -> 0
 THETA_RISK_PCT_ZERO = 10.0       # losing 10% of premium to decay over the hold -> 0
 VEGA_PCT_ZERO = 10.0             # 10% premium move per vol point -> 0
 IV_FALLING_VEGA_PENALTY = 2.0
-TRADING_MINUTES_PER_DAY = 375.0  # NSE 09:15-15:30; theta is quoted per day
-MINUTES_PER_YEAR_CALENDAR = 365.0 * 24.0 * 60.0  # option_pricing's T convention
+# TIME CONVENTION (QA fix): option_pricing's BSM T is CALENDAR time and its
+# theta_per_day is per CALENDAR day (annual theta / 365). Both the theta
+# decay estimate and the repricing horizon therefore use calendar minutes:
+# a 60-minute hold costs theta_per_day * 60/1440. (Previously decay used
+# 375 trading minutes/day, overstating hold decay 3.84x vs the repricer.)
+MINUTES_PER_DAY_CALENDAR = 24.0 * 60.0
+MINUTES_PER_YEAR_CALENDAR = 365.0 * MINUTES_PER_DAY_CALENDAR  # option_pricing's T convention
 IV_STRESS_POINTS = 2.0
 
 # ── Execution quality (spread + top-of-book depth) ──────────────────────
@@ -237,10 +242,14 @@ def delta_suitability_score(delta: Optional[float], band: Tuple[float, float]) -
 
 
 def theta_risk(theta_per_day: Optional[float], premium: Optional[float], hold_minutes: float) -> Tuple[Optional[float], Optional[float]]:
-    """(premium points lost to decay over the hold, same as % of premium)."""
+    """
+    (premium points lost to decay over the hold, same as % of premium).
+    theta_per_day is per CALENDAR day (BSM / Angel convention), so the hold
+    is converted with calendar minutes (1440/day), matching project_greeks.
+    """
     if theta_per_day is None:
         return None, None
-    pts = abs(theta_per_day) * max(hold_minutes, 0.0) / TRADING_MINUTES_PER_DAY
+    pts = abs(theta_per_day) * max(hold_minutes, 0.0) / MINUTES_PER_DAY_CALENDAR
     pct = (pts / premium * 100.0) if premium and premium > 0 else None
     return round(pts, 4), (None if pct is None else round(pct, 4))
 

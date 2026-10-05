@@ -61,10 +61,10 @@ for tsym, g in ticks.groupby(["tradingsymbol", ticks["ts"].map(lambda x: dt.date
         t_ist = dt.datetime.fromtimestamp(q0.ts_ms / 1000, IST)
         if t_ist.strftime("%H:%M") >= "15:29":       # archive is late-session only; stay inside market hours
             continue
-        icare = {"status": "APPROVED", "ts_ms": q0.ts_ms, "symbol": str(g["underlying"].iloc[0]), "tradingsymbol": tsym,
+        icare = {"status": "APPROVED", "ts_ms": q0.ts_ms, "signal_ts_ms": q0.ts_ms, "symbol": str(g["underlying"].iloc[0]), "tradingsymbol": tsym,
                  "side": str(tsym)[-2:], "recommended_lots": random.choice([1, 2, 3]), "lot_size": lot,
                  "premium": q0.mid, "stop_loss_premium": q0.mid * 0.8, "max_risk_allowed": 1e7, "expected_value": 1500}
-        st = new_state(build_command(icare, f"R{len(reports)}", "x", spec, CFG), q0.ts_ms)
+        st = new_state(build_command(icare, f"R{len(reports)}", f"{q0.ts_ms}-0", spec, CFG), q0.ts_ms)
         broker, upd, j = PaperBroker(300), [], i
         now = q0.ts_ms
         while st.status not in S.TERMINAL and now < q0.ts_ms + 20_000:

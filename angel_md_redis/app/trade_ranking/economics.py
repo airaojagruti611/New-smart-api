@@ -4,11 +4,14 @@ Trade Ranking Engine — expected value, reward/risk and lot feasibility
 formulas have one source of truth.
 
   initial SL   = icare.stop_loss_points (SIE adverse repricing, clamped 10-30 %)
-  EV per lot   = icare.expected_value  (model until the journal bucket has >= 30 trades)
+  EV per lot   = icare.ev_breakdown NET of round-trip charges for the feasible lots
+                 (model until the journal bucket has >= 30 trades); gross_ev_per_lot /
+                 charges reported alongside
   ev_per_risk  = EV per lot / risk per lot
   reward_risk  = projected gain / SL points
   risk_factor  = clamp(base + slope x reward_risk, base, 1)
-  lots         = MIN(icare.presize_lots)  (no quality class / portfolio here; ICARE decides)
+  lots         = MIN(icare.presize_lots)  (no quality class / portfolio here; ICARE decides),
+                 incl. the remaining daily-loss room (same formula as ICARE)
   lot_score    = 60 + 40 x min(1, lots / target_lots); 0 lots -> LOT_NOT_FEASIBLE
 """
 
@@ -17,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional
 
-from app.icare import ICAREConfig, ICAREInputs, expected_value, presize_lots, stop_loss_points
+from app.icare import ICAREConfig, ICAREInputs, daily_loss_room, ev_breakdown, presize_lots, stop_loss_points
 from app.trade_ranking.candidate import Candidate, Context
 from app.trade_ranking.config import RankConfig
 
@@ -39,7 +42,9 @@ class Economics:
     lot_score: Optional[float]
     capital_required: Optional[float]
     risk_amount: Optional[float]
-    expected_value: Optional[float]           # EV x feasible lots
+    expected_value: Optional[float]           # net EV x feasible lots
+    gross_ev_per_lot: Optional[float] = None  # before charges
+    charges: Optional[float] = None           # expected round-trip charges for the feasible lots
 
 
 def risk_factor(reward_risk: Optional[float], cfg: RankConfig) -> float:
@@ -62,8 +67,13 @@ def evaluate(c: Candidate, ctx: Context, cfg: RankConfig, icfg: ICAREConfig) -> 
     sl_pts = stop_loss_points(premium, c.adverse_change, icfg)
     gain = c.projected_gain if c.projected_gain is not None and c.projected_gain > 0 else None
     rr = round(gain / sl_pts, 4) if gain and sl_pts else None
-    ev = p_win = None
+    ev = p_win = gross = charges = None
     source = "none"
+    risk_lot = round(sl_pts * lot, 2)
+    room = daily_loss_room(ctx.total_capital, ctx.day_pnl, ctx.daily_loss_limit_pct) if ctx.total_capital > 0 else None
+    limits = presize_lots(premium, lot, sl_pts, ctx.available_margin, ctx.total_capital, c.liquidity_max_lots, icfg,
+                          risk_room=room)
+    lots = min(limits.values()) if limits else 0
     if gain:
         inp = ICAREInputs(
             symbol=c.symbol, side=c.side, tradingsymbol=c.tradingsymbol, strike=c.strike or 0.0,
@@ -72,10 +82,10 @@ def evaluate(c: Candidate, ctx: Context, cfg: RankConfig, icfg: ICAREConfig) -> 
             history_samples=c.history_samples, history_win_rate=c.history_win_rate,
             history_avg_win_pct=c.history_avg_win_pct, history_avg_loss_pct=c.history_avg_loss_pct,
         )
-        ev, source, p_win = expected_value(inp, premium, lot, sl_pts, gain, icfg)
-    risk_lot = round(sl_pts * lot, 2)
-    limits = presize_lots(premium, lot, sl_pts, ctx.available_margin, ctx.total_capital, c.liquidity_max_lots, icfg)
-    lots = min(limits.values()) if limits else 0
+        bd = ev_breakdown(inp, premium, lot, sl_pts, gain, icfg, lots=max(lots, 1))
+        if bd is not None:
+            ev, source, p_win = bd["net_ev"], bd["source"], bd["p_win"]
+            gross, charges = bd["gross_ev"], bd["charges"]
     return Economics(
         sl_pts=sl_pts,
         initial_sl_pct=round(sl_pts / premium * 100.0, 4),
@@ -93,4 +103,6 @@ def evaluate(c: Candidate, ctx: Context, cfg: RankConfig, icfg: ICAREConfig) -> 
         capital_required=round(lots * premium * lot, 2),
         risk_amount=round(lots * risk_lot, 2),
         expected_value=None if ev is None else round(ev * max(lots, 1), 2),
+        gross_ev_per_lot=gross,
+        charges=charges,
     )

@@ -98,6 +98,50 @@ def read_last_candles(
     return sort_unique_candles(found, limit=limit)
 
 
+def _iter_stream(r: redis.Redis, stream: str, page: int = 10000):
+    """Yield every (id, fields) oldest-first, paging with exclusive start ids."""
+    start = "-"
+    while True:
+        resp = r.xrange(stream, min=start, max="+", count=page)
+        if not resp:
+            return
+        yield from resp
+        if len(resp) < page:
+            return
+        start = "(" + resp[-1][0]
+
+
+def stream_symbol_ts(r: redis.Redis, stream: str) -> Dict[str, Set[int]]:
+    """Full pass: symbol -> set of bar ts_ms.
+
+    All symbols share one stream, so a tail scan (existing_ts_set) misses every
+    symbol written earlier in a seed loop and reports it as empty.
+    """
+    out: Dict[str, Set[int]] = {}
+    for _msg_id, fields in _iter_stream(r, stream):
+        sym = str(fields.get("symbol") or "").strip().upper()
+        ts = _safe_int(fields.get("ts_ms"))
+        if sym and ts is not None:
+            out.setdefault(sym, set()).add(ts)
+    return out
+
+
+def read_symbol_candles(
+    r: redis.Redis,
+    stream: str,
+    symbols: Set[str],
+    limit: int = 0,
+) -> Dict[str, List[Candle]]:
+    """Full pass: symbol -> oldest-first unique candles (last `limit` if > 0)."""
+    found: Dict[str, List[Candle]] = {s.upper(): [] for s in symbols}
+    for _msg_id, fields in _iter_stream(r, stream):
+        parsed = parse_candle_fields(fields)
+        if parsed is None or parsed[0] not in found:
+            continue
+        found[parsed[0]].append(parsed[1])
+    return {s: sort_unique_candles(c, limit=limit) for s, c in found.items()}
+
+
 def existing_ts_set(
     r: redis.Redis,
     stream: str,

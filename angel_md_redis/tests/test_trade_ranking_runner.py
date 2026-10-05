@@ -184,6 +184,11 @@ class RankingRunnerTest(unittest.TestCase):
         self.assertEqual(self._latest("TCS:CE")["rank_decision"], "DATA_INSUFFICIENT")
         self.assertNotIn("TCS:CE", self.r.zsets["md:ranking:rank"])
 
+    def test_empty_book_still_publishes_heartbeat_cycle(self):
+        rtr.run_cycle(self.r, self.engine, SECTORS)
+        cyc = json.loads(self.r.get("md:ranking:cycle:latest"))
+        self.assertEqual((cyc["outcome"], cyc["scanned"], cyc["ranked"]), ("NO_TRADE", 0, []))
+
     def test_expired_candidates_leave_the_book(self):
         self._add_all(age_ms=rtr.CANDIDATE_TTL_MS + 1000)
         rtr.run_cycle(self.r, self.engine, SECTORS)

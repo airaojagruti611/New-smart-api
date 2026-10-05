@@ -113,6 +113,8 @@ class TradeRankingEngine:
             reject_reasons=reject,
             flags=flags,
             sector=c.sector,
+            gross_ev=eco.gross_ev_per_lot,
+            charges=eco.charges,
         )
 
     def rank(self, candidates: List[Candidate], ctx: Context) -> Tuple[List[RankResult], CycleSummary]:

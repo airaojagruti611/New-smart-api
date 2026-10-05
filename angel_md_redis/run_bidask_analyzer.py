@@ -42,6 +42,7 @@ from app.bidask_analyzer import (
 )
 from app.config import load_symbols
 from app.logging_setup import setup_logger
+from app.order_flow import tick_ts_ms
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
@@ -156,9 +157,14 @@ def flush_option_hist(
 
 
 def _to_payload(key: str, kind: str, res: BidAskResult, now_ms: int, tick: Optional[dict] = None) -> Dict[str, str]:
+    """`now_ms` is the SOURCE time of the tick (ts_exch -> ts_recv), so
+    downstream quote-age checks measure the quote's real age."""
     tick = tick or {}
     return {
         "ts_ms": str(now_ms),
+        # Producer's local receive time (same host clock as the executor):
+        # quote-age checks use it so feed latency / exchange clock skew don't count.
+        "recv_ts_ms": str(tick.get("ts_recv") or now_ms),
         "key": key,
         "kind": kind,  # "eq" / "opt"
         "bid": f"{res.bid:.4f}",
@@ -173,6 +179,7 @@ def _to_payload(key: str, kind: str, res: BidAskResult, now_ms: int, tick: Optio
         "spread_avg": "" if res.spread_avg is None else f"{res.spread_avg:.4f}",
         "spread_avg_source": res.spread_avg_source or "",
         "spread_days": str(int(res.spread_days or 0)),
+        "crossed": "0",
         # raw book for the Order Executor (DECISION.md §7 E5): top-of-book sizes + 5 levels
         "ltp": str(tick.get("ltp") or ""),
         "bid_qty": str(tick.get("bid_sz") or ""),
@@ -182,6 +189,54 @@ def _to_payload(key: str, kind: str, res: BidAskResult, now_ms: int, tick: Optio
         "bid_depth5_px": str(tick.get("bid_depth5_px") or ""),
         "ask_depth5_px": str(tick.get("ask_depth5_px") or ""),
     }
+
+
+def _crossed_payload(key: str, kind: str, bid: float, ask: float, ts_ms: int, tick: Optional[dict] = None) -> Dict[str, str]:
+    """Crossed/locked-inverted book (bid > ask): never a "perfect 0 spread".
+    Spread fields are blank (None) and signal/crossed flag the condition."""
+    tick = tick or {}
+    return {
+        "ts_ms": str(ts_ms),
+        "recv_ts_ms": str(tick.get("ts_recv") or ts_ms),
+        "key": key,
+        "kind": kind,
+        "bid": f"{bid:.4f}",
+        "ask": f"{ask:.4f}",
+        "raw_spread": "",
+        "spread_pct": "",
+        "mid": "",
+        "depth": "",
+        "liquidity_score": "",
+        "signal": "CROSSED",
+        "spread_ratio": "",
+        "spread_avg": "",
+        "spread_avg_source": "",
+        "spread_days": "0",
+        "crossed": "1",
+        "ltp": str(tick.get("ltp") or ""),
+    }
+
+
+class LatestThrottle:
+    """Publish at most once per `throttle_sec` per key, and always the NEWEST
+    tick seen for that key (pending ticks are kept across batches and flushed
+    once the key's throttle window has elapsed)."""
+
+    def __init__(self, throttle_sec: float):
+        self.throttle_sec = throttle_sec
+        self.last_publish: Dict[str, float] = {}
+        self.pending: Dict[str, Any] = {}
+
+    def offer(self, key: str, item: Any) -> None:
+        self.pending[key] = item  # newer tick replaces older pending one
+
+    def due(self, now: float) -> List[Any]:
+        out = []
+        for key in list(self.pending):
+            if now - self.last_publish.get(key, 0.0) >= self.throttle_sec:
+                out.append(self.pending.pop(key))
+                self.last_publish[key] = now
+        return out
 
 
 def main() -> None:
@@ -194,7 +249,7 @@ def main() -> None:
     eq_analyzers: Dict[str, BidAskAnalyzer] = {}
     opt_analyzers: Dict[str, BidAskAnalyzer] = {}
 
-    last_publish: Dict[str, float] = {}
+    throttle = LatestThrottle(LIVE_THROTTLE_SEC)
     last_hist_flush = 0.0
 
     log.info(
@@ -220,7 +275,7 @@ def main() -> None:
             consumername=CONSUMER,
             streams={EQ_STREAM: ">", OPT_STREAM: ">"},
             count=2000,
-            block=2000,
+            block=max(50, int(LIVE_THROTTLE_SEC * 1000)) if throttle.pending else 2000,
         )
         now = time.time()
         if now - last_hist_flush >= HIST_FLUSH_SEC:
@@ -230,6 +285,7 @@ def main() -> None:
                 log.debug("HIST_FLUSH rows=%d analyzers=%d", n, len(opt_analyzers))
 
         if not resp:
+            _publish_due(r, throttle, now)
             continue
 
         now_ms = int(now * 1000)
@@ -259,6 +315,14 @@ def main() -> None:
                 ask = _safe_float(fields.get("ask"))
                 if bid is None or ask is None or bid <= 0 or ask <= 0:
                     log.debug("SKIP no_quote key=%s kind=%s bid=%s ask=%s", key, kind, bid, ask)
+                    continue
+                tick_ms = tick_ts_ms(fields, now_ms) or now_ms
+                if bid > ask:
+                    # Crossed book: stream a CROSSED row, but do NOT overwrite
+                    # the latest key (it would hand the executor an inverted
+                    # quote); the last good quote ages out via its ts_ms.
+                    log.debug("CROSSED key=%s kind=%s bid=%s ask=%s", key, kind, bid, ask)
+                    throttle.offer(key, ("crossed", key, kind, _crossed_payload(key, kind, bid, ask, tick_ms, fields)))
                     continue
 
                 bid_sizes = _parse_depth5(fields.get("bid_depth5") or "")
@@ -303,26 +367,28 @@ def main() -> None:
                     res.spread_days,
                 )
 
-                prev_t = last_publish.get(key, 0.0)
-                if (now - prev_t) < LIVE_THROTTLE_SEC:
-                    continue
-                last_publish[key] = now
-
-                payload = _to_payload(key, kind, res, now_ms, fields)
-                r.xadd(OUT_STREAM, payload, maxlen=OUT_MAXLEN, approximate=True)
-                r.set(
-                    f"{LATEST_KEY_PREFIX}{key}",
-                    json.dumps(payload, separators=(",", ":")),
-                    ex=LATEST_TTL_SEC,
-                )
-
-                if res.signal in ("THIN_AVOID", "CAUTION", "EXIT_TERRITORY"):
-                    log.info("EMIT key=%s kind=%s payload=%s", key, kind, payload)
-                else:
-                    log.debug("EMIT key=%s kind=%s payload=%s", key, kind, payload)
+                throttle.offer(key, ("ok", key, kind, _to_payload(key, kind, res, tick_ms, fields)))
 
             if ack_ids:
                 r.xack(stream, GROUP, *ack_ids)
+
+        _publish_due(r, throttle, time.time())
+
+
+def _publish_due(r: redis.Redis, throttle: "LatestThrottle", now: float) -> None:
+    for status, key, kind, payload in throttle.due(now):
+        r.xadd(OUT_STREAM, payload, maxlen=OUT_MAXLEN, approximate=True)
+        if status != "ok":
+            continue  # CROSSED: stream only, never the latest quote
+        r.set(
+            f"{LATEST_KEY_PREFIX}{key}",
+            json.dumps(payload, separators=(",", ":")),
+            ex=LATEST_TTL_SEC,
+        )
+        if payload.get("signal") in ("THIN_AVOID", "CAUTION", "EXIT_TERRITORY"):
+            log.info("EMIT key=%s kind=%s payload=%s", key, kind, payload)
+        else:
+            log.debug("EMIT key=%s kind=%s payload=%s", key, kind, payload)
 
 
 if __name__ == "__main__":

@@ -38,8 +38,8 @@ class PaperPositionTest(unittest.TestCase):
 
     def test_levels_reanchored_when_fill_beyond_them(self):
         pos = open_position(APPROVAL, 26.5, now_ms=0)   # fill above ICARE target
-        self.assertAlmostEqual(pos.sl_premium, 23.5)     # same 3-pt stop distance
-        self.assertAlmostEqual(pos.target_premium, 32.5)
+        self.assertAlmostEqual(pos.sl_premium, 17.0)     # E16: ICARE's SL stays a price (never widened)
+        self.assertAlmostEqual(pos.target_premium, 32.5)  # only the passed target is re-anchored (+6)
 
     def test_cannot_open(self):
         self.assertIsNone(open_position({**APPROVAL, "recommended_lots": "0"}, 20, 0))

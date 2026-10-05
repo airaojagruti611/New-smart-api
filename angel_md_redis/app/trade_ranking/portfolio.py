@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from typing import Dict, List, Optional, Tuple
 
+from app.icare import daily_loss_room
 from app.trade_ranking.candidate import Candidate, Context, RankResult
 from app.trade_ranking.config import RankConfig
 
@@ -52,7 +53,10 @@ def hard_gates(
     g["lot_fit"] = feasible_lots > 0
     g["duplicate"] = c.symbol.upper() not in ctx.open_symbols
     g["reentry_block"] = f"{c.symbol.upper()}:{c.side.upper()}" not in ctx.blocked
-    g["daily_loss"] = not (capital > 0 and ctx.day_pnl <= -capital * ctx.daily_loss_limit_pct / 100.0)
+    # Same boundary as ICARE: no room left (day_pnl <= -limit) or unknown day PnL -> blocked.
+    g["daily_loss"] = ctx.day_pnl_known and not (
+        capital > 0 and daily_loss_room(capital, ctx.day_pnl, ctx.daily_loss_limit_pct) <= 0
+    )
     g["exposure"] = (
         ctx.open_positions < ctx.max_open_trades
         and ctx.open_risk < capital * ctx.max_portfolio_risk_pct / 100.0

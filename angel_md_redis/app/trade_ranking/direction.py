@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 from app.probability_engine import _VOLUME_MAP, normalize_side
 from app.trade_ranking.candidate import Candidate
 from app.trade_ranking.config import RankConfig
-from app.trade_ranking.normalizer import label_alignment
+from app.trade_ranking.normalizer import contract_alignment, label_alignment
 
 FOR, AGAINST, NEUTRAL = "FOR", "AGAINST", "NEUTRAL"
 
@@ -47,7 +47,7 @@ def collect_votes(c: Candidate) -> Dict[str, str]:
         "indicator": _sign_vote(c.indicator_score, c.side),
         "volume": _sign_vote(_VOLUME_MAP.get((c.volume_signal or "").strip().upper()), c.side),
         "market_regime": label_alignment(c.regime, c.side),
-        "bidask": label_alignment(c.imbalance, c.side),
+        "bidask": contract_alignment(c.imbalance),      # the contract's own book: not side-flipped
         "oi": label_alignment(c.oi_positioning, c.side),
         "greeks": amd_vote(c.amd_phase),
         "expected_move": label_alignment(c.em_direction, c.side),

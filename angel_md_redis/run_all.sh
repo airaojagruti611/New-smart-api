@@ -20,11 +20,27 @@ export LOG_LEVEL="${LOG_LEVEL:-DEBUG}"
 export LOG_TO_FILE="${LOG_TO_FILE:-0}"
 export LOG_DIR="${LOG_DIR:-$BASE/logs}"
 
+# Refuse to start a second copy: pid files would be overwritten and the first
+# set of workers (incl. the order executor) would keep running unstoppable.
+# The lock covers the startup window before any pid file exists (bootstrap
+# takes minutes); workers inherit fd 9, so it is held while any of them runs.
+mkdir -p "$LOG_DIR"
+exec 9>"$LOG_DIR/.run_all.lock"
+if [[ "${ALLOW_DUPLICATE_START:-0}" != "1" ]] && ! flock -n 9; then
+  echo "Another run_all.sh is starting or its workers are still running. Stop it first: ./stop_all.sh"
+  exit 1
+fi
+if [[ "${ALLOW_DUPLICATE_START:-0}" != "1" ]] && ! LOG_DIR="$LOG_DIR" "$BASE/stop_all.sh" --check; then
+  echo "Pipeline already running (see above). Stop it first: ./stop_all.sh"
+  echo "(or set ALLOW_DUPLICATE_START=1 to start anyway)"
+  exit 1
+fi
+
 # start redis
 docker compose up -d
 
 DAY="$(date +%F)"
-LOGDIR="$BASE/logs/$DAY"
+LOGDIR="$LOG_DIR/$DAY"
 PIDDIR="$LOGDIR/pids"
 mkdir -p "$PIDDIR"
 
@@ -34,6 +50,9 @@ start() {
   nohup "$@" >> "$LOGDIR/$name.log" 2>&1 &
   echo $! > "$PIDDIR/$name.pid"
 }
+
+echo "Refreshing F&O universe (ScripMaster + NSE ban list, prunes expired symbols.txt entries)..."
+python3 run_fo_universe.py >> "$LOGDIR/fo_universe.log" 2>&1 || echo "WARNING: F&O universe refresh failed; see $LOGDIR/fo_universe.log"
 
 echo "Seeding candle history for Indicator Signals..."
 python3 run_history_bootstrap.py >> "$LOGDIR/history_bootstrap.log" 2>&1 || echo "WARNING: history bootstrap failed; see $LOGDIR/history_bootstrap.log"
@@ -164,8 +183,8 @@ echo "All started."
 echo "Logs: $LOGDIR"
 echo "PIDs: $PIDDIR"
 echo "Dashboard: http://127.0.0.1:${DASHBOARD_PORT:-8501}"
-echo "To stop everything:"
-echo "  kill \$(cat $PIDDIR/*.pid)"
+echo "To stop everything (SIGTERM, then SIGKILL after \${STOP_TIMEOUT:-20}s; works after midnight too):"
+echo "  ./stop_all.sh"
 echo "Client Excel (any time while Redis is up):"
 echo "  ./export_client_excel.sh"
 echo "  python3 export_client_excel.py --symbols RELIANCE,TCS,INFY"

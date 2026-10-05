@@ -147,7 +147,8 @@ def main() -> None:
                 if spot is not None and prev_spot and prev_spot != 0:
                     price_change_pct = round((spot - prev_spot) / prev_spot * 100.0, 4)
 
-                # None = pivots unavailable -> do not block Markup.
+                # None = pivots/spot unavailable -> Markup cannot fire (spec §7.4
+                # requires price beyond previous resistance; never assumed).
                 pivots = _load_pivots(r, und)
                 breakout: Optional[bool] = None
                 if spot is not None and pivots is not None:

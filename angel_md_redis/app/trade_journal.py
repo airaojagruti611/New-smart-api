@@ -6,7 +6,9 @@ Module 22 — Trade Journal + adaptive-learning statistics (DECISION.md D11).
 ICARE-APPROVED trades are PAPER-traded:
   entry  = ask at approval (a buyer pays the offer); with the Order Executor in
            EXEC_MODE=paper|live, the ACTUAL average fill and filled lots from
-           md:exec:fill instead (DECISION.md §7 E16)
+           md:exec:fill instead (DECISION.md §7 E16). ICARE's SL is kept as a PRICE
+           (never re-anchored wider); an entry at/below it is refused (PRICE_BELOW_STOP)
+           and lots are capped so (entry - SL) x qty <= max_risk_allowed
   marks  = bid (what the position could be sold for)
   exit   = first of SL / TARGET / TIME (hold window) / EOD, filled at bid;
            with Module 18 in TSL_MODE=active also TRAILING_STOP (validated by the
@@ -81,6 +83,12 @@ class PaperPosition:
     last_premium: Optional[float] = None
     max_premium: Optional[float] = None
     min_premium: Optional[float] = None
+    # live exits (E17): the position closes only on the broker-confirmed SELL fill
+    orig_qty: float = 0.0
+    exec_mode: str = ""
+    exit_pending: str = ""          # exit reason while the SELL is working
+    exit_requested_ms: int = 0      # last md:exec:exit_request (0 = request again now)
+    opened_forced: str = ""         # a real fill opened despite a rule ("OPENED_FORCED:<reasons>")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -90,20 +98,41 @@ class PaperPosition:
         return PaperPosition(**{k: d[k] for k in PaperPosition.__dataclass_fields__ if k in d})
 
 
-def open_position(icare: dict, entry_premium: float, now_ms: int) -> Optional[PaperPosition]:
-    """Paper entry from an ICARE APPROVED payload, filled at `entry_premium` (ask)."""
+def open_position(icare: dict, entry_premium: float, now_ms: int, exec_mode: str = "",
+                  force: bool = False) -> Optional[PaperPosition]:
+    """
+    Paper entry from an ICARE APPROVED payload, filled at `entry_premium` (ask or actual fill).
+
+    E16: ICARE's SL stays a PRICE. An entry at or below it is refused (PRICE_BELOW_STOP: the
+    signal is invalidated), and lots are cut so (entry - SL) x qty <= max_risk_allowed. Only a
+    target the fill already passed is re-anchored (that never adds risk). Missing levels
+    fall back to 30 % below / above ICARE's premium.
+
+    force=True (a REAL md:exec:fill — fills are facts): never refused or resized; a fill at or
+    below the SL opens with opened_forced="OPENED_FORCED:PRICE_BELOW_STOP" (the caller exits it).
+    """
     lots = int(_f(icare.get("recommended_lots"), 0) or 0)
     lot_size = _f(icare.get("lot_size"), 0.0) or 0.0
     if lots <= 0 or lot_size <= 0 or not entry_premium or entry_premium <= 0:
         return None
+    ref = _f(icare.get("premium"), entry_premium) or entry_premium
     sl = _f(icare.get("stop_loss_premium"))
     target = _f(icare.get("target_premium"))
-    if sl is None or target is None or not (sl < entry_premium < target):
-        # Re-anchor ICARE's mid-based levels on the actual fill.
-        ref = _f(icare.get("premium"), entry_premium) or entry_premium
-        sl_pts = ref - (sl if sl is not None else ref * 0.7)
+    if sl is None:
+        sl = entry_premium - abs(ref - ref * 0.7)
+    forced = []
+    if entry_premium <= sl:
+        if not force:
+            return None                                # PRICE_BELOW_STOP
+        forced.append("PRICE_BELOW_STOP")
+    if target is None or target <= entry_premium:
         tgt_pts = (target if target is not None else ref * 1.3) - ref
-        sl, target = entry_premium - abs(sl_pts), entry_premium + abs(tgt_pts)
+        target = entry_premium + abs(tgt_pts)
+    max_risk = _f(icare.get("max_risk_allowed"))
+    if max_risk is not None and max_risk > 0 and not force:
+        lots = min(lots, int(max_risk / ((entry_premium - sl) * lot_size) + 1e-9))
+        if lots <= 0:
+            return None                                # one lot already exceeds ICARE's risk
     hold_min = _f(icare.get("hold_minutes"), 60.0) or 60.0
     return PaperPosition(
         trade_id=f"{icare.get('symbol', '')}-{now_ms}",
@@ -124,7 +153,36 @@ def open_position(icare: dict, entry_premium: float, now_ms: int) -> Optional[Pa
         last_premium=entry_premium,
         max_premium=entry_premium,
         min_premium=entry_premium,
+        orig_qty=lots * lot_size,
+        exec_mode=exec_mode,
+        opened_forced=("OPENED_FORCED:" + ",".join(forced)) if forced else "",
     )
+
+
+def forced_reasons(pos: PaperPosition) -> list:
+    f = pos.opened_forced or ""
+    return [x for x in f.split(":", 1)[1].split(",") if x] if f.startswith("OPENED_FORCED:") else []
+
+
+def with_forced(pos: PaperPosition, reasons) -> PaperPosition:
+    allr = list(dict.fromkeys(forced_reasons(pos) + [x for x in reasons if x]))
+    return replace(pos, opened_forced=("OPENED_FORCED:" + ",".join(allr)) if allr else "")
+
+
+def merge_fill(pos: PaperPosition, add: PaperPosition) -> PaperPosition:
+    """A second real fill on an already-open contract: one position, qty-weighted average entry."""
+    qty = pos.qty + add.qty
+    avg = (pos.entry_premium * pos.qty + add.entry_premium * add.qty) / qty
+    ctx = dict(pos.context)
+    ec = (_f(pos.context.get("entry_charges"), 0.0) or 0.0) + (_f(add.context.get("entry_charges"), 0.0) or 0.0)
+    if pos.context.get("entry_charges") or add.context.get("entry_charges"):
+        ctx["entry_charges"] = str(round(ec, 2))
+    merged = replace(
+        pos, qty=qty, lots=pos.lots + add.lots, entry_premium=round(avg, 4),
+        orig_qty=(pos.orig_qty or pos.qty) + (add.orig_qty or add.qty), context=ctx,
+        exit_requested_ms=0 if pos.exit_pending else pos.exit_requested_ms,   # an exit in flight covers the new qty too
+    )
+    return with_forced(merged, forced_reasons(add))
 
 
 def mark(pos: PaperPosition, premium: Optional[float]) -> PaperPosition:
@@ -156,14 +214,14 @@ def exit_reason(
     return None
 
 
-def close_position(pos: PaperPosition, exit_premium: float, now_ms: int, reason: str) -> dict:
-    """Journal record (flat dict) for a closed paper trade."""
+def close_position(pos: PaperPosition, exit_premium: float, now_ms: int, reason: str, mode: str = "paper") -> dict:
+    """Journal record (flat dict) for a closed paper (or live, broker-filled) trade."""
     pnl = (exit_premium - pos.entry_premium) * pos.qty
     mfe = ((pos.max_premium or pos.entry_premium) - pos.entry_premium) * pos.qty
     mae = ((pos.min_premium or pos.entry_premium) - pos.entry_premium) * pos.qty
     rec = {
         "trade_id": pos.trade_id,
-        "mode": "paper",
+        "mode": mode,
         "symbol": pos.symbol,
         "tradingsymbol": pos.tradingsymbol,
         "side": pos.side,
@@ -186,9 +244,42 @@ def close_position(pos: PaperPosition, exit_premium: float, now_ms: int, reason:
         "drawdown": round(min(mae, 0.0), 2),
         "win": 1 if pnl > 0 else 0,
         "entry_spot": pos.entry_spot,
+        "opened_forced": pos.opened_forced,
     }
     rec.update(pos.context)
     return rec
+
+
+def exit_request(pos: PaperPosition, reason: str, now_ms: int, mode: str, bid: Optional[float] = None,
+                 limit_floor: Optional[float] = None) -> Dict[str, str]:
+    """md:exec:exit_request payload (E17). limit_floor empty = the executor's slippage floor."""
+    return {
+        "trade_id": pos.trade_id, "tradingsymbol": pos.tradingsymbol, "symbol": pos.symbol,
+        "qty": str(pos.qty), "orig_qty": str(pos.orig_qty or pos.qty), "lot_size": str(pos.lot_size),
+        "reason": reason, "limit_floor": "" if limit_floor is None else str(limit_floor),
+        "bid": "" if bid is None else str(bid), "exec_mode": mode, "ts_ms": str(now_ms),
+    }
+
+
+def apply_exit_fill(pos: PaperPosition, fill: dict) -> Tuple[Optional[PaperPosition], Optional[PaperPosition], float]:
+    """
+    A broker-confirmed SELL report for this position -> (closed part, remaining part, price).
+    The closed part has qty = filled units; the remaining part (if any) keeps its exit
+    reason with exit_requested_ms = 0, so the journal asks for the rest at once.
+    """
+    filled = _f(fill.get("filled_qty"), 0.0) or 0.0
+    px = _f(fill.get("avg_price"))
+    filled = min(filled, pos.qty)
+    if filled <= 0 or not px:
+        return None, replace(pos, exit_requested_ms=0), 0.0
+    lots_closed = int(round(filled / pos.lot_size)) if pos.lot_size else pos.lots
+    closed = replace(pos, qty=filled, lots=lots_closed)
+    left = pos.qty - filled
+    if left <= 1e-9:
+        return closed, None, px
+    remaining = replace(pos, qty=left, lots=int(round(left / pos.lot_size)) if pos.lot_size else 0,
+                        exit_requested_ms=0)
+    return closed, remaining, px
 
 
 def apply_charges(rec: dict, entry_charges: float, exit_charges: float) -> dict:

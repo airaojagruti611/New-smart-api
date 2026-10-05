@@ -1,4 +1,9 @@
-"""Greeks Analyzer phase rules: Markup must fire without gamma>=0.02."""
+"""Greeks Analyzer phase rules: Markup must fire without gamma>=0.02.
+
+Spec §7.4 Markup requires delta band AND gamma increasing AND IV rising AND
+breakout; these trending fixtures therefore ramp gamma/IV and pass
+breakout=True (QA fix: no delta-only shortcut, None breakout != breakout).
+"""
 
 from __future__ import annotations
 
@@ -45,34 +50,38 @@ class AccumulationGuardTest(unittest.TestCase):
         self.assertEqual(res.action, "NO_TRADE")
 
 
+# Legs reach the gamma (+10%) / IV (+5%) window thresholds only on tick 3.
+_RAMP = [dict(gamma=0.011, iv=20.0), dict(gamma=0.0115, iv=20.5), dict(gamma=0.0122, iv=21.1)]
+
+
+def _trend(tracker, deltas, cp="CE"):
+    last = None
+    for d, kw in zip(deltas, _RAMP):
+        last = _tick(tracker, d, cp=cp, breakout=True, **kw)
+    return last
+
+
 class MarkupFromDeltaTrendTest(unittest.TestCase):
     def test_rising_call_delta_enters_markup(self):
         t = GreeksPhaseTracker()
-        phases = [_tick(t, d).phase for d in (0.50, 0.54, 0.58)]
-        self.assertEqual(phases[-1], "MARKUP")
-        t2 = GreeksPhaseTracker()
-        last = None
-        for d in (0.50, 0.54, 0.58):
-            last = _tick(t2, d)
+        last = _trend(t, (0.50, 0.54, 0.58))
+        self.assertEqual(last.phase, "MARKUP")
         self.assertEqual(last.action, "BUY CALL")
         self.assertIn("delta_rising", last.reason)
 
     def test_rising_put_delta_magnitude_buys_put(self):
         t = GreeksPhaseTracker()
-        last = None
-        for d in (-0.50, -0.54, -0.58):
-            last = _tick(t, d, cp="PE")
+        last = _trend(t, (-0.50, -0.54, -0.58), cp="PE")
         self.assertEqual(last.phase, "MARKUP")
         self.assertEqual(last.action, "BUY PUT")
 
     def test_markup_holds_then_exits_on_delta_drop(self):
         t = GreeksPhaseTracker()
-        for d in (0.50, 0.54, 0.58):
-            _tick(t, d)
-        hold = _tick(t, 0.58)
+        _trend(t, (0.50, 0.54, 0.58))
+        hold = _tick(t, 0.58, gamma=0.0122, iv=21.1)
         self.assertEqual(hold.phase, "MARKUP")
         self.assertEqual(hold.action, "HOLD")
-        exit_res = _tick(t, 0.52)
+        exit_res = _tick(t, 0.52, gamma=0.0122, iv=21.1)
         self.assertEqual(exit_res.phase, "DISTRIBUTION")
         self.assertEqual(exit_res.action, "EXIT")
 

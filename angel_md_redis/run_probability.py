@@ -17,6 +17,12 @@ app/probability_engine.compute_probability():
   liquidity   <- SIE liquidity_score of the chosen strike
   greeks      <- SIE greeks_score of the chosen strike
 
+Freshness: a consumed md:strike:intel message older than PROB_MAX_SIGNAL_AGE_SEC
+(default 60; 0 disables) by its stream id — or by its `signal_ts_ms`, when
+present, whichever is EARLIER — is ACKed and skipped (SKIP stale_signal): after
+downtime the group replays history and an hours-old trigger must not be scored.
+Every md:probability message carries `signal_ts_ms` = that origin time.
+
 Sideways (hard filter): Module 8 direction NEUTRAL AND market breadth
 (md:regime:latest) NEUTRAL — a stock with no expected direction in a
 directionless market.
@@ -39,6 +45,7 @@ from typing import Dict, Optional
 import redis
 
 from app.config import load_symbols
+from app.freshness import env_ms
 from app.logging_setup import setup_logger
 from app.probability_engine import (
     FilterConfig,
@@ -51,7 +58,10 @@ from app.probability_engine import (
     intensity_score,
     normalize_side,
     oi_score,
+    signal_is_stale,
+    signal_origin_ms,
     signed_to_score,
+    volume_surge_flag,
 )
 from app.trade_journal import pick_bucket
 
@@ -68,6 +78,8 @@ COMPOSITE_PREFIX = os.getenv("COMPOSITE_LATEST_PREFIX", "md:composite:latest:")
 GREEKS_PREFIX = os.getenv("GREEKS_PHASE_LATEST_PREFIX", "md:greeks:phase:latest:")
 REGIME_LATEST_KEY = os.getenv("REGIME_LATEST_KEY", "md:regime:latest")
 JOURNAL_STATS_KEY = os.getenv("JOURNAL_STATS_KEY", "md:journal:stats")
+
+MAX_SIGNAL_AGE_MS = env_ms("PROB_MAX_SIGNAL_AGE_SEC", 60)
 
 GROUP = os.getenv("PROBABILITY_GROUP", "probability")
 CONSUMER = os.getenv("PROBABILITY_CONSUMER", "probability-1")
@@ -169,7 +181,7 @@ def build_inputs(
     side = normalize_side(sie.get("side"))
     sym = str(sie.get("symbol") or "").upper()
     bucket, summary = pick_bucket(stats, sym, str(sie.get("market_phase") or ""), min_samples)
-    surge = str(sie.get("entry_volume_surge") or "").strip().lower() in ("1", "true", "yes")
+    surge = volume_surge_flag(sie.get("entry_volume_surge"))
     inp = ProbabilityInputs(
         symbol=sym,
         confluence=confluence_score(confluence_votes(sie, composite, side)),
@@ -219,10 +231,18 @@ def live_sie_fields(
     return out
 
 
-def build_payload(res: ProbabilityResult, sie: dict, bucket: str, summary: dict, now_ms: int) -> Dict[str, str]:
+def build_payload(
+    res: ProbabilityResult, sie: dict, bucket: str, summary: dict, now_ms: int, signal_ts_ms: Optional[int] = None,
+) -> Dict[str, str]:
+    """
+    `signal_ts_ms` = origin time of the consumed message (signal_origin_ms);
+    deliberately NOT copied from `sie`, so a Module 18 re-score of an old origin
+    payload is stamped with its own (re-entry) time, defaulting to now_ms.
+    """
     d = res.to_dict()
     payload = {
         "ts_ms": str(now_ms),
+        "signal_ts_ms": str(int(signal_ts_ms) if signal_ts_ms else now_ms),
         "symbol": res.symbol,
         "probability": str(res.probability),
         "raw_probability": str(res.raw_probability),
@@ -245,11 +265,53 @@ def build_payload(res: ProbabilityResult, sie: dict, bucket: str, summary: dict,
     return payload
 
 
+def handle_message(
+    r, msg_id, fields: dict, symbols: set, regime: dict, stats: Optional[dict], now_ms: int,
+    max_signal_age_ms: int = MAX_SIGNAL_AGE_MS,
+) -> Optional[Dict[str, str]]:
+    """Score one md:strike:intel message and publish it; None when skipped (the caller ACKs either way)."""
+    sym = str(fields.get("symbol") or "").strip().upper()
+    log.debug("MSG_IN id=%s symbol=%s", msg_id, sym)
+    if not sym or sym not in symbols:
+        return None
+    if str(fields.get("status") or "").upper() != "OK":
+        log.debug("SKIP sie_not_ok symbol=%s reason=%s", sym, fields.get("reason"))
+        return None
+    origin = signal_origin_ms(msg_id, fields)
+    if signal_is_stale(origin, now_ms, max_signal_age_ms):
+        log.info("SKIP stale_signal id=%s symbol=%s age_ms=%s max_ms=%s", msg_id, sym,
+                 None if origin is None else now_ms - origin, max_signal_age_ms)
+        return None
+
+    tsym = str(fields.get("tradingsymbol") or "")
+    inp, bucket, summary = build_inputs(
+        fields,
+        _load_json(r, f"{COMPOSITE_PREFIX}{sym}"),
+        _load_json(r, f"{GREEKS_PREFIX}{tsym}"),
+        regime,
+        stats,
+        FILTERS.min_historical_samples,
+    )
+    log.debug("LOGIC_IN symbol=%s inputs=%s", sym, inp)
+    res = compute_probability(inp, FILTERS)
+    payload = build_payload(res, fields, bucket, summary, now_ms, signal_ts_ms=origin)
+
+    log.info(
+        "LOGIC symbol=%s tsym=%s probability=%s grade=%s decision=%s rejects=%s flags=%s missing=%s",
+        sym, tsym, res.probability, res.grade, res.decision, res.reject_reasons, res.flags, res.missing,
+    )
+    r.xadd(OUT_STREAM, payload, maxlen=OUT_MAXLEN, approximate=True)
+    r.set(f"{LATEST_KEY_PREFIX}{sym}", json.dumps(payload, separators=(",", ":")), ex=3600)
+    r.zadd(RANK_KEY, {sym: res.probability})
+    return payload
+
+
 def main():
     symbols = set(load_symbols())
     r = redis.from_url(REDIS_URL, decode_responses=True)
     ensure_group(r, IN_STREAM, GROUP)
-    log.info("START reading %s, writing %s (filters=%s symbols=%d)", IN_STREAM, OUT_STREAM, FILTERS, len(symbols))
+    log.info("START reading %s, writing %s (filters=%s symbols=%d max_signal_age_ms=%s)",
+             IN_STREAM, OUT_STREAM, FILTERS, len(symbols), MAX_SIGNAL_AGE_MS)
 
     while True:
         resp = r.xreadgroup(groupname=GROUP, consumername=CONSUMER, streams={IN_STREAM: ">"}, count=2000, block=2000)
@@ -264,34 +326,7 @@ def main():
         for _stream, msgs in resp:
             for msg_id, fields in msgs:
                 ack_ids.append(msg_id)
-                sym = str(fields.get("symbol") or "").strip().upper()
-                log.debug("MSG_IN id=%s symbol=%s", msg_id, sym)
-                if not sym or sym not in symbols:
-                    continue
-                if str(fields.get("status") or "").upper() != "OK":
-                    log.debug("SKIP sie_not_ok symbol=%s reason=%s", sym, fields.get("reason"))
-                    continue
-
-                tsym = str(fields.get("tradingsymbol") or "")
-                inp, bucket, summary = build_inputs(
-                    fields,
-                    _load_json(r, f"{COMPOSITE_PREFIX}{sym}"),
-                    _load_json(r, f"{GREEKS_PREFIX}{tsym}"),
-                    regime,
-                    stats,
-                    FILTERS.min_historical_samples,
-                )
-                log.debug("LOGIC_IN symbol=%s inputs=%s", sym, inp)
-                res = compute_probability(inp, FILTERS)
-                payload = build_payload(res, fields, bucket, summary, now_ms)
-
-                log.info(
-                    "LOGIC symbol=%s tsym=%s probability=%s grade=%s decision=%s rejects=%s flags=%s missing=%s",
-                    sym, tsym, res.probability, res.grade, res.decision, res.reject_reasons, res.flags, res.missing,
-                )
-                r.xadd(OUT_STREAM, payload, maxlen=OUT_MAXLEN, approximate=True)
-                r.set(f"{LATEST_KEY_PREFIX}{sym}", json.dumps(payload, separators=(",", ":")), ex=3600)
-                r.zadd(RANK_KEY, {sym: res.probability})
+                handle_message(r, msg_id, fields, symbols, regime, stats, now_ms)
 
         if ack_ids:
             r.xack(IN_STREAM, GROUP, *ack_ids)

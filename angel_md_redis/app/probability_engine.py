@@ -39,7 +39,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence
+
+from app.freshness import stream_id_ms, ts_field_ms
 
 WEIGHTS = {
     "confluence": 0.25,
@@ -103,6 +105,41 @@ _VOLUME_MAP = {
     "STRONG BEARISH VOLUME": -2.0,
 }
 VOLUME_SURGE_BONUS = 10.0
+# Same threshold as app/volume_analyzer.py ("Strong" = volume / avg > 2.0).
+VOLUME_SURGE_RATIO = 2.0
+
+
+def volume_surge_flag(raw) -> bool:
+    """
+    entry_volume_surge -> surge? Upstream publishes the ratio volume / avg
+    ("2.35"); a ratio above VOLUME_SURGE_RATIO is a surge. Legacy boolean
+    strings ("1" / "true" / "yes") are still accepted.
+    """
+    v = "" if raw is None else str(raw).strip().lower()
+    if v in ("1", "true", "yes"):          # legacy flag ("1" is never read as a ratio of 1.0)
+        return True
+    try:
+        x = float(v)
+    except ValueError:
+        return False
+    return math.isfinite(x) and x > VOLUME_SURGE_RATIO
+
+
+def signal_origin_ms(msg_id, payload: Optional[Mapping] = None) -> Optional[int]:
+    """
+    Source time of a consumed decision-chain message: the EARLIER of its Redis
+    stream-id ms (XADD time, never re-stamped) and the payload's `signal_ts_ms`
+    (origin of the chain upstream). None when neither is known (treat as stale).
+    """
+    times = [t for t in (stream_id_ms(msg_id), ts_field_ms(payload, "signal_ts_ms")) if t is not None and t > 0]
+    return min(times) if times else None
+
+
+def signal_is_stale(origin_ms: Optional[int], now_ms: int, max_age_ms: int) -> bool:
+    """Unknown origin is stale (fail closed); max_age_ms <= 0 disables the check."""
+    if max_age_ms <= 0:
+        return False
+    return origin_ms is None or now_ms - origin_ms > max_age_ms
 
 
 # ── Normalizers (upstream payload -> 0..100, aligned to trade side) ─────

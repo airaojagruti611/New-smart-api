@@ -34,6 +34,7 @@ class Quote:
     ltp: Optional[float] = None
     bid_levels: Tuple[Tuple[float, float], ...] = field(default_factory=tuple)   # (price, units) best first
     ask_levels: Tuple[Tuple[float, float], ...] = field(default_factory=tuple)
+    recv_ts_ms: Optional[int] = None    # local time the quote was received / written (age basis)
 
     @property
     def tradable(self) -> bool:
@@ -53,7 +54,12 @@ class Quote:
         return (self.ask - self.bid) / self.mid * 100.0 if self.tradable else None
 
     def age_ms(self, now_ms: int) -> int:
-        return now_ms - self.ts_ms
+        """
+        Age on the LOCAL clock: the receive / write time when the payload carries one
+        (run_bidask_analyzer's ts_ms is the exchange tick time — feed latency and clock skew
+        would otherwise reject every entry), else ts_ms.
+        """
+        return now_ms - (self.recv_ts_ms if self.recv_ts_ms else self.ts_ms)
 
     def ask_units_within(self, cap: float) -> Optional[float]:
         """Visible offer quantity at prices <= cap; None when no book data at all."""
@@ -73,11 +79,30 @@ def _levels(px_raw, sz_raw) -> Tuple[Tuple[float, float], ...]:
     return tuple((p, s) for p, s in zip(pxs, szs) if p > 0 and s > 0)
 
 
+RECV_TIME_FIELDS = ("recv_ts_ms", "eval_ts_ms", "ts_recv")
+
+
+def quote_recv_ms(doc: dict) -> Optional[int]:
+    """Local receive / write time of a md:bidask:latest payload, when it carries one."""
+    for k in RECV_TIME_FIELDS:
+        v = _f((doc or {}).get(k))
+        if v and v > 0:
+            return int(v)
+    return None
+
+
+def quote_age_basis_ms(doc: dict) -> Optional[int]:
+    """Receive time when present, else the tick ts_ms (None = no time at all)."""
+    t = quote_recv_ms(doc) or int(_f((doc or {}).get("ts_ms")) or 0)
+    return t or None
+
+
 def quote_from_bidask(doc: dict) -> Optional[Quote]:
     """md:bidask:latest:{TSYM} JSON -> Quote (None when the key is missing)."""
     if not doc:
         return None
     return Quote(
+        recv_ts_ms=quote_recv_ms(doc),
         ts_ms=int(_f(doc.get("ts_ms")) or 0),
         bid=_f(doc.get("bid")),
         ask=_f(doc.get("ask")),

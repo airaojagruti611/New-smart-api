@@ -16,7 +16,10 @@ Persistence      = EMA of the (spoof-filtered, weighted) imbalance across
                    ticks, plus a same-sign streak counter.
 Flip             = sign change after a streak that had sustained >10 ticks.
 
-Spoofing filter  = a price level only contributes its size to the imbalance
+Spoofing filter  = (see weighted_filtered_imbalance for the exact guards:
+                   per-level confirmation, unconfirmed-side fallback to
+                   unfiltered, never flips sign vs raw)
+                   a price level only contributes its size to the imbalance
                    calc once it has been observed at the SAME price for
                    > 3 consecutive ticks. A level that appears and vanishes
                    within that window never gets counted — this is
@@ -106,6 +109,7 @@ class LevelPersistenceFilter:
 
     def __init__(self, rank_window: int = 50):
         self._streaks: Dict[float, int] = {}
+        self.confirmed_prices: set = set()  # prices confirmed on the LAST update()
         self._rank_avg: Dict[int, RollingStat] = {i: RollingStat(rank_window) for i in range(5)}
 
     def update(self, levels: List[DepthLevel], trade_price: Optional[float]) -> Tuple[float, List[dict]]:
@@ -133,17 +137,71 @@ class LevelPersistenceFilter:
             del self._streaks[price]
 
         filtered_sum = 0.0
+        self.confirmed_prices = set()
         for price, qty in current_prices.items():
             streak = self._streaks.get(price, 0) + 1
             self._streaks[price] = streak
             if streak > CONFIRM_STREAK:
                 filtered_sum += qty
+                self.confirmed_prices.add(price)
 
         return filtered_sum, spoof_events
 
 
 def _weighted_sum(levels: List[DepthLevel], weights: List[float] = LEVEL_WEIGHTS) -> float:
     return sum(lv.qty * weights[i] for i, lv in enumerate(levels[:len(weights)]))
+
+
+def _weighted_confirmed(levels: List[DepthLevel], confirmed: set, weights: List[float] = LEVEL_WEIGHTS) -> float:
+    return sum(
+        lv.qty * weights[i]
+        for i, lv in enumerate(levels[:len(weights)])
+        if lv.price > 0 and round(lv.price, 4) in confirmed
+    )
+
+
+def weighted_filtered_imbalance(
+    bid_levels: List[DepthLevel],
+    ask_levels: List[DepthLevel],
+    bid_confirmed: set,
+    ask_confirmed: set,
+    raw: float,
+) -> float:
+    """
+    Depth-weighted imbalance over spoof-CONFIRMED levels only, with two
+    guards so the filter can only ever REMOVE evidence, never invent it:
+
+      1. Per-level, not per-side scaling: each level contributes
+         qty x rank weight only if its own price is confirmed.
+      2. Unconfirmed side fallback: if a side has visible weighted depth
+         but none of it is confirmed (the whole side just repriced, e.g. an
+         ask ladder stepping down), filtering that side would read as
+         "zero liquidity" and pin the score to +/-1. Instead the result
+         falls back to the UNFILTERED weighted imbalance of both sides —
+         a repriced side is not a vanished side.
+      3. Sign guard: if the filtered result disagrees in sign with `raw`
+         (unweighted, unfiltered), it is clamped to 0.0 (NEUTRAL) — removing
+         suspected spoofs can neutralise a signal, but never reverse it.
+
+    Example: bid 500 vs ask 5000 (raw -0.82), ask ladder stepping down so no
+    ask level is confirmed -> old per-side scaling gave +1.0 (BULLISH);
+    this returns the unfiltered weighted value (bearish), never > 0.
+    """
+    wb_all = _weighted_sum(bid_levels)
+    wa_all = _weighted_sum(ask_levels)
+    wb = _weighted_confirmed(bid_levels, bid_confirmed)
+    wa = _weighted_confirmed(ask_levels, ask_confirmed)
+
+    bid_unconfirmed = wb_all > 0 and wb <= 0
+    ask_unconfirmed = wa_all > 0 and wa <= 0
+    if bid_unconfirmed or ask_unconfirmed:
+        out = raw_imbalance(wb_all, wa_all)
+    else:
+        out = raw_imbalance(wb, wa)
+
+    if (raw > 0 and out < 0) or (raw < 0 and out > 0):
+        return 0.0
+    return out
 
 
 def detect_layering(prev_sizes: List[float], curr_sizes: List[float]) -> bool:
@@ -207,17 +265,11 @@ class ImbalanceDetector:
         bid_filtered_sum, spoof_bid = self._bid_filter.update(bid_levels, trade_price)
         ask_filtered_sum, spoof_ask = self._ask_filter.update(ask_levels, trade_price)
 
-        # Weighted-and-filtered: weight each CONFIRMED level, using its
-        # rank position in the current snapshot for the weight.
-        confirmed_bid_levels = [lv for lv in bid_levels[:5] if lv.qty <= bid_filtered_sum + 1e-6]
-        # simpler & robust: recompute weighted using only sizes proportionally
-        # scaled by the filtered/raw ratio per side (keeps weighting stable
-        # without re-deriving which exact levels were confirmed).
-        bid_scale = (bid_filtered_sum / total_bid_raw) if total_bid_raw > 0 else 0.0
-        ask_scale = (ask_filtered_sum / total_ask_raw) if total_ask_raw > 0 else 0.0
-        weighted_bid = _weighted_sum(bid_levels) * bid_scale
-        weighted_ask = _weighted_sum(ask_levels) * ask_scale
-        weighted_filtered = raw_imbalance(weighted_bid, weighted_ask)
+        weighted_filtered = weighted_filtered_imbalance(
+            bid_levels, ask_levels,
+            self._bid_filter.confirmed_prices, self._ask_filter.confirmed_prices,
+            raw,
+        )
 
         bid_sizes = [lv.qty for lv in bid_levels[:5]]
         ask_sizes = [lv.qty for lv in ask_levels[:5]]

@@ -4,10 +4,14 @@ run_trade_ranking.py
 Module 13 — Trade Ranking Engine, Redis wiring (DECISION.md §6). Pure logic
 lives in app/trade_ranking/.
 
-Consumes md:probability. Every candidate without a Probability hard-filter
-rejection enters the candidate book md:ranking:book (field SYM:SIDE, latest
-wins, expires after RANK_CANDIDATE_TTL_SEC). A rank cycle runs on new
-candidates and every RANK_CYCLE_SEC:
+Consumes md:probability. A message older than RANK_MAX_SIGNAL_AGE_SEC (default
+60; 0 disables) by its stream id or its `signal_ts_ms` (the EARLIER) is ACKed
+and skipped (SKIP stale_signal). Every other candidate without a Probability
+hard-filter rejection enters the candidate book md:ranking:book (field SYM:SIDE,
+latest wins, expires RANK_CANDIDATE_TTL_SEC after its SIGNAL time — not its
+arrival — so a replayed backlog cannot linger). The forwarded payload carries
+`signal_ts_ms` = that origin time. A rank cycle runs on new candidates and
+every RANK_CYCLE_SEC:
 
   1. re-read live inputs per candidate (None when missing or stale):
        md:indicator:score:latest:{SYM}  md:volume:latest  md:regime:latest
@@ -45,14 +49,17 @@ from typing import Dict, List, Optional, Tuple
 import redis
 
 from app.config import load_symbols
+from app.freshness import env_ms, ts_field_ms
 from app.logging_setup import setup_logger
+from app.probability_engine import signal_is_stale, signal_origin_ms
 from app.trade_ranking import Candidate, Context, RankConfig, RankResult, TradeRankingEngine, get_profile
 from app.trade_ranking.config import WEIGHTS
+from app.trade_ranking.portfolio import CycleSummary
 from app.trade_ranking.sl_tsl import propose_tsl
 from run_adaptive_tsl import CFG as TSL_CFG
 from run_adaptive_tsl import Inputs, build_snapshot
 from run_icare import CFG as ICARE_CFG
-from run_icare import liquidity_max_lots, load_positions, load_sectors, portfolio_state
+from run_icare import liquidity_max_lots, load_journal_daily, load_positions, load_sectors, portfolio_state
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 MODE = os.getenv("RANK_MODE", "shadow").strip().lower()
@@ -80,12 +87,14 @@ GREEKS_PREFIX = os.getenv("GREEKS_PHASE_LATEST_PREFIX", "md:greeks:phase:latest:
 HTF_PREFIX = os.getenv("HTF_TREND_LATEST_PREFIX", "md:htf:trend:latest:")
 ST_PREFIX = os.getenv("SUPERTREND_BIAS_LATEST_PREFIX", "md:supertrend:bias:latest:")
 
-CANDIDATE_TTL_MS = int(float(os.getenv("RANK_CANDIDATE_TTL_SEC", "120")) * 1000)
+# Default = ICARE_MAX_SIGNAL_AGE_SEC: older emissions would be dropped by ICARE anyway.
+CANDIDATE_TTL_MS = int(float(os.getenv("RANK_CANDIDATE_TTL_SEC", "60")) * 1000)
 CYCLE_SEC = float(os.getenv("RANK_CYCLE_SEC", "5"))
 BATCH_WINDOW_MS = int(float(os.getenv("RANK_BATCH_WINDOW_SEC", "3")) * 1000)
 MAX_AGE_MS = int(float(os.getenv("RANK_MAX_AGE_SEC", "120")) * 1000)
 MAX_QUOTE_AGE_MS = int(float(os.getenv("RANK_MAX_QUOTE_AGE_SEC", "30")) * 1000)
 CYCLE_HEARTBEAT_SEC = float(os.getenv("RANK_CYCLE_HEARTBEAT_SEC", "60"))
+MAX_SIGNAL_AGE_MS = env_ms("RANK_MAX_SIGNAL_AGE_SEC", 60)
 
 GROUP = os.getenv("RANKING_GROUP", "trade-ranking")
 CONSUMER = os.getenv("RANKING_CONSUMER", "trade-ranking-1")
@@ -264,7 +273,8 @@ def build_candidate(prob: dict, inp: Inputs, sectors: Dict[str, str]) -> Candida
 def build_context(r: redis.Redis, sectors: Dict[str, str], now_ms: int) -> Tuple[Context, List[str]]:
     positions = load_positions(r)
     raw = r.get(ACCOUNT_KEY)
-    pf, flags = portfolio_state(_json(raw, {}), positions, sectors, now_ms)
+    pf, flags = portfolio_state(_json(raw, {}), positions, sectors, now_ms,
+                                journal_daily=load_journal_daily(r, now_ms))
     open_sectors: Dict[str, int] = {}
     for p in positions:
         sec = sectors.get(str(p.get("symbol") or "").upper())
@@ -281,6 +291,7 @@ def build_context(r: redis.Redis, sectors: Dict[str, str], now_ms: int) -> Tuple
         open_sectors=open_sectors,
         blocked=blocked,
         kill_switch=str(r.get(KILL_SWITCH_KEY) or "").strip() == "1",
+        day_pnl_known=pf.day_pnl_known,
         max_risk_per_trade=ICARE_CFG.max_risk_per_trade,
         max_risk_pct=ICARE_CFG.max_risk_pct,
         daily_loss_limit_pct=ICARE_CFG.daily_loss_limit_pct,
@@ -340,12 +351,21 @@ def build_payload(res: RankResult, prob: dict, now_ms: int, emit: bool, flags: L
 
 # ── cycle ──────────────────────────────────────────────────────────────
 
+def entry_signal_ms(entry: dict) -> Optional[int]:
+    """Signal (origin) time of a book entry; None (-> expired) when unknown."""
+    v = _f(entry.get("signal_ms"))
+    if v is not None and v > 0:
+        return int(v)
+    return ts_field_ms(entry.get("prob") if isinstance(entry.get("prob"), dict) else None, "signal_ts_ms")
+
+
 def load_book(r: redis.Redis, now_ms: int) -> Dict[str, dict]:
     book: Dict[str, dict] = {}
     expired = []
     for field, raw in (r.hgetall(BOOK_KEY) or {}).items():
         entry = _json(raw, {})
-        if not entry or now_ms - int(entry.get("arrived_ms") or 0) > CANDIDATE_TTL_MS:
+        sig = entry_signal_ms(entry) if entry else None
+        if not entry or sig is None or now_ms - sig > CANDIDATE_TTL_MS:
             expired.append(field)
             continue
         book[field] = entry
@@ -355,14 +375,22 @@ def load_book(r: redis.Redis, now_ms: int) -> Dict[str, dict]:
     return book
 
 
-def add_to_book(r: redis.Redis, prob: dict, now_ms: int) -> None:
+def add_to_book(r: redis.Redis, prob: dict, now_ms: int, signal_ms: Optional[int] = None) -> None:
+    """
+    `signal_ms` = origin time of the probability message (signal_origin_ms);
+    defaults to the payload's signal_ts_ms, else now_ms. The book TTL counts
+    from it; `arrived_ms` only drives the R3 batch window.
+    """
     field = book_field(prob)
     prev = _json(r.hget(BOOK_KEY, field), {})
     cid = candidate_id(prob)
     same = prev.get("candidate_id") == cid
+    if signal_ms is None:
+        signal_ms = ts_field_ms(prob, "signal_ts_ms") or now_ms
     entry = {
         "prob": prob,
         "candidate_id": cid,
+        "signal_ms": int(signal_ms),
         "arrived_ms": prev.get("arrived_ms", now_ms) if same else now_ms,
         "emitted": bool(prev.get("emitted")) if same else False,
         "last_decision": prev.get("last_decision", "") if same else "",
@@ -380,6 +408,27 @@ def emission_ready(results: List[RankResult], book: Dict[str, dict], now_ms: int
     return True
 
 
+def ingest(r: redis.Redis, msg_id, fields: dict, symbols: set, now_ms: int,
+           max_signal_age_ms: int = MAX_SIGNAL_AGE_MS) -> bool:
+    """One md:probability message -> candidate book. True when it entered the book (caller ACKs either way)."""
+    sym = str(fields.get("symbol") or "").strip().upper()
+    if not sym or sym not in symbols:
+        return False
+    origin = signal_origin_ms(msg_id, fields)
+    if signal_is_stale(origin, now_ms, max_signal_age_ms):
+        log.info("SKIP stale_signal id=%s symbol=%s tsym=%s age_ms=%s max_ms=%s", msg_id, sym,
+                 fields.get("tradingsymbol"), None if origin is None else now_ms - origin, max_signal_age_ms)
+        return False
+    if is_hard_rejected(fields):
+        log.debug("SKIP probability_hard_reject symbol=%s reasons=%s", sym, fields.get("reject_reasons"))
+        return False
+    prob = dict(fields)
+    if origin is not None:
+        prob["signal_ts_ms"] = str(origin)
+    add_to_book(r, prob, now_ms, signal_ms=origin)
+    return True
+
+
 _last_cycle: Dict[str, object] = {"sig": None, "ts": 0.0}
 
 
@@ -387,6 +436,9 @@ def run_cycle(r: redis.Redis, engine: TradeRankingEngine, sectors: Dict[str, str
     now_ms = int(time.time() * 1000)
     book = load_book(r, now_ms)
     if not book:
+        # Nothing to rank: still publish the heartbeat cycle so the dashboard /
+        # pipeline health can tell "running, idle" from "worker dead".
+        _publish_cycle(r, CycleSummary(0, 0, 0, 0, 0, 0, "NO_TRADE", []), [], now_ms)
         return
     inp = Inputs(r, now_ms)
     ctx, ctx_flags = build_context(r, sectors, now_ms)
@@ -422,6 +474,10 @@ def run_cycle(r: redis.Redis, engine: TradeRankingEngine, sectors: Dict[str, str
             entry = dict(entry, emitted=entry.get("emitted") or emit, last_decision=res.decision)
             r.hset(BOOK_KEY, field, json.dumps(entry, separators=(",", ":")))
 
+    _publish_cycle(r, summary, results, now_ms)
+
+
+def _publish_cycle(r: redis.Redis, summary: CycleSummary, results: List[RankResult], now_ms: int) -> None:
     sig = (summary.scanned, summary.data_insufficient, summary.rejected, summary.watch,
            summary.eligible, summary.taken, tuple(summary.taken_ids))
     if sig != _last_cycle["sig"] or time.time() - float(_last_cycle["ts"]) >= CYCLE_HEARTBEAT_SEC:
@@ -456,14 +512,8 @@ def main():
             ack_ids = []
             for msg_id, fields in msgs:
                 ack_ids.append(msg_id)
-                sym = str(fields.get("symbol") or "").strip().upper()
-                if not sym or sym not in symbols:
-                    continue
-                if is_hard_rejected(fields):
-                    log.debug("SKIP probability_hard_reject symbol=%s reasons=%s", sym, fields.get("reject_reasons"))
-                    continue
-                add_to_book(r, fields, int(time.time() * 1000))
-                new = True
+                if ingest(r, msg_id, fields, symbols, int(time.time() * 1000)):
+                    new = True
             if ack_ids:
                 r.xack(IN_STREAM, GROUP, *ack_ids)
         if new or time.time() - last_cycle >= CYCLE_SEC:

@@ -45,7 +45,7 @@ except Exception:  # pragma: no cover
     IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
 from app.config import load_symbols
-from app.expected_move import as_annualized_decimal
+from app.expected_move import iv_from_percent  # greeks-phase `iv` is PERCENT
 from app.greeks_change import (
     _direction_family,
     build_scenario_matrix,
@@ -316,7 +316,7 @@ def main() -> None:
                     spot = cand.get("spot")
 
                 gp_doc = _load_json(r, f"{GREEKS_PHASE_LATEST_PREFIX}{tsym}") or {}
-                current_iv = as_annualized_decimal(_safe_float(gp_doc.get("iv")))
+                current_iv = iv_from_percent(_safe_float(gp_doc.get("iv")))
                 observed_delta = _safe_float(gp_doc.get("delta"))
                 observed_gamma = _safe_float(gp_doc.get("gamma"))
                 observed_theta = _safe_float(gp_doc.get("theta"))
@@ -386,7 +386,7 @@ def main() -> None:
                     risk_free_rate=RISK_FREE_RATE, dividend_or_carry=DIVIDEND_OR_CARRY,
                     spot_scenarios=spot_scenarios, iv_scenarios=iv_scenarios, time_scenarios=time_scenarios,
                 )
-                summary = build_summary(matrix, direction)
+                summary = build_summary(matrix, direction, option_type=option_type)
 
                 log.debug(
                     "LOGIC symbol=%s tsym=%s origin=%s spot=%s strike=%s type=%s iv=%s T=%.6f em=%s dir=%s "
@@ -410,6 +410,8 @@ def main() -> None:
                         "iv": current.iv, "delta": current.delta, "gamma": current.gamma,
                         "theta_per_day": current.theta_per_day, "vega_per_point": current.vega_per_point,
                         "greeks_source": current.greeks_source,
+                        # premium_change in every scenario = model(future) - model_premium
+                        "model_premium": current.model_premium,
                     }, separators=(",", ":")),
                     "summary": json.dumps({
                         "base": _scenario_result_to_dict(summary.base) if summary.base else None,

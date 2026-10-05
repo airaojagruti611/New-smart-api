@@ -82,10 +82,13 @@ class VolumeAnalyzer:
             sell_pct = round(100.0 - buy_pct, 2)
 
         volume_surge: Optional[float] = None
+        surge_raw: Optional[float] = None
         if avg_volume and avg_volume > 0:
-            volume_surge = round(volume / avg_volume, 2)
+            surge_raw = volume / avg_volume
+            volume_surge = round(surge_raw, 2)
 
-        surge_confirmed = volume_surge is not None and volume_surge > 2.0
+        # Compare the unrounded ratio: 2.004 rounds to 2.0 but IS > 2.
+        surge_confirmed = surge_raw is not None and surge_raw > 2.0
 
         if buy_pct >= 60.0:
             signal = "Strong Bullish Volume" if surge_confirmed else "Bullish Volume"

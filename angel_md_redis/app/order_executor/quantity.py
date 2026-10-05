@@ -47,8 +47,10 @@ def executable_lots(
     if available_margin is not None and cap_price > 0:
         per_lot = cap_price * lot_size * (1.0 + cfg.margin_buffer_pct / 100.0)
         limits["margin"] = _floor(max(available_margin, 0.0) / per_lot)
-    if max_risk_amount and sl_points and sl_points > 0:
-        limits["risk"] = _floor(max_risk_amount / (sl_points * lot_size))
+    if max_risk_amount is not None and max_risk_amount > 0 and sl_points is not None:
+        # risk = (worst fill = cap - SL) x qty must stay <= ICARE max_risk_allowed. A cap at or
+        # below the SL means the signal is invalid: 0 lots, never "no limit" (E7).
+        limits["risk"] = _floor(max_risk_amount / (sl_points * lot_size)) if sl_points > 0 else 0
     dl = depth_lots(depth_units, lot_size, cfg)
     if dl is not None and dl < 1:
         limits["depth"] = 0

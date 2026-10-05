@@ -35,6 +35,21 @@ def iso_to_expirydate(iso_date: str) -> str:
     return f"{int(d):02d}{_MONTH_ABBR[int(m) - 1]}{int(y)}"
 
 
+def stamp_greeks_items(data_list: list, ts_ms: int) -> list:
+    """Add `ts_ms` (poll time, epoch ms) to every greeks item.
+
+    md:greeks:latest:* stays a JSON list (backward compatible); readers judge
+    freshness from the per-item ts_ms instead of the 1h key TTL.
+    """
+    out = []
+    for it in data_list or []:
+        if isinstance(it, dict):
+            it = dict(it)
+            it["ts_ms"] = int(ts_ms)
+        out.append(it)
+    return out
+
+
 class GreeksPoller:
     def __init__(self, auth_token: str, smart_api=None):
         self.auth_token = auth_token
@@ -42,9 +57,12 @@ class GreeksPoller:
         self.rs = RedisStore()
 
     def _publish(self, underlying: str, expiry_iso: str, data_list: list, source: str) -> None:
+        ts = now_ms()
+        data_list = stamp_greeks_items(data_list, ts)
         data_json = json.dumps(data_list, separators=(",", ":"))
         payload = {
-            "ts_recv": str(now_ms()),
+            "ts_recv": str(ts),
+            "ts_ms": str(ts),
             "underlying": underlying,
             "expiry": expiry_iso,
             "data_json": data_json,

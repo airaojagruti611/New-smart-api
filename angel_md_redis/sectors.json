@@ -2,5 +2,22 @@
   "_comment": "Underlying -> sector for ICARE sector-exposure limit. Symbols missing here are flagged SECTOR_UNCHECKED.",
   "RELIANCE": "ENERGY",
   "TCS": "IT",
-  "INFY": "IT"
+  "INFY": "IT",
+  "HCLTECH": "IT",
+  "HDFCBANK": "BANK",
+  "ICICIBANK": "BANK",
+  "SBIN": "BANK",
+  "AXISBANK": "BANK",
+  "KOTAKBANK": "BANK",
+  "BAJFINANCE": "FINANCE",
+  "BHARTIARTL": "TELECOM",
+  "ITC": "FMCG",
+  "HINDUNILVR": "FMCG",
+  "LT": "INFRA",
+  "ADANIENT": "INFRA",
+  "MARUTI": "AUTO",
+  "M&M": "AUTO",
+  "SUNPHARMA": "PHARMA",
+  "TATASTEEL": "METALS",
+  "NTPC": "POWER"
 }

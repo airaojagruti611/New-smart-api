@@ -128,8 +128,9 @@ class ComponentTest(unittest.TestCase):
         # design: 5-minute hold -> theta matters little; 3 hours -> much more
         _, short = theta_risk(-6.0, 100.0, 5)
         _, long = theta_risk(-6.0, 100.0, 180)
-        self.assertAlmostEqual(short, 0.08)
-        self.assertAlmostEqual(long, 2.88)
+        # calendar-day theta x hold/1440 (QA fix: was /375 trading minutes)
+        self.assertAlmostEqual(short, 0.0208)
+        self.assertAlmostEqual(long, 0.75)
         self.assertGreater(theta_efficiency_score(short), theta_efficiency_score(long))
         self.assertEqual(theta_efficiency_score(10.0), 0.0)
         self.assertEqual(theta_risk(None, 100, 60), (None, None))

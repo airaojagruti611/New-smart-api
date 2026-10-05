@@ -32,7 +32,8 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 # ──────────────────────────────────────────────────────────────
 # Color helpers (works in Windows Terminal / PowerShell 7+)
 # ──────────────────────────────────────────────────────────────
-os.system("")  # enable ANSI on Windows
+if os.name == "nt":
+    os.system("")  # enable ANSI on Windows
 
 GREEN  = "\033[92m"
 YELLOW = "\033[93m"
@@ -46,6 +47,7 @@ OK   = f"{GREEN}✅ OK{RESET}"
 WARN = f"{YELLOW}⚠️  WARN{RESET}"
 FAIL = f"{RED}❌ FAIL{RESET}"
 SKIP = f"{DIM}⏭️  SKIP{RESET}"
+STALE = f"{YELLOW}⏳ STALE{RESET}"
 
 # ──────────────────────────────────────────────────────────────
 # Layer/Module definitions — exact Redis keys from the codebase
@@ -90,7 +92,7 @@ LAYERS = [
             {
                 "name": "Module 1a: Supertrend MTF Bias",
                 "worker": "run_supertrend_mtf_bias.py",
-                "streams": [],
+                "streams": ["md:supertrend:bias"],
                 "latest_prefix": "md:supertrend:bias:latest:*",
                 "latest_key": None,
                 "description": "Multi-timeframe Supertrend → CALL/PUT/NEUTRAL bias",
@@ -99,7 +101,7 @@ LAYERS = [
             {
                 "name": "Module 1b: EMA Cross (Momentum)",
                 "worker": "run_ema_cross.py",
-                "streams": [],
+                "streams": ["md:ema:cross"],
                 "latest_prefix": "md:ema:cross:latest:*",
                 "latest_key": None,
                 "description": "EMA9/EMA26 momentum state → bullish/bearish",
@@ -108,7 +110,7 @@ LAYERS = [
             {
                 "name": "Module 1c: HTF Trend Filter",
                 "worker": "run_htf_trend_filter.py",
-                "streams": [],
+                "streams": ["md:htf:trend"],
                 "latest_prefix": "md:htf:trend:latest:*",
                 "latest_key": None,
                 "description": "Daily/Weekly/Monthly trend → CALL/PUT/NEUTRAL gate",
@@ -117,7 +119,7 @@ LAYERS = [
             {
                 "name": "Module 1d: Pivot Levels",
                 "worker": "run_daily_pivots.py",
-                "streams": [],
+                "streams": ["md:pivots:prevday"],
                 "latest_prefix": "md:pivots:prevday:*",
                 "latest_key": None,
                 "hash_keys": True,
@@ -126,7 +128,7 @@ LAYERS = [
             {
                 "name": "Module 1e: Level Entry (Pivot Break)",
                 "worker": "run_level_entry.py",
-                "streams": [],
+                "streams": ["md:level:entry"],
                 "latest_prefix": "md:level:entry:latest:*",
                 "latest_key": None,
                 "description": "Pivot break detection → BUY CALL / BUY PUT / NEUTRAL",
@@ -135,9 +137,10 @@ LAYERS = [
             {
                 "name": "Module 1f: Momentum Confirm (ST+EMA)",
                 "worker": "run_momentum_confirm.py",
-                "streams": [],
+                "streams": ["md:momentum:confirm"],
                 "latest_prefix": "md:momentum:confirm:latest:*",
                 "latest_key": None,
+                "extra_prefix": "md:indicator:score:latest:*",
                 "description": "Supertrend=Bullish AND EMA bullish → Confirmed",
             },
             {
@@ -175,7 +178,7 @@ LAYERS = [
             {
                 "name": "Module 4a: Bid-Ask Analyzer",
                 "worker": "run_bidask_analyzer.py",
-                "streams": [],
+                "streams": ["md:bidask:signal"],
                 "latest_prefix": "md:bidask:latest:*",
                 "latest_key": None,
                 "description": "Spread%, 0-100 depth score; options vs 10-day avg spread (1.5x caution / 2x exit)",
@@ -184,7 +187,7 @@ LAYERS = [
             {
                 "name": "Module 4b: Smart Money Detection",
                 "worker": "run_smart_money.py",
-                "streams": [],
+                "streams": ["md:smartmoney:signal"],
                 "latest_prefix": "md:smartmoney:latest:*",
                 "latest_key": None,
                 "description": "Size anomaly, absorption, sweep, clustering",
@@ -192,7 +195,7 @@ LAYERS = [
             {
                 "name": "Module 4c: Order Flow",
                 "worker": "run_order_flow.py",
-                "streams": [],
+                "streams": ["md:orderflow:signal"],
                 "latest_prefix": "md:orderflow:latest:*",
                 "latest_key": None,
                 "description": "Net delta, cumulative delta, directional bias",
@@ -200,7 +203,7 @@ LAYERS = [
             {
                 "name": "Module 4d: Bid-Ask Imbalance",
                 "worker": "run_bidask_imbalance.py",
-                "streams": [],
+                "streams": ["md:imbalance:signal"],
                 "latest_prefix": "md:imbalance:latest:*",
                 "latest_key": None,
                 "description": "Depth-weighted imbalance (-1 to +1), spoof filter",
@@ -208,7 +211,7 @@ LAYERS = [
             {
                 "name": "Module 4e: Stock Entry/Exit Gates",
                 "worker": "run_stock_entry_exit.py",
-                "streams": [],
+                "streams": ["md:stockflow:signal"],
                 "latest_prefix": "md:stockflow:latest:*",
                 "latest_key": None,
                 "description": "5-condition entry / exit gate from bid-ask data",
@@ -216,7 +219,7 @@ LAYERS = [
             {
                 "name": "Module 4f: Composite Score",
                 "worker": "run_composite.py",
-                "streams": [],
+                "streams": ["md:composite:signal"],
                 "latest_prefix": "md:composite:latest:*",
                 "latest_key": None,
                 "description": "Weighted composite bid-ask score (>+0.60 entry, <-0.40 exit)",
@@ -224,7 +227,7 @@ LAYERS = [
             {
                 "name": "Module 5: OI Analysis",
                 "worker": "run_oi_analysis.py",
-                "streams": [],
+                "streams": ["md:oi:signal", "md:oi:underlying:signal"],
                 "latest_prefix": "md:oi:latest:*",
                 "latest_key": None,
                 "extra_prefix": "md:oi:underlying:latest:*",
@@ -239,7 +242,7 @@ LAYERS = [
             {
                 "name": "Module 6: Greeks Phase Detector",
                 "worker": "run_greeks_analyzer.py",
-                "streams": [],
+                "streams": ["md:greeks:phase:signal"],
                 "latest_prefix": "md:greeks:phase:latest:*",
                 "latest_key": None,
                 "extra_prefix": "md:greeks:phase:underlying:latest:*",
@@ -248,7 +251,7 @@ LAYERS = [
             {
                 "name": "Module 7a: Liquidity Score",
                 "worker": "run_liquidity_score.py",
-                "streams": [],
+                "streams": ["md:liquidity:score:signal"],
                 "latest_prefix": "md:liquidity:score:latest:*",
                 "latest_key": None,
                 "description": "Option liquidity 0-100 (Green/Yellow/Orange/Red)",
@@ -256,7 +259,7 @@ LAYERS = [
             {
                 "name": "Module 7b: Option Liquidity Exit",
                 "worker": "run_option_liquidity_exit.py",
-                "streams": [],
+                "streams": ["md:optexit:signal"],
                 "latest_prefix": "md:optexit:latest:*",
                 "latest_key": None,
                 "description": "Staged exit warning when option spread widens",
@@ -264,7 +267,7 @@ LAYERS = [
             {
                 "name": "Module 7c: Strike Flow",
                 "worker": "run_strike_flow.py",
-                "streams": [],
+                "streams": ["md:strikeflow:signal"],
                 "latest_prefix": "md:strikeflow:latest:*",
                 "latest_key": None,
                 "description": "Option order flow: Vol/OI, sweep detection per strike",
@@ -278,7 +281,7 @@ LAYERS = [
             {
                 "name": "Module 8: Expected Move Calculator",
                 "worker": "run_expected_move.py",
-                "streams": [],
+                "streams": ["md:expected_move:signal"],
                 "latest_prefix": "md:expected_move:latest:*",
                 "latest_key": None,
                 "description": "Predicted move %, target price, confidence 0-100",
@@ -286,7 +289,7 @@ LAYERS = [
             {
                 "name": "Module 9: Greeks Change Predictor",
                 "worker": "run_greeks_change.py",
-                "streams": [],
+                "streams": ["md:greeks_change:signal"],
                 "latest_prefix": "md:greeks_change:latest:*",
                 "latest_key": None,
                 "description": "Scenario grid of predicted Greeks from Expected Move + ATM/strikeflow candidate",
@@ -309,7 +312,7 @@ LAYERS = [
             {
                 "name": "Module 10: Strike Selector",
                 "worker": "run_strike_select.py",
-                "streams": [],
+                "streams": ["md:strike:select"],
                 "latest_prefix": "md:strike:select:latest:*",
                 "latest_key": None,
                 "description": "Maps entry signal → concrete option contract (ATM/OTM/OI-target)",
@@ -354,7 +357,7 @@ LAYERS = [
             {
                 "name": "Module 14: Order Executor / Trade Entry",
                 "worker": "run_order_executor.py",
-                "streams": ["md:exec", "md:exec:fill"],
+                "streams": ["md:exec", "md:exec:fill", "md:exec:exit_request", "md:exec:exit_fill"],
                 "latest_prefix": "md:exec:latest:*",
                 "latest_key": None,
                 "description": "Fresh validation, capped limit-order ladder (no market orders), quantity MIN(), "
@@ -402,7 +405,7 @@ LAYERS = [
             {
                 "name": "Module 20: Capital Allocation",
                 "worker": "run_capital_alloc.py",
-                "streams": [],
+                "streams": ["md:capital:alloc"],
                 "latest_prefix": "md:capital:alloc:latest:*",
                 "latest_key": None,
                 "description": "Regime-based capital bias + risk-based position sizing",
@@ -426,6 +429,274 @@ LAYERS = [
         ],
     },
 ]
+
+
+# ──────────────────────────────────────────────────────────────
+# Freshness thresholds (seconds) — newest output older than this → STALE.
+# None = event-driven module (only emits on trades), no age check.
+# Override per module with "max_age_sec" in LAYERS, globally with
+# --max-age / HEALTH_MAX_AGE_SEC, or per worker with
+# HEALTH_MAX_AGE_<WORKER> (e.g. HEALTH_MAX_AGE_RUN_PRODUCER=60).
+# ──────────────────────────────────────────────────────────────
+
+DEFAULT_MAX_AGE_SEC = 300.0
+
+MAX_AGE_SEC_BY_WORKER = {
+    "run_producer.py": 30,
+    "run_greeks_only.py": 300,
+    "run_joiner.py": 60,
+    "run_candles_publisher.py": 150,          # newest of 1m / 1d
+    "run_candles_resampler.py": 660,          # newest of 5m / 10m / 30m
+    "run_daily_pivots.py": 4 * 86400,         # once per session (weekends)
+    "run_htf_trend_filter.py": 3600,
+    "run_bidask_analyzer.py": 60,
+    "run_bidask_imbalance.py": 60,
+    "run_smart_money.py": 120,
+    "run_order_flow.py": 120,
+    "run_stock_entry_exit.py": 120,
+    "run_composite.py": 120,
+    "run_liquidity_score.py": 120,
+    "run_option_liquidity_exit.py": 120,
+    "run_strike_flow.py": 120,
+    "run_account.py": 180,
+    "run_trade_ranking.py": 600,
+    "run_order_executor.py": None,
+    "run_adaptive_tsl.py": None,
+    "run_trade_journal.py": None,
+}
+
+_TS_FIELDS = ("ts_ms", "updated_ms", "timestamp", "ts_recv", "bar_ts_ms", "rank_ts_ms")
+
+
+def module_max_age(mod: dict, override: Optional[float] = None) -> Optional[float]:
+    worker = mod.get("worker") or ""
+    if "max_age_sec" in mod:
+        base = mod["max_age_sec"]
+    else:
+        base = MAX_AGE_SEC_BY_WORKER.get(worker, DEFAULT_MAX_AGE_SEC)
+    env_key = "HEALTH_MAX_AGE_" + worker.replace(".py", "").upper()
+    if os.getenv(env_key):
+        try:
+            return float(os.getenv(env_key))
+        except ValueError:
+            pass
+    if base is None:
+        return None
+    if override is None:
+        try:
+            override = float(os.getenv("HEALTH_MAX_AGE_SEC", "") or 0) or None
+        except ValueError:
+            override = None
+    return float(override) if override else float(base)
+
+
+def _to_ms(v) -> Optional[int]:
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    return int(n * 1000) if n < 1e11 else int(n)
+
+
+def doc_ts_ms(doc, stream_id=None) -> Optional[int]:
+    """Doc timestamp (ts_ms / updated_ms / … ), else the stream id's ms part."""
+    if isinstance(doc, dict):
+        for f in _TS_FIELDS:
+            ms = _to_ms(doc.get(f))
+            if ms:
+                return ms
+        try:  # session date (pivots): that session's close, 10:00 UTC = 15:30 IST
+            d = datetime.strptime(str(doc.get("date") or "")[:10], "%Y-%m-%d")
+            return int((d - datetime(1970, 1, 1)).total_seconds() * 1000) + 10 * 3600 * 1000
+        except ValueError:
+            pass
+    if stream_id is not None:
+        try:
+            return int(str(stream_id).split("-", 1)[0])
+        except ValueError:
+            return None
+    return None
+
+
+def _newest_latest_ms(r, keys, sample: int = 50) -> Optional[int]:
+    newest = None
+    for k in sorted(keys)[:sample] if len(keys) > sample else keys:
+        try:
+            t = r.type(k)
+            if t == "string":
+                raw = r.get(k)
+                val = safe_json(raw)
+                if isinstance(val, list):  # md:greeks:latest list form: newest per-item ts_ms (if stamped)
+                    ts = max((doc_ts_ms(it) or 0 for it in val if isinstance(it, dict)), default=0) or None
+                else:
+                    ts = doc_ts_ms(val)
+            elif t == "hash":
+                ts = doc_ts_ms(r.hgetall(k))
+            else:
+                ts = None
+        except Exception:
+            ts = None
+        if ts and (newest is None or ts > newest):
+            newest = ts
+    return newest
+
+
+def evaluate_module(r, mod: dict, now_ms: Optional[int] = None, keys=None,
+                    max_age_override: Optional[float] = None) -> dict:
+    """Pure health verdict for one module (no printing).
+
+    status: OK (newest output within max_age) | STALE (data exists, newest too old,
+    or no timestamp at all) | FAIL (no data) | NOT_IMPL.  `keys` = optional pre-scanned
+    key list (filtered locally with fnmatch instead of one SCAN per prefix).
+    """
+    import fnmatch
+
+    now_ms = now_ms or int(time.time() * 1000)
+    out = {"name": mod["name"], "worker": mod.get("worker"), "status": "NOT_IMPL",
+           "max_age_sec": module_max_age(mod, max_age_override), "newest_age_sec": None, "components": []}
+    if not mod.get("worker"):
+        return out
+    newest = None
+    has_data = False
+    for stream in mod.get("streams", []) or []:
+        try:
+            n = int(r.xlen(stream) or 0)
+        except Exception:
+            n = 0
+        ts = None
+        if n:
+            try:
+                rows = r.xrevrange(stream, count=1) or []
+                if rows:
+                    mid, fields = rows[0]
+                    ts = doc_ts_ms(fields, mid)
+            except Exception:
+                ts = None
+        has_data = has_data or n > 0
+        out["components"].append({"kind": "stream", "name": stream, "count": n,
+                                  "age_sec": None if ts is None else (now_ms - ts) / 1000.0})
+        if ts and (newest is None or ts > newest):
+            newest = ts
+    for prefix in (mod.get("latest_prefix"), mod.get("extra_prefix")):
+        if not prefix:
+            continue
+        try:
+            if keys is not None:
+                ks = [k for k in keys if fnmatch.fnmatchcase(k, prefix)]
+            else:
+                ks = list(r.scan_iter(match=prefix, count=500))
+        except Exception:
+            ks = []
+        ts = _newest_latest_ms(r, ks) if ks else None
+        has_data = has_data or bool(ks)
+        out["components"].append({"kind": "keys", "name": prefix, "count": len(ks),
+                                  "age_sec": None if ts is None else (now_ms - ts) / 1000.0})
+        if ts and (newest is None or ts > newest):
+            newest = ts
+    for single in (mod.get("latest_key"), mod.get("hash_pattern")):
+        if not single:
+            continue
+        try:
+            t = r.type(single)
+        except Exception:
+            t = "none"
+        ts = None
+        cnt = 0
+        try:
+            if t == "string":
+                val = safe_json(r.get(single))
+                cnt = 1 if val is not None else 0
+                ts = doc_ts_ms(val)
+            elif t == "hash":
+                cnt = len(r.hgetall(single) or {})
+                ts = _to_ms(r.get(single + ":ts_ms")) if single == "md:active_expiry" else None
+            elif t == "zset":
+                cnt = len(r.zrevrange(single, 0, 9) or [])
+        except Exception:
+            pass
+        has_data = has_data or cnt > 0
+        out["components"].append({"kind": t, "name": single, "count": cnt,
+                                  "age_sec": None if ts is None else (now_ms - ts) / 1000.0})
+        if ts and (newest is None or ts > newest):
+            newest = ts
+    out["newest_age_sec"] = None if newest is None else max(0.0, (now_ms - newest) / 1000.0)
+    max_age = out["max_age_sec"]
+    if not has_data:
+        out["status"] = "FAIL"
+    elif max_age is None:
+        out["status"] = "OK"
+    elif newest is None or out["newest_age_sec"] > max_age:
+        out["status"] = "STALE"
+    else:
+        out["status"] = "OK"
+    return out
+
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def worker_pid_names(run_all: Optional[str] = None) -> dict:
+    """script -> pid-file name, parsed from run_all.sh `start "name" python3 script.py` lines."""
+    import re
+
+    path = run_all or os.path.join(_BASE_DIR, "run_all.sh")
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return {}
+    return {m.group(2): m.group(1) for m in re.finditer(r'start\s+"([^"]+)"\s+python3?\s+(\S+\.py)', text)}
+
+
+def worker_alive(worker: Optional[str], names: Optional[dict] = None, log_dir: Optional[str] = None) -> Optional[bool]:
+    """True/False from the newest logs/<date>/pids/<name>.pid written by run_all.sh; None = unknown."""
+    import glob
+
+    if not worker:
+        return None
+    name = (names if names is not None else worker_pid_names()).get(worker)
+    if not name:
+        return None
+    log_dir = log_dir or os.getenv("LOG_DIR") or os.path.join(_BASE_DIR, "logs")
+    pid_files = glob.glob(os.path.join(log_dir, "*", "pids", f"{name}.pid"))
+    if not pid_files:
+        return None
+    try:
+        with open(max(pid_files, key=os.path.getmtime), encoding="utf-8") as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def evaluate_all(r, now_ms: Optional[int] = None, keys=None, max_age_override: Optional[float] = None,
+                 filter_layer: Optional[str] = None, check_workers: bool = False) -> list:
+    """check_workers: also look at run_all.sh pid files (same host only). A worker
+    that is running but has produced nothing is IDLE (e.g. no entry signal yet),
+    not FAIL; a worker whose process is gone is DOWN."""
+    names = worker_pid_names() if check_workers else {}
+    rows = []
+    for layer in LAYERS:
+        if filter_layer and layer["id"] != filter_layer:
+            continue
+        for mod in layer["modules"]:
+            res = evaluate_module(r, mod, now_ms=now_ms, keys=keys, max_age_override=max_age_override)
+            if check_workers and mod.get("worker"):
+                alive = worker_alive(mod["worker"], names)
+                res["alive"] = alive
+                if alive is False:
+                    res["status"] = "DOWN"
+                elif alive and res["status"] == "FAIL":
+                    res["status"] = "IDLE"
+            res["layer"] = layer["id"]
+            res["layer_name"] = layer["name"]
+            rows.append(res)
+    return rows
 
 
 # ──────────────────────────────────────────────────────────────
@@ -473,7 +744,8 @@ def age_str(ts_ms_raw) -> str:
 # Core check logic
 # ──────────────────────────────────────────────────────────────
 
-def check_module(r: redis.Redis, mod: dict, sample_symbol: Optional[str] = None) -> dict:
+def check_module(r: redis.Redis, mod: dict, sample_symbol: Optional[str] = None,
+                 max_age_override: Optional[float] = None) -> dict:
     """Check a single module's health. Returns a result dict."""
     result = {
         "name": mod["name"],
@@ -554,7 +826,7 @@ def check_module(r: redis.Redis, mod: dict, sample_symbol: Optional[str] = None)
                     key_type = r.type(show_key)
                     if key_type == "string":
                         val = safe_json(r.get(show_key))
-                        ts = (val or {}).get("ts_ms") or (val or {}).get("ts_recv")
+                        ts = doc_ts_ms(val) if isinstance(val, dict) else None
                         result["details"].append(
                             f"  └─ {show_key}: {fmt_json(val)} [{age_str(ts)}]"
                         )
@@ -627,7 +899,17 @@ def check_module(r: redis.Redis, mod: dict, sample_symbol: Optional[str] = None)
         except Exception as e:
             result["details"].append(f"Hash {hash_pattern}: {RED}ERROR {e}{RESET}")
 
-    result["status"] = "OK" if has_any_data else "FAIL"
+    verdict = evaluate_module(r, mod, max_age_override=max_age_override)
+    result["status"] = verdict["status"]
+    result["newest_age_sec"] = verdict["newest_age_sec"]
+    result["max_age_sec"] = verdict["max_age_sec"]
+    age = verdict["newest_age_sec"]
+    lim = verdict["max_age_sec"]
+    age_txt = "no timestamp" if age is None else f"{age:.0f}s"
+    lim_txt = "no age check (event-driven)" if lim is None else f"limit {lim:.0f}s"
+    if has_any_data:
+        colour = RED if result["status"] == "STALE" else GREEN
+        result["details"].append(f"Freshness: newest output {colour}{age_txt}{RESET} ({lim_txt})")
     return result
 
 
@@ -636,7 +918,7 @@ def check_module(r: redis.Redis, mod: dict, sample_symbol: Optional[str] = None)
 # ──────────────────────────────────────────────────────────────
 
 def print_report(r: redis.Redis, filter_layer: Optional[str] = None,
-                 sample_symbol: Optional[str] = None):
+                 sample_symbol: Optional[str] = None, max_age_override: Optional[float] = None):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n{'=' * 80}")
     print(f"{BOLD}{CYAN}  PIPELINE HEALTH CHECK — {now}{RESET}")
@@ -662,6 +944,7 @@ def print_report(r: redis.Redis, filter_layer: Optional[str] = None,
 
     total_ok = 0
     total_fail = 0
+    total_stale = 0
     total_not_impl = 0
 
     for layer in LAYERS:
@@ -673,12 +956,15 @@ def print_report(r: redis.Redis, filter_layer: Optional[str] = None,
         print(f"{'─' * 80}")
 
         for mod in layer["modules"]:
-            result = check_module(r, mod, sample_symbol)
+            result = check_module(r, mod, sample_symbol, max_age_override=max_age_override)
 
             # Status icon
             if result["status"] == "OK":
                 icon = OK
                 total_ok += 1
+            elif result["status"] == "STALE":
+                icon = STALE
+                total_stale += 1
             elif result["status"] == "NOT_IMPL":
                 icon = f"{DIM}🚧 NOT IMPLEMENTED{RESET}"
                 total_not_impl += 1
@@ -697,6 +983,7 @@ def print_report(r: redis.Redis, filter_layer: Optional[str] = None,
     print(f"\n{'=' * 80}")
     print(f"{BOLD}  SUMMARY{RESET}")
     print(f"    {GREEN}✅ Producing data:{RESET}  {total_ok}")
+    print(f"    {YELLOW}⏳ Stale data:{RESET}      {total_stale}")
     print(f"    {RED}❌ No data found:{RESET}   {total_fail}")
     print(f"    {DIM}🚧 Not implemented:{RESET} {total_not_impl}")
 
@@ -704,7 +991,10 @@ def print_report(r: redis.Redis, filter_layer: Optional[str] = None,
         print(f"\n  {YELLOW}💡 Pipeline appears to not be running.{RESET}")
         print(f"     Start it with: {BOLD}.\\run_all.ps1{RESET}")
         print(f"     Or check if it's market hours (9:15 AM - 3:30 PM IST, Mon-Fri).")
-    elif total_fail > 0:
+    if total_stale > 0:
+        print(f"\n  {YELLOW}💡 {total_stale} module(s) have only old data (worker stopped / market closed / "
+              f"upstream stalled). Thresholds: MAX_AGE_SEC_BY_WORKER, --max-age, HEALTH_MAX_AGE_SEC.{RESET}")
+    if total_fail > 0 and total_ok > 0:
         print(f"\n  {YELLOW}💡 Some modules have no data. This could mean:{RESET}")
         print(f"     - The worker hasn't processed enough data yet (wait a few minutes)")
         print(f"     - The upstream dependency hasn't produced output yet")
@@ -733,6 +1023,10 @@ def main():
         help="Show sample data for a specific symbol (e.g. 'RELIANCE')"
     )
     parser.add_argument(
+        "--max-age", type=float, default=None,
+        help="Override every module's freshness threshold (seconds); event-driven modules stay unchecked"
+    )
+    parser.add_argument(
         "--interval", type=int, default=15,
         help="Refresh interval in seconds when using --watch (default: 15)"
     )
@@ -745,13 +1039,13 @@ def main():
             while True:
                 # Clear screen
                 os.system("cls" if os.name == "nt" else "clear")
-                print_report(r, filter_layer=args.layer, sample_symbol=args.symbol)
+                print_report(r, filter_layer=args.layer, sample_symbol=args.symbol, max_age_override=args.max_age)
                 print(f"  {DIM}Auto-refreshing every {args.interval}s... Press Ctrl+C to stop.{RESET}")
                 time.sleep(args.interval)
         except KeyboardInterrupt:
             print("\nStopped.")
     else:
-        print_report(r, filter_layer=args.layer, sample_symbol=args.symbol)
+        print_report(r, filter_layer=args.layer, sample_symbol=args.symbol, max_age_override=args.max_age)
 
 
 if __name__ == "__main__":

@@ -88,3 +88,70 @@ def parse_pivots_payload(data: dict) -> Optional[PivotLevels]:
     except (KeyError, TypeError, ValueError):
         return None
     return PivotLevels(date=date, P=P, R1=R1, S1=S1, R2=R2, S2=S2)
+
+
+@dataclass
+class LevelBarDecision:
+    """Outcome of feeding one 1m bar into :class:`LevelBreakTracker`."""
+
+    emit: bool  # True -> publish (bar is recent and had a prev close to compare)
+    result: Optional[LevelEntryResult]
+    prev_close: Optional[float]
+    skip_reason: str = ""
+
+
+class LevelBreakTracker:
+    """Per-symbol prev-close state with a bar-age guard.
+
+    * Bars older than ``max_bar_age_ms`` (by their own bar timestamp) only warm
+      up the prev-close state; they never produce a signal. This stops history /
+      bootstrap / replayed 1m bars from becoming live "breaks".
+    * Bars whose timestamp is not newer than the last seen bar (duplicates,
+      out-of-order replay) are ignored entirely, so a replayed old bar is never
+      compared against a newer close.
+    * A bar without a timestamp is not evaluated (fail closed).
+    """
+
+    def __init__(self, max_bar_age_ms: int) -> None:
+        self.max_bar_age_ms = int(max_bar_age_ms)
+        self._prev_close: dict = {}
+        self._prev_ts: dict = {}
+
+    def seed(self, symbol: str, close: float, bar_ts_ms: Optional[int]) -> None:
+        self._prev_close[symbol] = float(close)
+        if bar_ts_ms is not None:
+            self._prev_ts[symbol] = int(bar_ts_ms)
+
+    def prev_close(self, symbol: str) -> Optional[float]:
+        return self._prev_close.get(symbol)
+
+    def on_bar(
+        self,
+        symbol: str,
+        close: float,
+        bar_ts_ms: Optional[int],
+        now_ms: int,
+        pivots,
+    ) -> LevelBarDecision:
+        """``pivots`` is a PivotLevels, None, or a zero-arg callable returning
+        one (only called for bars that are actually evaluated)."""
+        if bar_ts_ms is None:
+            return LevelBarDecision(False, None, self._prev_close.get(symbol), "missing_bar_ts")
+
+        last_ts = self._prev_ts.get(symbol)
+        if last_ts is not None and bar_ts_ms <= last_ts:
+            return LevelBarDecision(False, None, self._prev_close.get(symbol), "out_of_order_or_duplicate")
+
+        prev = self._prev_close.get(symbol)
+        self._prev_close[symbol] = float(close)
+        self._prev_ts[symbol] = int(bar_ts_ms)
+
+        if prev is None:
+            return LevelBarDecision(False, None, None, "seed_prev_close")
+        if self.max_bar_age_ms > 0 and now_ms - bar_ts_ms > self.max_bar_age_ms:
+            return LevelBarDecision(False, None, prev, "stale_bar_warmup")
+        if callable(pivots):
+            pivots = pivots()
+        if pivots is None:
+            return LevelBarDecision(False, None, prev, "no_pivots")
+        return LevelBarDecision(True, level_entry(prev, close, pivots), prev, "")

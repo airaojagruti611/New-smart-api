@@ -46,6 +46,7 @@ from app.expected_move import (
     clip_bidask_score,
     combine_trend,
     compute_expected_move,
+    iv_from_percent,
     GAMMA_TREND_UP_PCT,
     IV_TREND_UP_PCT,
     normalize_oi_signal,
@@ -183,9 +184,11 @@ def main() -> None:
             gp_ce = _load_json(r, f"{GREEKS_PHASE_UNDERLYING_PREFIX}{sym}:CE") or {}
             gp_pe = _load_json(r, f"{GREEKS_PHASE_UNDERLYING_PREFIX}{sym}:PE") or {}
 
-            iv_ce = _safe_float(gp_ce.get("iv"))
-            iv_pe = _safe_float(gp_pe.get("iv"))
-            iv_vals = [v for v in (iv_ce, iv_pe) if v is not None and v > 0]
+            # Greeks-phase latest `iv` is PERCENT (Angel / joiner contract).
+            # Convert by declared unit; implausible readings drop to None.
+            iv_ce = iv_from_percent(_safe_float(gp_ce.get("iv")))
+            iv_pe = iv_from_percent(_safe_float(gp_pe.get("iv")))
+            iv_vals = [v for v in (iv_ce, iv_pe) if v is not None]
             implied_volatility = round(sum(iv_vals) / len(iv_vals), 6) if iv_vals else None
 
             gamma_trend = combine_trend(

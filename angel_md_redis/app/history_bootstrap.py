@@ -8,14 +8,21 @@ from __future__ import annotations
 import datetime as dt
 import os
 import time
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import redis
 
 from .angel_auth import login
 from .angel_rest import api_error_text, api_failed, candle_rows, fetch_candle_data
-from .candle_builder import resample_candles
-from .candle_io import count_symbol_candles, existing_ts_set
+from .candle_builder import (
+    in_session,
+    is_degenerate_daily,
+    resample_candles,
+    session_close_bar_ts_ms,
+    session_completed,
+    session_date_ist,
+)
+from .candle_io import existing_ts_set, read_symbol_candles, stream_symbol_ts
 from .candle_types import Candle
 from .candles_store import CandlesStore
 from .config import load_symbols
@@ -135,6 +142,34 @@ def _row_to_candle(row) -> Optional[Candle]:
     return Candle(ts_ms=int(when.timestamp() * 1000), o=o, h=h, l=l, c=c, v=v)
 
 
+def normalize_bar_ts(candle: Candle, tf: str, source: str = "") -> Candle:
+    """Stamp a history bar with the pipeline convention (ts_ms = bar END).
+
+    - 1d: last ms of the IST session (15:29:59.999) for every source, so Angel
+      (00:00 / 09:15 start stamps), Yahoo/Moneycontrol and the live builder agree.
+    - intraday from Angel getCandleData: rows are stamped at bar START
+      (11:15:00 for 11:15-11:16) -> start + tf - 1ms (11:15:59.999), the same as
+      live / Yahoo / Moneycontrol bars.
+    """
+    if tf == "1d":
+        ts = session_close_bar_ts_ms(session_date_ist(candle.ts_ms))
+    elif source == "angel":
+        minutes = _TF_MINUTES.get(tf, 0)
+        if minutes <= 0:
+            return candle
+        ts = candle.ts_ms + minutes * 60_000 - 1
+    else:
+        return candle
+    if ts == candle.ts_ms:
+        return candle
+    return Candle(ts_ms=ts, o=candle.o, h=candle.h, l=candle.l, c=candle.c, v=candle.v)
+
+
+_TF_MINUTES = {"1m": 1, "5m": 5, "10m": 10, "15m": 15, "30m": 30}
+_INTERVAL_TF = {"ONE_DAY": "1d", "ONE_MINUTE": "1m", "FIVE_MINUTE": "5m", "TEN_MINUTE": "10m",
+                "FIFTEEN_MINUTE": "15m", "THIRTY_MINUTE": "30m"}
+
+
 def _range_for(interval: str, lookback_days: int) -> Tuple[str, str]:
     now = _now_ist()
     if interval == "ONE_DAY":
@@ -150,7 +185,19 @@ def _range_for(interval: str, lookback_days: int) -> Tuple[str, str]:
     return _fmt(start), _fmt(end)
 
 
-def _needs_seed(r: redis.Redis, symbols: Sequence[str]) -> bool:
+def _ts_index(r: redis.Redis, stream: str, cache: Dict[str, Dict[str, Set[int]]]) -> Dict[str, Set[int]]:
+    """Per-stream symbol -> bar ts set, built once per seed run (full stream pass)."""
+    if stream not in cache:
+        cache[stream] = stream_symbol_ts(r, stream)
+    return cache[stream]
+
+
+def _needs_seed(
+    r: redis.Redis,
+    symbols: Sequence[str],
+    cache: Optional[Dict[str, Dict[str, Set[int]]]] = None,
+) -> bool:
+    cache = {} if cache is None else cache
     checks = [
         (STREAM_1D, 2),
         (STREAM_1M, 26),
@@ -159,10 +206,21 @@ def _needs_seed(r: redis.Redis, symbols: Sequence[str]) -> bool:
         (STREAM_30M, 8),
     ]
     for stream, need in checks:
-        counts = count_symbol_candles(r, stream, list(symbols), per_symbol_limit=need)
-        if any(counts.get(s.upper(), 0) < need for s in symbols):
+        idx = _ts_index(r, stream, cache)
+        if any(len(idx.get(s.upper(), ())) < need for s in symbols):
             return True
     return False
+
+
+def pick_pivot_source(bars: Sequence[Candle], now_ms: int) -> Optional[Candle]:
+    """Latest daily bar of a COMPLETED session that is not degenerate (H > L)."""
+    for c in sorted(bars, key=lambda b: b.ts_ms, reverse=True):
+        if is_degenerate_daily(c):
+            continue
+        if not session_completed(session_date_ist(c.ts_ms), now_ms):
+            continue
+        return c
+    return None
 
 
 def seed_pivots_from_daily(r: redis.Redis, symbols: Sequence[str], store: Optional[CandlesStore] = None) -> int:
@@ -172,11 +230,11 @@ def seed_pivots_from_daily(r: redis.Redis, symbols: Sequence[str], store: Option
     store = store or CandlesStore()
     written = 0
     for sym in symbols:
-        bars = read_last_candles(r, STREAM_1D, sym, limit=2, scan=8000)
-        if not bars:
+        bars = read_last_candles(r, STREAM_1D, sym, limit=5, scan=8000)
+        src = pick_pivot_source(bars, int(time.time() * 1000))
+        if src is None:
             continue
-        src = bars[-1]
-        date_str = dt.datetime.fromtimestamp(src.ts_ms / 1000.0, tz=IST).date().isoformat()
+        date_str = session_date_ist(src.ts_ms).isoformat()
         p = classic_pivots(src, date=date_str)
         store.write_pivots_prevday(f"{PIVOTS_KEY_PREFIX}{sym.upper()}", p)
         r.xadd(
@@ -208,31 +266,36 @@ def _write_candles(
     tf: str,
     candles: Sequence[Candle],
     skip_today: bool,
+    existing: Optional[Set[int]] = None,
 ) -> int:
-    today = _now_ist().date()
-    now_ms = int(time.time() * 1000) + 120_000
-    existing = existing_ts_set(r, stream, sym, scan=20000)
+    """`existing` (from _ts_index) is updated in place with written bars."""
+    now_ms = int(time.time() * 1000)
+    if existing is None:
+        existing = existing_ts_set(r, stream, sym, scan=20000)
     n = 0
     skip_d = 0
     skip_fut = 0
     for candle in candles:
         if candle is None:
             continue
+        # ts_ms is the bar END: a bar still in progress has end > now.
         if candle.ts_ms > now_ms:
             skip_fut += 1
             continue
+        if tf != "1d" and not in_session(candle.ts_ms):
+            continue
         if skip_today:
-            d = dt.datetime.fromtimestamp(candle.ts_ms / 1000.0, tz=IST).date()
-            if d >= today:
+            # a daily bar is final only once its session has closed
+            if not session_completed(session_date_ist(candle.ts_ms), now_ms):
                 skip_d += 1
                 continue
         if candle.ts_ms in existing:
             continue
         extra_date = ""
         if tf == "1d":
-            extra_date = dt.datetime.fromtimestamp(
-                candle.ts_ms / 1000.0, tz=IST
-            ).date().isoformat()
+            if is_degenerate_daily(candle):
+                continue
+            extra_date = session_date_ist(candle.ts_ms).isoformat()
         store.write_candle(stream, maxlen, sym, tf, candle, date=extra_date)
         existing.add(candle.ts_ms)
         n += 1
@@ -262,7 +325,8 @@ def _angel_candles(
     rows = candle_rows(body)
     if not rows:
         return [], f"empty data ({api_error_text(body)})"
-    ok = [c for c in (_row_to_candle(row) for row in rows) if c is not None]
+    tf = _INTERVAL_TF.get(interval, "")
+    ok = [normalize_bar_ts(c, tf, source="angel") for c in (_row_to_candle(row) for row in rows) if c is not None]
     if not ok:
         sample = rows[0] if rows else None
         return [], f"unparsed rows={len(rows)} sample={repr(sample)[:200]}"
@@ -294,24 +358,26 @@ def _seed_htf_from_1m(
     store: CandlesStore,
     symbols: Sequence[str],
     written: Dict[str, int],
+    cache: Dict[str, Dict[str, Set[int]]],
 ) -> None:
     """Fill 5m/10m/30m from seeded 1m so Supertrend MTF has ATR history."""
-    from .candle_io import read_last_candles
 
     targets = (
         (5, STREAM_5M, OUT_MAXLEN_5M, "5m"),
         (10, STREAM_10M, OUT_MAXLEN_10M, "10m"),
         (30, STREAM_30M, OUT_MAXLEN_30M, "30m"),
     )
+    all_1m = read_symbol_candles(r, STREAM_1M, set(symbols), limit=4000)
     for sym in symbols:
-        bars_1m = read_last_candles(r, STREAM_1M, sym, limit=4000, scan=20000)
+        bars_1m = all_1m.get(sym.upper(), [])
         if len(bars_1m) < 8:
             print(f"[HISTORY] resample skip {sym}: only {len(bars_1m)} 1m bars")
             continue
         for minutes, stream, maxlen, tf in targets:
-            have = len(existing_ts_set(r, stream, sym, scan=8000))
+            existing = _ts_index(r, stream, cache).setdefault(sym.upper(), set())
+            have = len(existing)
             ht = resample_candles(bars_1m, minutes)
-            n = _write_candles(r, store, stream, maxlen, sym, tf, ht, skip_today=False)
+            n = _write_candles(r, store, stream, maxlen, sym, tf, ht, skip_today=False, existing=existing)
             written[f"{sym}:{tf}:resample"] = n
             print(
                 f"[HISTORY] resampled {n} {tf} bars for {sym} "
@@ -337,7 +403,8 @@ def seed_history(
     if r is None:
         r = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
 
-    if not force and not _needs_seed(r, symbols):
+    cache: Dict[str, Dict[str, Set[int]]] = {}
+    if not force and not _needs_seed(r, symbols, cache):
         n = seed_pivots_from_daily(r, symbols)
         print(f"[HISTORY] skip fetch: daily candles already present; pivots_written={n}")
         return {"skipped": 1, "pivots": n}
@@ -357,15 +424,14 @@ def seed_history(
     written: Dict[str, int] = {}
     angel_usable = auth_token is not None
 
-    dailies_ready = all(
-        count_symbol_candles(r, STREAM_1D, list(symbols), per_symbol_limit=2).get(s, 0) >= 2
-        for s in symbols
-    )
+    idx_1d = _ts_index(r, STREAM_1D, cache)
+    dailies_ready = all(len(idx_1d.get(s, ())) >= 2 for s in symbols)
 
     for interval, tf, stream, maxlen, lookback_days, min_bars, skip_today in FETCH_INTERVALS:
         fromdate, todate = _range_for(interval, lookback_days)
         for sym in symbols:
-            have = len(existing_ts_set(r, stream, sym, scan=max(8000, min_bars * 40)))
+            existing = _ts_index(r, stream, cache).setdefault(sym, set())
+            have = len(existing)
             if not force and dailies_ready and have >= min_bars:
                 print(f"[HISTORY] skip {sym} {tf}: already {have} bars")
                 continue
@@ -398,11 +464,13 @@ def seed_history(
                     written[f"{sym}:{tf}"] = 0
                     continue
 
-            n = _write_candles(r, store, stream, maxlen, sym, tf, candles, skip_today)
+            if source != "angel":  # Angel rows are normalized in _angel_candles
+                candles = [normalize_bar_ts(c, tf, source=source) for c in candles]
+            n = _write_candles(r, store, stream, maxlen, sym, tf, candles, skip_today, existing=existing)
             written[f"{sym}:{tf}"] = n
             print(f"[HISTORY] wrote {n} {tf} bars for {sym} via {source} (had={have})")
 
-    _seed_htf_from_1m(r, store, symbols, written)
+    _seed_htf_from_1m(r, store, symbols, written, cache)
     written["pivots"] = seed_pivots_from_daily(r, symbols, store=store)
     return written
 

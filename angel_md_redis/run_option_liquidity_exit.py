@@ -24,6 +24,7 @@ import redis
 
 from app.config import load_symbols
 from app.logging_setup import setup_logger
+from app.order_flow import tick_ts_ms
 from app.option_liquidity_exit import LiquidityExitResult, OptionLiquidityExitDetector
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -37,7 +38,10 @@ LATEST_KEY_PREFIX = os.getenv("OPTEXIT_LATEST_PREFIX", "md:optexit:latest:")
 GROUP = os.getenv("OPTEXIT_GROUP", "optexit")
 CONSUMER = os.getenv("OPTEXIT_CONSUMER", "optexit-1")
 
-LATEST_TTL_SEC = int(os.getenv("OPTEXIT_LATEST_TTL_SEC", "3600"))
+# Short TTL: the latest key must not keep a stale EXIT_NOW alive for an hour
+# after the contract stops ticking. Consumers should ALSO check ts_ms (the
+# tick's source time) against their own max age (see run_composite.py).
+LATEST_TTL_SEC = int(os.getenv("OPTEXIT_LATEST_TTL_SEC", "120"))
 
 log = setup_logger("option_liquidity_exit")
 
@@ -59,7 +63,40 @@ def _safe_float(v) -> Optional[float]:
         return None
 
 
+def classify_quote(bid: Optional[float], ask: Optional[float], bid_sz: Optional[float], ask_sz: Optional[float]) -> str:
+    """'TWO_SIDED' (normal), 'BIDS_VANISHED' (ask quoted, no bid) or 'EMPTY'
+    (nothing usable on the ask side — no information, skip)."""
+    has_ask = ask is not None and ask > 0
+    has_bid = bid is not None and bid > 0
+    if has_ask and not has_bid:
+        return "BIDS_VANISHED"
+    if has_ask and has_bid and bid_sz is not None and ask_sz is not None:
+        return "TWO_SIDED"
+    return "EMPTY"
+
+
+def evaluate_tick(
+    detector: OptionLiquidityExitDetector,
+    fields: Dict[str, str],
+    spot: Optional[float],
+    fallback_ms: int,
+) -> Optional[LiquidityExitResult]:
+    """One opt tick -> result, or None for a fully-empty / unusable book."""
+    bid = _safe_float(fields.get("bid"))
+    ask = _safe_float(fields.get("ask"))
+    bid_sz = _safe_float(fields.get("bid_sz"))
+    ask_sz = _safe_float(fields.get("ask_sz"))
+    ts_ms = tick_ts_ms(fields, fallback_ms) or fallback_ms
+    kind = classify_quote(bid, ask, bid_sz, ask_sz)
+    if kind == "BIDS_VANISHED":
+        return detector.analyze_bids_vanished(ts_ms=ts_ms, ask=ask, ask_sz=ask_sz or 0.0, spot=spot)
+    if kind == "TWO_SIDED":
+        return detector.analyze(ts_ms=ts_ms, bid=bid, ask=ask, bid_sz=bid_sz, ask_sz=ask_sz, spot=spot)
+    return None
+
+
 def _to_payload(tsym: str, underlying: str, res: LiquidityExitResult, now_ms: int) -> Dict[str, str]:
+    """`now_ms` = the tick's source time (ts_exch -> ts_recv)."""
     return {
         "ts_ms": str(now_ms),
         "tradingsymbol": tsym,
@@ -79,6 +116,7 @@ def _to_payload(tsym: str, underlying: str, res: LiquidityExitResult, now_ms: in
         "stage3_refresh_slowing": "1" if res.stage3_refresh_slowing else "0",
         "stage4_bid_pull": "1" if res.stage4_bid_pull else "0",
         "stage5_one_sided": "1" if res.stage5_one_sided else "0",
+        "bids_vanished": "1" if res.bids_vanished else "0",
         "exit_status": res.exit_status,
     }
 
@@ -133,22 +171,16 @@ def main() -> None:
                     log.debug("SKIP unknown_or_missing symbol=%s tsym=%s", und, tsym)
                     continue
 
-                bid = _safe_float(fields.get("bid"))
-                ask = _safe_float(fields.get("ask"))
-                bid_sz = _safe_float(fields.get("bid_sz"))
-                ask_sz = _safe_float(fields.get("ask_sz"))
-                if bid is None or ask is None or bid_sz is None or ask_sz is None or bid <= 0 or ask <= 0:
-                    log.debug("SKIP no_quote tsym=%s", tsym)
-                    continue
-
                 spot = spot_by_sym.get(und)
 
                 if tsym not in detectors:
                     detectors[tsym] = OptionLiquidityExitDetector()
 
-                res = detectors[tsym].analyze(
-                    ts_ms=now_ms, bid=bid, ask=ask, bid_sz=bid_sz, ask_sz=ask_sz, spot=spot,
-                )
+                res = evaluate_tick(detectors[tsym], fields, spot, now_ms)
+                if res is None:
+                    log.debug("SKIP empty_book tsym=%s", tsym)
+                    continue
+                tick_ms = tick_ts_ms(fields, now_ms) or now_ms
 
                 log.debug(
                     "LOGIC tsym=%s spread=%.4f/%s bid_sz=%s/%s refresh=%s/%s "
@@ -167,7 +199,7 @@ def main() -> None:
                     res.exit_status,
                 )
 
-                payload = _to_payload(tsym, und, res, now_ms)
+                payload = _to_payload(tsym, und, res, tick_ms)
                 r.xadd(OUT_STREAM, payload, maxlen=OUT_MAXLEN, approximate=True)
                 r.set(
                     f"{LATEST_KEY_PREFIX}{tsym}",

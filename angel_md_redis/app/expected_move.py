@@ -123,11 +123,30 @@ def normalize_oi_signal(positioning: Optional[str]) -> Optional[float]:
     return _OI_SIGNAL_MAP.get(key)
 
 
-def as_annualized_decimal(vol: Optional[float]) -> Optional[float]:
+# IV / RV unit handling (QA HIGH fix): units are declared by the SOURCE,
+# never guessed from magnitude. Guessing (">1 means percent") turned a
+# percent reading of 0.01 (= 0.01%) into a decimal 0.01 (= 1%) — a 100x error.
+#   "percent": Angel REST optionGreek / joiner / greeks_poller / greeks-phase
+#              latest `iv` (18.5 == 18.5%).
+#   "decimal": annualized decimal (0.185 == 18.5%) — option_pricing sigma,
+#              StrikeCandidate.iv, ExpectedMoveResult.implied_volatility.
+IV_UNITS_PERCENT = "percent"
+IV_UNITS_DECIMAL = "decimal"
+# Plausibility band for an annualized vol (decimal). Outside -> missing.
+MIN_PLAUSIBLE_IV = 0.01   # 1% annualized
+MAX_PLAUSIBLE_IV = 3.00   # 300% annualized
+
+
+def as_annualized_decimal(vol: Optional[float], units: str) -> Optional[float]:
     """
-    Accept either a decimal (0.18) or a percent (18.0 / "18.5" from Angel Greeks).
-    Values > 1.0 are treated as percent. Non-positive / non-finite -> None.
+    Convert a vol reading to an annualized decimal using the source's
+    DECLARED units ("percent" or "decimal"). Returns None for missing,
+    non-finite, non-positive, or implausible (< 1% / > 300% annualized)
+    values. Raises ValueError on an unknown units string (programming error).
     """
+    u = str(units or "").strip().lower()
+    if u not in (IV_UNITS_PERCENT, IV_UNITS_DECIMAL):
+        raise ValueError(f"as_annualized_decimal: units must be 'percent' or 'decimal', got {units!r}")
     if vol is None:
         return None
     try:
@@ -136,9 +155,21 @@ def as_annualized_decimal(vol: Optional[float]) -> Optional[float]:
         return None
     if not math.isfinite(v) or v <= 0:
         return None
-    if v > 1.0:
+    if u == IV_UNITS_PERCENT:
         v = v / 100.0
+    if v < MIN_PLAUSIBLE_IV or v > MAX_PLAUSIBLE_IV:
+        return None
     return v
+
+
+def iv_from_percent(vol: Optional[float]) -> Optional[float]:
+    """Percent-unit source (Angel / greeks-phase `iv`) -> annualized decimal or None."""
+    return as_annualized_decimal(vol, IV_UNITS_PERCENT)
+
+
+def iv_from_decimal(vol: Optional[float]) -> Optional[float]:
+    """Decimal-unit source -> validated annualized decimal or None."""
+    return as_annualized_decimal(vol, IV_UNITS_DECIMAL)
 
 
 def _finite(v: Optional[float]) -> Optional[float]:
@@ -254,7 +285,7 @@ def validate_inputs(
     if _finite_positive(trading_minutes_per_day) is None:
         flags.append("invalid_trading_minutes_per_day")
 
-    if as_annualized_decimal(implied_volatility) is None:
+    if iv_from_decimal(implied_volatility) is None:
         flags.append("missing_implied_volatility")
 
     if _finite_positive(atm_call_mid) is None:
@@ -262,7 +293,7 @@ def validate_inputs(
     if _finite_positive(atm_put_mid) is None:
         flags.append("missing_atm_put_mid")
 
-    if as_annualized_decimal(realized_volatility) is None:
+    if iv_from_decimal(realized_volatility) is None:
         flags.append("missing_realized_volatility")
 
     if indicator_score is None:
@@ -424,8 +455,12 @@ def calculate_iv_move(
     trading_minutes_per_day: float = TRADING_MINUTES_PER_DAY,
     trading_days_per_year: float = TRADING_DAYS_PER_YEAR,
 ) -> Optional[float]:
-    """1-sigma IV move over the horizon. Diagnostic only."""
-    sigma = as_annualized_decimal(implied_volatility)
+    """1-sigma IV move over the horizon. Diagnostic only.
+
+    implied_volatility MUST be an annualized decimal (0.185); convert
+    percent-unit sources with iv_from_percent() first.
+    """
+    sigma = iv_from_decimal(implied_volatility)
     if sigma is None or spot_price <= 0 or horizon_minutes <= 0 or trading_minutes_per_day <= 0:
         return None
     t_years = (horizon_minutes / trading_minutes_per_day) / trading_days_per_year
@@ -579,7 +614,7 @@ def compute_expected_move(
             spot, realized_volatility, horizon, tpd, trading_days_per_year
         )
 
-    sigma = as_annualized_decimal(implied_volatility)
+    sigma = iv_from_decimal(implied_volatility)
     return ExpectedMoveResult(
         spot_price=round(spot, 4) if spot is not None else spot_price,
         implied_volatility=round(sigma, 6) if sigma is not None else None,

@@ -54,6 +54,23 @@ def label_alignment(label: Optional[str], side: str) -> Optional[str]:
     return "FOR" if bull == is_ce else "AGAINST"
 
 
+def contract_alignment(label: Optional[str]) -> Optional[str]:
+    """
+    Order-book imbalance of the option CONTRACT we would buy
+    (md:imbalance:latest:{TSYM}) -> FOR / AGAINST / NEUTRAL / None. We only
+    buy options, so buying pressure (BULLISH) on that contract supports the
+    trade for CE and PE alike — it is NOT an underlying-direction label and
+    must not be flipped for puts (same reading as adaptive_tsl's `bidask` check).
+    """
+    v = (label or "").strip().upper()
+    if not v:
+        return None
+    bull, bear = "BULL" in v, "BEAR" in v
+    if bull == bear:
+        return "NEUTRAL"
+    return "FOR" if bull else "AGAINST"
+
+
 _ALIGN_SCORE = {"FOR": 100.0, "NEUTRAL": 50.0, "AGAINST": 0.0}
 
 
@@ -70,7 +87,7 @@ def regime_score(c: Candidate) -> Optional[float]:
 
 def bidask_score(c: Candidate) -> Optional[float]:
     exe = None if c.execution_quality is None else clip(float(c.execution_quality))
-    a = label_alignment(c.imbalance, c.side)
+    a = contract_alignment(c.imbalance)
     imb = None if a is None else _ALIGN_SCORE[a]
     if exe is None and imb is None:
         return None

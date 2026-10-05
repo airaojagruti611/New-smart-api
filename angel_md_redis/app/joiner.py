@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Tuple
 import redis
 
 from app.config import GREEKS_DIVIDEND_YIELD, RISK_FREE_RATE
+from app.freshness import env_ms, is_fresh_ts, stream_id_ms, ts_field_ms
 from app.option_pricing import greeks_from_market_premium, time_to_expiry_years
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -21,6 +22,22 @@ CONSUMER = os.getenv("JOINER_CONSUMER", "joiner-1")
 # refresh greeks cache at most every N seconds per (underlying, expiry)
 GREEKS_REFRESH_SEC = float(os.getenv("GREEKS_REFRESH_SEC", "3.0"))
 SPOT_REFRESH_SEC = float(os.getenv("JOINER_SPOT_REFRESH_SEC", "1.0"))
+# Greeks older than this (per-item ts_ms written by greeks_poller) are ignored so
+# the local Black-Scholes fallback runs instead of attaching hour-old greeks.
+GREEKS_MAX_AGE_MS = env_ms("GREEKS_MAX_AGE_SEC", 180.0)
+# Cached spot (age from its md:ticks:eq stream id) older than this is not used.
+SPOT_MAX_AGE_MS = env_ms("JOINER_SPOT_MAX_AGE_SEC", 60.0)
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def greeks_fresh(item: Dict[str, Any], now_ms: int, max_age_ms: int = None) -> bool:
+    """True when a greeks item carries ts_ms no older than GREEKS_MAX_AGE_SEC.
+    Items without ts_ms (legacy writers) are treated as stale (fail closed)."""
+    max_age = GREEKS_MAX_AGE_MS if max_age_ms is None else max_age_ms
+    return is_fresh_ts(ts_field_ms(item, "ts_ms"), now_ms, max_age)
 
 
 def _ensure_group(r: redis.Redis, stream: str, group: str):
@@ -97,6 +114,7 @@ class OptionsGreeksJoiner:
         self._cache: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
         self._cache_t: Dict[Tuple[str, str], float] = {}
         self._spot: Dict[str, float] = {}
+        self._spot_ts: Dict[str, int] = {}  # source time (stream id ms) of cached spot
         self._spot_t: float = 0.0
 
     def _load_greeks_map(self, underlying: str, expiry: str) -> Dict[str, Dict[str, Any]]:
@@ -154,13 +172,16 @@ class OptionsGreeksJoiner:
             self._cache_t[k] = now
 
         cache = self._cache.get(k, {})
+        now_ms = _now_ms()
         sk = strike_cp_key(strike, cp)
         if sk and sk in cache:
-            return cache[sk]
+            g = cache[sk]
+            return g if greeks_fresh(g, now_ms) else {}
 
         tsym = str(tradingsymbol or "").strip().upper()
         if tsym and tsym in cache:
-            return cache[tsym]
+            g = cache[tsym]
+            return g if greeks_fresh(g, now_ms) else {}
         return {}
 
     def _refresh_spot(self) -> None:
@@ -171,12 +192,20 @@ class OptionsGreeksJoiner:
             rows = self.r.xrevrange(EQ_STREAM, count=40)
         except Exception:
             return
-        for _mid, fields in rows:
+        for mid, fields in rows:
             sym = str(fields.get("symbol") or "").strip().upper()
             ltp = _safe_float(fields.get("ltp"))
-            if sym and ltp:
+            ts = stream_id_ms(mid) or int(now * 1000)
+            if sym and ltp and ts >= self._spot_ts.get(sym, 0):
                 self._spot[sym] = ltp
+                self._spot_ts[sym] = ts
         self._spot_t = now
+
+    def _fresh_spot(self, underlying: str) -> Optional[float]:
+        sym = str(underlying or "").strip().upper()
+        if not is_fresh_ts(self._spot_ts.get(sym), _now_ms(), SPOT_MAX_AGE_MS):
+            return None
+        return self._spot.get(sym)
 
     def _local_greeks(
         self,
@@ -187,7 +216,7 @@ class OptionsGreeksJoiner:
         ltp: Any,
     ) -> Dict[str, Any]:
         self._refresh_spot()
-        spot = self._spot.get(str(underlying or "").strip().upper())
+        spot = self._fresh_spot(underlying)
         k = _safe_float(strike)
         p = _safe_float(ltp)
         side = _norm_cp(cp)

@@ -26,11 +26,14 @@ from .command import Context, ExecCommand, validate
 from .config import ExecConfig
 from .fills import avg_price, continue_decision, fill_delta
 from .market import Quote
-from .pricing import ladder_step, next_price, price_cap, start_price
+from .broker import place_failure_kind
+from .pricing import ceil_tick, floor_tick, ladder_step, next_price, price_cap, start_price
 from .quantity import executable_lots, slice_lots
 
 CANCEL_RESEND_MS = 5000
 PRICE_BAND_MAX_REJECTS = 2
+
+_QUOTE_WAIT_REASONS = frozenset({"STALE_QUOTE", "NO_QUOTE"})
 
 _REJECT_FOR_LIMIT = {"margin": "INSUFFICIENT_MARGIN", "depth": "NO_DEPTH", "risk": "RISK_LIMIT",
                      "requested": "ZERO_LOTS"}
@@ -50,11 +53,17 @@ def new_state(cmd: ExecCommand, now_ms: int) -> S.ExecState:
 
 # ── broker updates ─────────────────────────────────────────────────────
 
+def is_band_reject(reason: str) -> bool:
+    r = (reason or "").upper()
+    return "BAND" in r or "LPP" in r
+
+
 def _apply_updates(st: S.ExecState, updates: Sequence[S.OrderUpdate], now_ms: int, events: List[dict]) -> None:
     w = st.working
     for u in updates:
         if not w or u.order_id != w.get("order_id"):
             continue
+        w.pop("pending_reconcile", None)            # the broker knows the order (or gave up on it)
         d = fill_delta(w["filled"], w.get("avg"), u.filled_qty, u.avg_price, w["price"])
         if d:
             px, units = d
@@ -66,8 +75,9 @@ def _apply_updates(st: S.ExecState, updates: Sequence[S.OrderUpdate], now_ms: in
             if u.status == "REJECTED":
                 st.reject_reasons.append(u.reason or "REJECTED")
                 events.append(_event("ORDER_REJECTED", now_ms, order_id=u.order_id, reason=u.reason))
-                if "BAND" in (u.reason or "").upper() or "LPP" in (u.reason or "").upper():
+                if is_band_reject(u.reason):
                     st.lpp_rejects += 1
+                    st.lpp_last_price = w["price"]      # next quote must be INSIDE the band
                     if st.lpp_rejects >= PRICE_BAND_MAX_REJECTS and not st.closing:
                         st.closing = "PRICE_OUT_OF_BAND"
                 elif not st.closing:
@@ -107,13 +117,23 @@ def _start(st: S.ExecState, q: Optional[Quote], ctx: Context, now_ms: int, cfg: 
            events: List[dict]) -> bool:
     """VALIDATING + SIZING. False = rejected before any order."""
     cmd = _cmd(st)
-    events.append(_event("COMMAND", now_ms, requested_lots=cmd.requested_lots, signal_premium=cmd.signal_premium,
-                         quote=q.to_dict() if q else None))
+    if st.block_reason not in _QUOTE_WAIT_REASONS:        # first attempt only
+        events.append(_event("COMMAND", now_ms, requested_lots=cmd.requested_lots, signal_premium=cmd.signal_premium,
+                             quote=q.to_dict() if q else None))
     reasons = validate(cmd, q, ctx, now_ms, cfg)
+    if reasons and set(reasons) <= _QUOTE_WAIT_REASONS and now_ms - st.received_ms <= cfg.command_ttl_sec * 1000:
+        # no fresh quote yet: wait (the runner re-steps every poll) instead of a single-shot rejection
+        if st.block_reason != reasons[0]:
+            events.append(_event("WAIT_QUOTE", now_ms, reason=reasons[0]))
+        st.block_reason = reasons[0]
+        return False
     if not reasons:
         reference = q.ask
         cap = price_cap(reference, cmd.tick, cfg)
         start = start_price(q, cmd.tick, cap, cfg)
+        if cmd.sl_premium is not None and min(start, cap) <= cmd.sl_premium + 1e-9:
+            reasons = ["PRICE_BELOW_STOP"]                # a fill at the start / cap would be at or below SL
+    if not reasons:
         sl_pts = (cap - cmd.sl_premium) if cmd.sl_premium is not None else None
         lots, limiting, reductions, limits = executable_lots(
             cmd.requested_lots, cmd.lot_size, cap, ctx.available_margin, cmd.max_risk_amount, sl_pts,
@@ -180,11 +200,15 @@ def _drive(st: S.ExecState, q: Optional[Quote], ctx: Context, now_ms: int, cfg: 
         if w.get("cancel_sent"):
             _resend_cancel_if_stuck(st, now_ms, actions)
             return
+        if w.get("pending_reconcile"):
+            st.block_reason = "PENDING_RECONCILE"      # no broker id yet: nothing to modify
+            return
         if (now_ms - w["priced_ms"] >= cfg.step_sec * 1000 and w["price"] < st.cap - 1e-9
                 and w["filled"] < w["qty"]):
             new_px = next_price(w["price"], st.step, st.cap)
             actions.append({"type": "MODIFY", "order_id": w["order_id"], "price": new_px,
-                            "qty": w["qty"] - w["filled"]})
+                            "qty": w["qty"], "prev_price": w["price"], "tradingsymbol": cmd.tradingsymbol})
+            # Angel modifyOrder takes the order's TOTAL quantity (filled + open), not the remainder
             events.append(_event("ORDER_MODIFIED", now_ms, order_id=w["order_id"], old=w["price"], price=new_px))
             w["price"], w["priced_ms"] = new_px, now_ms
             for o in st.orders:
@@ -214,6 +238,13 @@ def _drive(st: S.ExecState, q: Optional[Quote], ctx: Context, now_ms: int, cfg: 
         st.block_reason = "NO_DEPTH"
         return
     price = start_price(q, cmd.tick, st.cap, cfg)
+    if st.lpp_last_price is not None:
+        price = band_requote_buy(q, cmd.tick, st.cap, st.lpp_last_price)
+    if cmd.sl_premium is not None and price <= cmd.sl_premium + 1e-9:
+        st.closing = "PRICE_BELOW_STOP"                   # the market fell to ICARE's SL: signal invalid
+        events.append(_event("PRICE_BELOW_STOP", now_ms, price=price, sl=cmd.sl_premium))
+        _wind_down(st, now_ms, actions, events)
+        return
     order_id = f"{st.trade_id}-{len(st.orders) + 1}"
     qty = size * lot
     actions.append({"type": "PLACE", "order_id": order_id, "tradingsymbol": cmd.tradingsymbol,
@@ -226,6 +257,83 @@ def _drive(st: S.ExecState, q: Optional[Quote], ctx: Context, now_ms: int, cfg: 
     st.block_reason = ""
     events.append(_event("ORDER_PLACED", now_ms, order_id=order_id, price=price, lots=size, qty=qty,
                          bid=q.bid, ask=q.ask, spread_pct=round(q.spread_pct, 4), depth_units=depth_units))
+
+
+def band_requote_buy(q: Quote, tick: float, cap: float, rejected: float) -> float:
+    """
+    After a price-band (LPP) rejection never re-send the same limit: the band is centred on
+    the LTP, so quote at the LTP (or mid) clamped to [bid, cap], and at least a tick below the
+    refused price.
+    """
+    base = q.ltp if q.ltp and q.ltp > 0 else q.mid
+    px = min(max(floor_tick(base, tick), q.bid), cap)
+    return round(min(px, floor_tick(rejected - tick, tick)), 4)
+
+
+def band_requote_sell(q: Quote, tick: float, floor: float, rejected: float) -> float:
+    """SELL mirror: LTP (or mid) clamped to [floor, ask], at least a tick above the refused price."""
+    base = q.ltp if q.ltp and q.ltp > 0 else q.mid
+    px = max(min(ceil_tick(base, tick), q.ask), floor)
+    return round(max(px, ceil_tick(rejected + tick, tick)), 4)
+
+
+def set_broker_id(st, order_id: str, broker_id: str) -> None:
+    """Persist the broker's order id on the state (md:exec:state survives a restart)."""
+    if not broker_id:
+        return
+    if st.working and st.working.get("order_id") == order_id:
+        st.working["broker_id"] = broker_id
+    for o in st.orders:
+        if o["order_id"] == order_id:
+            o["broker_id"] = broker_id
+
+
+def action_failed(st, a: dict, why: str, now_ms: int, apply_fn=None):
+    """
+    The broker refused / could not confirm an action. Returns (state, events). Works for
+    entry (ExecState) and exit (ExitState) states — both keep `working` / `orders`.
+      PLACE  RETRY (local rate limit)  -> drop the order, the next step re-places it
+             UNKNOWN (timeout / conn.) -> PENDING_RECONCILE: the broker looks for our tag
+             REJECTED (definite)       -> a REJECTED update through the normal path
+      MODIFY -> the price did NOT change: revert, the ladder retries next interval
+      CANCEL -> re-send in about a second (the order may still be live)
+    """
+    st = copy.deepcopy(st)
+    events: List[dict] = []
+    w = st.working
+    oid = a.get("order_id")
+    if not w or w.get("order_id") != oid:
+        return st, events
+    t = a["type"]
+    if t == "PLACE":
+        kind = place_failure_kind(why)
+        if kind == "RETRY":
+            st.orders = [o for o in st.orders if o["order_id"] != oid]
+            st.working = None
+            st.block_reason = why
+            events.append(_event("PLACE_RETRY", now_ms, order_id=oid, reason=why))
+        elif kind == "UNKNOWN":
+            w["pending_reconcile"] = True
+            for o in st.orders:
+                if o["order_id"] == oid:
+                    o["status"] = "PENDING_RECONCILE"
+            events.append(_event("PLACE_UNKNOWN", now_ms, order_id=oid, reason=why))
+        else:
+            (apply_fn or _apply_updates)(st, [S.OrderUpdate(oid, "REJECTED", 0.0, None, why)], now_ms, events)
+    elif t == "MODIFY":
+        prev = a.get("prev_price")
+        if prev is not None:
+            w["price"] = prev
+            for o in st.orders:
+                if o["order_id"] == oid:
+                    o["last_price"] = prev
+                    o["modifies"] = max(o.get("modifies", 1) - 1, 0)
+        events.append(_event("MODIFY_FAILED", now_ms, order_id=oid, price=a.get("price"), kept=w["price"], reason=why))
+    elif t == "CANCEL":
+        w["cancel_sent"] = True
+        w["cancel_ms"] = now_ms - CANCEL_RESEND_MS + 1000
+        events.append(_event("CANCEL_FAILED", now_ms, order_id=oid, reason=why))
+    return st, events
 
 
 def _cancel(st: S.ExecState, now_ms: int, actions: List[dict], events: List[dict], why: str) -> None:
@@ -259,6 +367,7 @@ def _wind_down(st: S.ExecState, now_ms: int, actions: List[dict], events: List[d
         "PRICE_OUT_OF_BAND": S.PARTIAL_FILL_STOPPED if filled else S.ABORTED_PRICE_BAND,
         "BROKER_REJECTED": S.PARTIAL_FILL_STOPPED if filled else S.REJECTED_BY_BROKER,
         "RESTART": S.PARTIAL_FILL_STOPPED if filled else S.CANCELLED_TIMEOUT,
+        "PRICE_BELOW_STOP": S.PARTIAL_FILL_STOPPED if filled else S.CANCELLED_TIMEOUT,
     }.get(st.closing)
     if status is None:   # TIMEOUT
         if filled:
@@ -354,13 +463,22 @@ def exec_fields(rep: dict) -> dict:
     return out
 
 
-def recover_after_restart(st: S.ExecState) -> S.ExecState:
-    """Paper mode: an order that was working when the process died is treated as cancelled (fills kept)."""
+def recover_after_restart(st: S.ExecState, live: bool = False) -> S.ExecState:
+    """
+    Restart. Paper / shadow: a simulated order that was working when the process died is
+    treated as cancelled (fills kept). Live: the order may still rest at the exchange — keep it
+    as the working order and wind down: the next step sends a real CANCEL (the runner first
+    re-attaches its persisted broker id, or reconciles it by tag) and the final fills are
+    read from the order book before the report.
+    """
     st = copy.deepcopy(st)
     if st.status in S.TERMINAL:
         return st
     if st.working:
-        _close_order_record(st, st.working, "CANCELLED")
-        st.working = None
+        if live:
+            st.working["cancel_sent"] = False
+        else:
+            _close_order_record(st, st.working, "CANCELLED")
+            st.working = None
     st.closing = st.closing or "RESTART"
     return st

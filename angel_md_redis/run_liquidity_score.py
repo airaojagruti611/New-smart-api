@@ -47,7 +47,9 @@ from app.liquidity_score import (
     scale_out_decision,
     vol_oi_is_dropping,
 )
+from app.freshness import env_ms
 from app.logging_setup import setup_logger
+from app.order_flow import prune_stale_book, tick_ts_ms
 
 log = setup_logger("liquidity_score")
 
@@ -72,6 +74,9 @@ EVAL_INTERVAL_SEC = float(os.getenv("LIQUIDITY_SCORE_EVAL_INTERVAL_SEC", "3.0"))
 LATEST_TTL_SEC = int(os.getenv("LIQUIDITY_SCORE_LATEST_TTL_SEC", "3600"))
 HIST_TTL_SEC = int(os.getenv("LIQUIDITY_HIST_TTL_SEC", str(14 * 24 * 3600)))
 HIST_FLUSH_EVERY_EVALS = int(os.getenv("LIQUIDITY_HIST_FLUSH_EVERY", "10"))
+# Contracts / spot not updated within this window are pruned from the
+# in-memory chain instead of being republished with a fresh ts_ms.
+BOOK_MAX_AGE_MS = env_ms("LIQUIDITY_SCORE_BOOK_MAX_AGE_SEC", 120)
 
 SCRIPMASTER_PATH = Path(os.getenv("SCRIPMASTER_PATH") or (BASE_DIR / "OpenAPIScripMaster.json"))
 
@@ -191,7 +196,7 @@ def persist_hist(r: redis.Redis, hist: ContractDayHist, tsym: str) -> None:
 class ContractState:
     __slots__ = (
         "underlying", "cp", "strike", "oi_shares", "cum_vol_shares",
-        "bid_sizes_shares", "ltp", "lot_size",
+        "bid_sizes_shares", "ltp", "lot_size", "data_ts_ms",
     )
 
     def __init__(self):
@@ -203,6 +208,7 @@ class ContractState:
         self.bid_sizes_shares: List[float] = []
         self.ltp = 0.0
         self.lot_size = 0.0
+        self.data_ts_ms = 0  # source time (ts_exch -> ts_recv) of the last tick
 
     @property
     def oi(self) -> float:
@@ -234,6 +240,7 @@ def main() -> None:
     log.info("hydrated daily OI/volume hist for %d contracts", loaded)
 
     spot_by_sym: Dict[str, float] = {}
+    spot_ts_by_sym: Dict[str, int] = {}
     prev_spot_by_sym: Dict[str, float] = {}
     session_spot_by_sym: Dict[str, Tuple[str, float]] = {}
     last_of_bias: Dict[str, str] = {}
@@ -274,6 +281,7 @@ def main() -> None:
                         ltp = _safe_float(fields.get("ltp"))
                         if ltp:
                             spot_by_sym[sym] = ltp
+                            spot_ts_by_sym[sym] = tick_ts_ms(fields, int(time.time() * 1000)) or 0
                             today = dt.date.today().isoformat()
                             held = session_spot_by_sym.get(sym)
                             if not held or held[0] != today:
@@ -307,6 +315,7 @@ def main() -> None:
                     st.oi_shares, st.cum_vol_shares = oi, cum_vol
                     st.bid_sizes_shares, st.ltp = bid_sizes, ltp
                     st.lot_size = lot_by_tsym.get(tsym, 0.0)
+                    st.data_ts_ms = tick_ts_ms(fields, int(time.time() * 1000)) or 0
 
                     hist.observe(tsym, oi, cum_vol)
 
@@ -324,7 +333,13 @@ def main() -> None:
             evals_since_flush = 0
 
         for und, book in book_by_underlying.items():
+            dropped = prune_stale_book(book, now_ms, BOOK_MAX_AGE_MS)
+            if dropped:
+                log.debug("PRUNE underlying=%s stale_contracts=%s", und, dropped)
             spot = spot_by_sym.get(und)
+            spot_ts = spot_ts_by_sym.get(und, 0)
+            if BOOK_MAX_AGE_MS > 0 and (not spot_ts or now_ms - spot_ts > BOOK_MAX_AGE_MS):
+                spot = None
             if not spot or not book:
                 continue
 
@@ -486,7 +501,10 @@ def main() -> None:
                 )
 
                 payload = {
-                    "ts_ms": str(now_ms),
+                    # Source time of the data used (older of this contract's
+                    # last tick and the spot tick) — never processing time.
+                    "ts_ms": str(min(st.data_ts_ms, spot_ts)),
+                    "eval_ts_ms": str(now_ms),
                     "tradingsymbol": tsym,
                     "underlying": und,
                     "cp": st.cp,

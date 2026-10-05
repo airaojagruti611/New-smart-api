@@ -281,10 +281,10 @@ class AdaptersTest(unittest.TestCase):
         self.assertEqual(specs["TCS26OCT3000CE"]["freeze_qty"], 10501)
 
     def test_live_gate_without_static_ip(self):
-        gate = LiveGate("live", True, "", "1.2.3.4", True, 50_000)
+        gate = LiveGate("live", True, "", "1.2.3.4", True, 50_000, exit_path=True)
         self.assertEqual(gate.problems(), ["LIVE_BLOCKED_NO_STATIC_IP"])
         self.assertIn("EXEC_MODE_NOT_LIVE", LiveGate("paper", False, "", "", False, 0).problems())
-        self.assertEqual(LiveGate("live", True, "1.2.3.4", "1.2.3.4", True, 50_000).problems(), [])
+        self.assertEqual(LiveGate("live", True, "1.2.3.4", "1.2.3.4", True, 50_000, exit_path=True).problems(), [])
 
     def test_angel_broker_limit_day_only_and_reconcile(self):
         from app.order_executor.broker import AngelBroker

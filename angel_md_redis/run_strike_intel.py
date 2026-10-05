@@ -33,7 +33,8 @@ from typing import Dict, Optional
 import redis
 
 from app.config import GREEKS_DIVIDEND_YIELD, RISK_FREE_RATE, load_symbols
-from app.expected_move import as_annualized_decimal
+from app.expected_move import iv_from_percent  # greeks-phase `iv` is PERCENT
+from app.freshness import env_ms, is_fresh_ts, stream_id_ms, ts_field_ms
 from app.logging_setup import setup_logger
 from app.option_pricing import IST, time_to_expiry_years
 from app.probability_engine import normalize_side
@@ -62,6 +63,9 @@ MIN_LIQUIDITY = float(os.getenv("SIE_MIN_LIQUIDITY", "70"))
 MAX_SPREAD_PCT = float(os.getenv("SIE_MAX_SPREAD_PCT", "3.0"))
 TOP_N = int(os.getenv("SIE_TOP_N", "3"))
 COOLDOWN_MS = int(os.getenv("STRIKE_INTEL_COOLDOWN_MS", "60000"))
+# The group starts at "0": a backlog of md:entry:trigger must not become new
+# strike picks. Same limit as entry_trigger (ENTRY_MAX_SIGNAL_AGE_SEC).
+MAX_SIGNAL_AGE_MS = env_ms("STRIKE_INTEL_MAX_SIGNAL_AGE_SEC", 120)
 
 # Entry-trigger fields echoed downstream for the Probability runner.
 ECHO_FIELDS = (
@@ -71,6 +75,22 @@ ECHO_FIELDS = (
 )
 
 log = setup_logger("strike_intel")
+
+
+def trigger_origin_ms(msg_id, fields: dict) -> Optional[int]:
+    """Origin time of an entry trigger: the earlier of its stream-id ms and the
+    break bar's ``bar_ts_ms``. Published downstream as ``signal_ts_ms`` so
+    probability / ranking / ICARE / executor age the chain from the break."""
+    times = [t for t in (stream_id_ms(msg_id), ts_field_ms(fields, "bar_ts_ms"),
+                         ts_field_ms(fields, "signal_ts_ms")) if t]
+    return min(times) if times else None
+
+
+def trigger_is_stale(msg_id, fields: dict, now_ms: int, max_age_ms: int = MAX_SIGNAL_AGE_MS) -> bool:
+    """Unknown origin fails closed; ``max_age_ms <= 0`` disables the check."""
+    if max_age_ms <= 0:
+        return False
+    return not is_fresh_ts(trigger_origin_ms(msg_id, fields), now_ms, max_age_ms)
 
 
 def ensure_group(r: redis.Redis, stream: str, group: str) -> None:
@@ -146,7 +166,7 @@ def load_candidate(r: redis.Redis, contract: dict, lot_sizes: Dict[str, float]) 
         gamma=_safe_float(g.get("gamma")),
         theta_per_day=_safe_float(g.get("theta")),
         vega_per_point=_safe_float(g.get("vega")),
-        iv=as_annualized_decimal(_safe_float(g.get("iv"))),
+        iv=iv_from_percent(_safe_float(g.get("iv"))),
         greeks_source=str(g.get("greeks_source") or ""),
         liquidity_score=_safe_float(lq.get("liquidity_score")),
         liquidity_band=str(lq.get("liquidity_band") or ""),
@@ -266,6 +286,10 @@ def main():
                     log.debug("SKIP not_buy_signal symbol=%s signal=%s", sym, signal)
                     continue
 
+                if trigger_is_stale(msg_id, fields, now_ms):
+                    log.info("SKIP stale_signal symbol=%s id=%s bar_ts_ms=%s", sym, msg_id, fields.get("bar_ts_ms"))
+                    continue
+
                 prev = last_emit_ms.get(sym)
                 if prev is not None and (now_ms - prev) < COOLDOWN_MS:
                     log.info("SKIP cooldown symbol=%s age_ms=%s", sym, now_ms - prev)
@@ -305,6 +329,8 @@ def main():
 
                 res = rank_strikes(window, ctx, cfg)
                 payload = build_payload(res, fields, str(expiry), now_ms, em)
+                origin = trigger_origin_ms(msg_id, fields)
+                payload["signal_ts_ms"] = "" if origin is None else str(origin)
 
                 log.info(
                     "LOGIC symbol=%s status=%s side=%s phase=%s band=%s em=%s best=%s score=%s conf=%s "

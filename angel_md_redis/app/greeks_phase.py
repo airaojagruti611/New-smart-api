@@ -201,9 +201,10 @@ class GreeksPhaseTracker:
         )
         theta_surging = theta_pct is not None and abs(theta_pct) >= self.theta_surge_pct
         price_small = price_change_pct is not None and abs(price_change_pct) < self.price_small_pct
-        # breakout is optional context (price vs pivot); when the caller
-        # doesn't have it, None means "not evaluated" -> doesn't block entry.
-        breakout_ok = True if breakout is None else breakout
+        # Spec §7.4 "price > previous resistance" is a REQUIRED Markup leg.
+        # breakout=None (pivots/spot unavailable) is "not evaluated" and must
+        # NOT be treated as a breakout -> no entry, reason says so.
+        breakout_ok = breakout is True
         in_delta_band = self.delta_entry_min <= abs_delta <= self.delta_entry_max
 
         reasons = []
@@ -228,26 +229,20 @@ class GreeksPhaseTracker:
                 reasons.append("in_trade_no_exit_trigger")
 
         elif in_delta_band and gamma_rising and iv_rising and breakout_ok:
+            # Spec §7.4 Markup: 0.5<=|delta|<=0.8 AND gamma increasing AND
+            # iv rising AND price beyond previous resistance (CE: > R1,
+            # PE: < S1). All four legs required; no delta-only shortcut.
             phase = "MARKUP"
             action = "BUY CALL" if cp == "CE" else ("BUY PUT" if cp == "PE" else "HOLD")
             self._in_markup = True
             reasons.append("delta_in_range+gamma_rising+iv_rising+breakout")
+            if delta_rising:
+                reasons.append("delta_rising")
 
-        elif (
-            in_delta_band
-            and breakout_ok
-            and delta_rising
-            and not gamma_falling
-            and not iv_dropping_sharply
-            and len(abs_delta_hist) >= DELTA_CONV_MIN_SAMPLES
-        ):
-            # Word-doc Markup: "steadily increasing call Delta" (PE mirrored on |delta|).
-            # Lets theoretical/local Greeks enter Markup when tick-to-tick gamma/IV
-            # % is ~0 but directional conviction is building with spot.
-            phase = "MARKUP"
-            action = "BUY CALL" if cp == "CE" else ("BUY PUT" if cp == "PE" else "HOLD")
-            self._in_markup = True
-            reasons.append("delta_in_range+delta_rising+breakout")
+        elif in_delta_band and gamma_rising and iv_rising and breakout is None:
+            # Every Greek leg met but the price leg could not be evaluated.
+            phase, action = "NEUTRAL", "HOLD"
+            reasons.append("markup_greeks_met+breakout_unavailable")
 
         elif (
             gamma <= self.gamma_low

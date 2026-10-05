@@ -185,8 +185,9 @@ class ConfidenceTest(unittest.TestCase):
 
 class AdapterTest(unittest.TestCase):
     def test_iv_percent_and_decimal(self):
-        self.assertEqual(as_annualized_decimal(18.5), 0.185)
-        self.assertEqual(as_annualized_decimal(0.185), 0.185)
+        # Units are declared by the source, never guessed from magnitude.
+        self.assertEqual(as_annualized_decimal(18.5, "percent"), 0.185)
+        self.assertEqual(as_annualized_decimal(0.185, "decimal"), 0.185)
 
     def test_trend_combine(self):
         self.assertEqual(classify_pct_trend(12.0, 10.0), "up")

@@ -201,7 +201,10 @@ def implied_vol(
 ) -> Optional[float]:
     """
     Invert bs_price_greeks for IV (annualized decimal) given a market premium.
-    Returns None when the quote cannot be solved (non-positive inputs / expired).
+    Returns None when the quote cannot be solved: non-positive inputs /
+    expired, or the premium lies outside the open (price(lo), price(hi))
+    bracket (below intrinsic/no-arb lower bound or above the sigma=hi price).
+    Never returns the bracket bounds as a fake IV.
     """
     try:
         s, k, p = float(spot), float(strike), float(premium)
@@ -217,22 +220,31 @@ def implied_vol(
         ).premium
 
     p_lo, p_hi = _px(lo), _px(hi)
-    if p <= p_lo:
-        return lo
-    if p >= p_hi:
-        return hi
+    # No-solution quotes: premium at/below the sigma->0 price (the no-arb
+    # lower bound, e.g. CE S - K*e^-rT) or at/above the sigma=hi price.
+    # Returning the bracket bound here used to fabricate IV 0.01% / 500%
+    # (and delta 1.0 / garbage Greeks). No solution -> None -> NO_DATA.
+    if p <= p_lo or p >= p_hi:
+        return None
 
     a, b = lo, hi
+    sol = None
     for _ in range(max_iter):
         mid = 0.5 * (a + b)
         pm = _px(mid)
         if abs(pm - p) < tol:
-            return mid
+            sol = mid
+            break
         if pm < p:
             a = mid
         else:
             b = mid
-    return 0.5 * (a + b)
+    if sol is None:
+        sol = 0.5 * (a + b)
+    # A root pinned against either bracket edge is not a usable IV.
+    if sol <= lo * (1.0 + 1e-3) or sol >= hi * (1.0 - 1e-3):
+        return None
+    return sol
 
 
 def greeks_from_market_premium(

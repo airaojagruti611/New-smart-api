@@ -37,7 +37,9 @@ from typing import Dict, List, Optional
 import redis
 
 from app.config import load_symbols
+from app.freshness import env_ms, is_fresh_payload
 from app.logging_setup import setup_logger
+from app.order_flow import newest_data_ts, prune_stale_book, tick_ts_ms
 from app.strike_flow import (
     PutCallRatioTracker,
     StrikeCandidate,
@@ -66,6 +68,11 @@ CONSUMER = os.getenv("STRIKEFLOW_CONSUMER", "strikeflow-1")
 EVAL_INTERVAL_SEC = float(os.getenv("STRIKEFLOW_EVAL_INTERVAL_SEC", "3.0"))
 REFRESH_MIN_OBSERVATIONS = int(os.getenv("STRIKEFLOW_REFRESH_MIN_OBS", "3"))
 LATEST_TTL_SEC = int(os.getenv("STRIKEFLOW_LATEST_TTL_SEC", "3600"))
+# Contracts / spot not updated within this window are dropped from the
+# in-memory chain instead of being republished as if fresh.
+BOOK_MAX_AGE_MS = env_ms("STRIKEFLOW_BOOK_MAX_AGE_SEC", 120)
+# A smart-money sweep only confirms a strike while its doc is this fresh.
+SWEEP_MAX_AGE_MS = env_ms("STRIKEFLOW_SWEEP_MAX_AGE_SEC", 30)
 
 log = setup_logger("strike_flow")
 
@@ -99,7 +106,7 @@ def _load_json(r: redis.Redis, key: str) -> Optional[dict]:
 
 
 class ContractState:
-    __slots__ = ("strike", "cp", "vol", "oi", "bid", "ask")
+    __slots__ = ("strike", "cp", "vol", "oi", "bid", "ask", "data_ts_ms")
 
     def __init__(self):
         self.strike: float = 0.0
@@ -108,6 +115,7 @@ class ContractState:
         self.oi: float = 0.0
         self.bid: float = 0.0
         self.ask: float = 0.0
+        self.data_ts_ms: int = 0  # source time (ts_exch -> ts_recv) of the last tick
 
 
 class RefreshMemory:
@@ -143,6 +151,7 @@ def main() -> None:
     ensure_group(r, OPT_STREAM, GROUP)
 
     spot_by_sym: Dict[str, float] = {}
+    spot_ts_by_sym: Dict[str, int] = {}
     contracts_by_underlying: Dict[str, Dict[str, ContractState]] = {}
     pcr_tracker: Dict[str, PutCallRatioTracker] = {}
     refresh_memory: Dict[str, RefreshMemory] = {}
@@ -176,6 +185,7 @@ def main() -> None:
                         ltp = _safe_float(fields.get("ltp"))
                         if ltp:
                             spot_by_sym[sym] = ltp
+                            spot_ts_by_sym[sym] = tick_ts_ms(fields, int(time.time() * 1000)) or 0
                         continue
 
                     # opt tick
@@ -195,6 +205,7 @@ def main() -> None:
                     st = book.setdefault(tsym, ContractState())
                     st.strike, st.cp, st.vol, st.oi = strike, cp, vol, oi
                     st.bid, st.ask = bid, ask
+                    st.data_ts_ms = tick_ts_ms(fields, int(time.time() * 1000)) or 0
 
                 if ack_ids:
                     r.xack(stream, GROUP, *ack_ids)
@@ -206,9 +217,18 @@ def main() -> None:
         now_ms = int(now * 1000)
 
         for und, book in contracts_by_underlying.items():
+            dropped = prune_stale_book(book, now_ms, BOOK_MAX_AGE_MS)
+            if dropped:
+                log.debug("PRUNE underlying=%s stale_contracts=%s", und, dropped)
             spot = spot_by_sym.get(und)
+            spot_ts = spot_ts_by_sym.get(und, 0)
+            if BOOK_MAX_AGE_MS > 0 and (not spot_ts or now_ms - spot_ts > BOOK_MAX_AGE_MS):
+                spot = None  # stale spot -> ATM/moneyness would be wrong
             if not spot or not book:
                 continue
+            # Published ts_ms = SOURCE data time (newest contract tick, capped
+            # by the spot tick time), not processing time.
+            data_ts = min(newest_data_ts(book.values()) or 0, spot_ts)
 
             strikes = sorted({st.strike for st in book.values() if st.strike > 0})
             if not strikes:
@@ -238,7 +258,10 @@ def main() -> None:
 
                 sm_doc = _load_json(r, f"{SMARTMONEY_LATEST_PREFIX}{tsym}") or {}
                 sweep_signal = str(sm_doc.get("sweep_signal") or "NONE")
-                sweep_confirmed = str(sm_doc.get("sweep_confirmed") or "0") == "1"
+                sweep_confirmed = (
+                    str(sm_doc.get("sweep_confirmed") or "0") == "1"
+                    and is_fresh_payload(sm_doc, now_ms, SWEEP_MAX_AGE_MS)
+                )
 
                 ba_doc = _load_json(r, f"{BIDASK_LATEST_PREFIX}{tsym}") or {}
                 spread_pct = _safe_float(ba_doc.get("spread_pct")) or 0.0
@@ -282,7 +305,8 @@ def main() -> None:
             )
 
             payload = {
-                "ts_ms": str(now_ms),
+                "ts_ms": str(data_ts),
+                "eval_ts_ms": str(now_ms),
                 "underlying": und,
                 "spot": f"{spot:.2f}",
                 "atm": f"{atm:.2f}",
