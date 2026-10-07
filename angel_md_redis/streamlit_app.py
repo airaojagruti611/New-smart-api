@@ -11,6 +11,16 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import streamlit as st
 
+# On Streamlit Community Cloud, settings (REDIS_URL, DASHBOARD_PASSWORD) come
+# from the app's Secrets instead of .env. Expose them as environment variables
+# before app.config reads the environment.
+try:
+    for _k, _v in st.secrets.items():
+        if isinstance(_v, (str, int, float)) and not os.getenv(_k):
+            os.environ[_k] = str(_v)
+except Exception:
+    pass  # no secrets.toml: local run, .env is used
+
 from app.dashboard_data import (
     age_sec,
     collect_symbol,
@@ -222,7 +232,12 @@ with st.sidebar:
     if st.button("Refresh now", use_container_width=True):
         st.rerun()
     st.divider()
-    if health.get("ok"):
+    mirror_age = health.get("mirror_age_s")
+    if health.get("ok") and mirror_age is not None and mirror_age > 60:
+        # Cloud copy: the PC pipeline (or its mirror) stopped sending.
+        st.markdown(_pill("PC DATA PAUSED", "empty"), unsafe_allow_html=True)
+        st.caption(f"Last sync from the pipeline PC {mirror_age / 60:.0f} min ago")
+    elif health.get("ok"):
         st.markdown(_pill("REDIS LIVE", "ok"), unsafe_allow_html=True)
         st.caption(f"EQ ticks {health['eq']:,} · OPT {health['opt']:,} · 1m candles {health['c1m']:,}")
         st.caption(f"Greeks snap {health['greeks']:,}")

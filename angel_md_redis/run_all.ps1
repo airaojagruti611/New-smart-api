@@ -125,6 +125,16 @@ Start-Worker "greeks_change" "run_greeks_change.py"
 # --- Archiver: all Angel One + layer streams -> data_lake/*.parquet ---
 Start-Worker "arch_layers" "run_archiver_layers.py" "all"
 
+# --- Copy dashboard inputs to a cloud Redis (for Streamlit Community Cloud) ---
+# Only when CLOUD_REDIS_URL is set (environment or .env).
+$HasCloudRedis = [bool]$env:CLOUD_REDIS_URL
+if (-not $HasCloudRedis -and (Test-Path "$PSScriptRoot\.env")) {
+    $HasCloudRedis = [bool](Select-String -Path "$PSScriptRoot\.env" -Pattern '^\s*CLOUD_REDIS_URL\s*=\s*\S' -Quiet)
+}
+if ($HasCloudRedis) {
+    Start-Worker "cloud_mirror" "run_cloud_mirror.py"
+}
+
 # --- Live Streamlit UI — set START_DASHBOARD=0 to skip ---
 # Binds to 127.0.0.1 by default; share it via Cloudflare Tunnel, not the LAN.
 $DashPort = if ($env:DASHBOARD_PORT) { $env:DASHBOARD_PORT } else { "8501" }

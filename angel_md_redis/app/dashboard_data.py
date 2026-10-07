@@ -10,6 +10,38 @@ import redis
 
 from app.config import REDIS_URL, load_symbols
 
+# Everything this module reads, for run_cloud_mirror.py (keeps a hosted copy of
+# the dashboard's inputs in a small cloud Redis). Update both together.
+MIRROR_KEY_PATTERNS = [
+    "md:supertrend:bias:latest:*",
+    "md:ema:cross:latest:*",
+    "md:htf:trend:latest:*",
+    "md:pivots:prevday:*",
+    "md:level:entry:latest:*",
+    "md:momentum:confirm:latest:*",
+    "md:regime:latest",
+    "md:volume:latest",
+    "md:bidask:latest:*",
+    "md:smartmoney:latest:*",
+    "md:orderflow:latest:*",
+    "md:imbalance:latest:*",
+    "md:stockflow:latest:*",
+    "md:composite:latest:*",
+    "md:oi:underlying:latest:*",
+    "md:greeks:phase:underlying:latest:*",
+    "md:strikeflow:latest:*",
+    "md:expected_move:latest:*",
+    "md:entry:trigger:latest:*",
+    "md:capital:alloc:latest:*",
+    "md:strike:select:latest:*",
+    "md:liquidity:score:latest:*",
+    "md:greeks_change:latest:*",
+]
+MIRROR_HASHES = ["md:active_expiry"]
+MIRROR_STREAMS = ["md:ticks:eq", "md:candles:1m", "md:candles:5m", "md:candles:10m", "md:candles:30m"]
+# The mirror stores the source's real stream sizes here (the copy is trimmed).
+MIRROR_HEALTH_KEY = "md:mirror:health"
+
 
 def connect() -> redis.Redis:
     return redis.Redis.from_url(REDIS_URL, decode_responses=True)
@@ -127,6 +159,11 @@ def collect_symbol(r: redis.Redis, sym: str) -> Dict[str, Any]:
 def redis_health(r: redis.Redis) -> Dict[str, Any]:
     try:
         r.ping()
+        mirrored = load_json(r, MIRROR_HEALTH_KEY)
+        if isinstance(mirrored, dict):
+            # Reading a cloud copy: report the PC pipeline's real counts.
+            return {"ok": True, **{k: mirrored.get(k, 0) for k in ("eq", "opt", "c1m", "greeks", "keys")},
+                    "mirror_age_s": age_sec(mirrored)}
         return {
             "ok": True,
             "eq": int(r.xlen("md:ticks:eq") or 0),

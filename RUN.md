@@ -335,6 +335,28 @@ This gives an HTTPS link like `https://dash.yourdomain.com` without opening rout
 
 Keep `DASHBOARD_PASSWORD` set as a second layer.
 
+### Host on Streamlit Community Cloud
+
+The dashboard runs on share.streamlit.io and reads a small cloud Redis. The pipeline and its full Redis stay on your PC. `run_cloud_mirror.py` copies only what the dashboard reads (latest signals, the last 1000 ticks/candles per stream, and the PC's stream sizes) every 5 seconds, which is about 1 MB.
+
+1. **Cloud Redis.** Create a free database at redis.io/try-free (Redis Cloud, 30 MB). From its *Connect* panel, copy the public endpoint and the default user's password.
+2. **Mirror on the PC.** Add this to `angel_md_redis\.env`:
+   ```env
+   CLOUD_REDIS_URL=redis://default:<password>@<endpoint-host>:<port>
+   ```
+   `run_all.ps1` / `run_all.sh` then start the `cloud_mirror` worker with the pipeline, and `stop_all` stops it. To try it alone: `python run_cloud_mirror.py`. It logs `[MIRROR] ok ...` once a minute.
+3. **Deploy.** share.streamlit.io → *Create app* → *Deploy a public app from GitHub* → repository `airaojagruti611/New-smart-api`, the branch you want, main file `angel_md_redis/streamlit_app.py`. Your GitHub account needs access to the repo, and Streamlit must be allowed to read it.
+   - *Advanced settings* → Python **3.11** (matches `requirements.txt`).
+   - *Secrets*:
+     ```toml
+     REDIS_URL = "redis://default:<password>@<endpoint-host>:<port>"
+     DASHBOARD_PASSWORD = "<something long>"
+     ```
+     The app copies these into environment variables at start-up, and Secrets win over `.env`.
+4. **Who can open it.** Anyone with the link reaches the password prompt. Streamlit's own *Share* settings can also limit viewers to invited emails.
+
+While the pipeline is stopped, the hosted dashboard shows the last copied data, and the sidebar shows **PC DATA PAUSED** with the time of the last sync. Streamlit puts apps with no visitors to sleep after a while; opening the link wakes them up.
+
 ---
 
 ## Pipeline order (dependency map)
