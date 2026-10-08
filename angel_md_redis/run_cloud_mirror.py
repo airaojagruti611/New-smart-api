@@ -39,6 +39,9 @@ CLOUD_REDIS_URL = env_str("CLOUD_REDIS_URL")
 INTERVAL_SEC = env_int("MIRROR_INTERVAL_SEC", 5)
 STREAM_LEN = env_int("MIRROR_STREAM_LEN", 1000)
 KEY_TTL_SEC = env_int("MIRROR_KEY_TTL_SEC", 7 * 24 * 3600)  # when the source key has no TTL
+# Free cloud databases have no persistence and can come back empty after a
+# restart; periodically forget what was sent so everything is written again.
+RESYNC_SEC = env_int("MIRROR_RESYNC_SEC", 300)
 
 
 def _id_tuple(stream_id: str) -> tuple:
@@ -59,6 +62,7 @@ class Mirror:
         self.dst = dst
         self.sent: Dict[str, str] = {}           # key -> last value written
         self.last_id: Dict[str, Optional[str]] = {}  # stream -> last ID copied
+        self.synced_at = time.time()
 
     def _copy_keys(self) -> int:
         keys: list[str] = []
@@ -150,6 +154,10 @@ class Mirror:
         self.dst.set(MIRROR_HEALTH_KEY, json.dumps(health, separators=(",", ":")), ex=KEY_TTL_SEC)
 
     def cycle(self) -> Dict[str, int]:
+        if time.time() - self.synced_at >= RESYNC_SEC:
+            self.sent.clear()      # rewrite every key once
+            self.last_id.clear()   # re-read each stream's tail from the cloud copy
+            self.synced_at = time.time()
         keys = self._copy_keys()
         self._copy_hashes()
         rows = self._copy_streams()
