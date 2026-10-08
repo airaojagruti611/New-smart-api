@@ -4,12 +4,23 @@
 from __future__ import annotations
 
 import datetime as dt
+import hmac
 import json
 import os
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
+
+# On Streamlit Community Cloud, settings (REDIS_URL, DASHBOARD_PASSWORD) come
+# from the app's Secrets instead of .env. Expose them as environment variables
+# before app.config reads the environment.
+try:
+    for _k, _v in st.secrets.items():
+        if isinstance(_v, (str, int, float)) and not os.getenv(_k):
+            os.environ[_k] = str(_v)
+except Exception:
+    pass  # no secrets.toml: local run, .env is used
 
 from app import dashboard_data as dd
 from app.dashboard_data import (
@@ -38,6 +49,27 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+def _require_password() -> None:
+    """Shared-password gate for when the dashboard is reachable from outside.
+
+    Set DASHBOARD_PASSWORD in .env to enable; unset = open (local use).
+    """
+    expected = os.getenv("DASHBOARD_PASSWORD", "")
+    if not expected or st.session_state.get("auth_ok"):
+        return
+    st.markdown("### Option Rider")
+    pw = st.text_input("Password", type="password")
+    if pw:
+        if hmac.compare_digest(pw.encode(), expected.encode()):
+            st.session_state["auth_ok"] = True
+            st.rerun()
+        st.error("Wrong password.")
+    st.stop()
+
+
+_require_password()
 
 CSS = """
 <style>

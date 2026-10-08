@@ -5,7 +5,7 @@ from collections import defaultdict, deque
 
 import redis
 
-from app.candle_io import parse_candle_fields, read_last_candles, upsert_candle_window
+from app.candle_io import parse_candle_fields, read_last_candles_multi, upsert_candle_window
 from app.candle_types import Candle
 from app.config import load_symbols
 from app.logging_setup import setup_logger
@@ -81,11 +81,13 @@ def main():
         len(symbols),
     )
 
+    # One backwards walk per timeframe for all symbols (streams interleave them).
+    seed = {tf: read_last_candles_multi(r, stream, list(symbols), WINDOW) for tf, stream in by_tf.items()}
     now_ms = int(time.time() * 1000)
     for sym in symbols:
         bar_counts = {}
         for tf, stream in by_tf.items():
-            bars = read_last_candles(r, stream, sym, WINDOW)
+            bars = seed[tf].get(sym.upper(), [])
             if bars:
                 windows[tf][sym].extend(bars)
             bar_counts[tf] = len(windows[tf][sym])

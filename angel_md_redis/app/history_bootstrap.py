@@ -22,7 +22,7 @@ from .candle_builder import (
     session_completed,
     session_date_ist,
 )
-from .candle_io import existing_ts_set, read_symbol_candles, stream_symbol_ts
+from .candle_io import existing_ts_set, read_last_candles_multi, read_symbol_candles, stream_symbol_ts
 from .candle_types import Candle
 from .candles_store import CandlesStore
 from .config import load_symbols
@@ -225,12 +225,11 @@ def pick_pivot_source(bars: Sequence[Candle], now_ms: int) -> Optional[Candle]:
 
 def seed_pivots_from_daily(r: redis.Redis, symbols: Sequence[str], store: Optional[CandlesStore] = None) -> int:
     """Write today's prev-day pivots from the latest closed 1d bar per symbol."""
-    from .candle_io import read_last_candles
-
     store = store or CandlesStore()
     written = 0
+    last_bars = read_last_candles_multi(r, STREAM_1D, list(symbols), 5)
     for sym in symbols:
-        bars = read_last_candles(r, STREAM_1D, sym, limit=5, scan=8000)
+        bars = last_bars.get(sym.upper(), [])
         src = pick_pivot_source(bars, int(time.time() * 1000))
         if src is None:
             continue
@@ -353,6 +352,49 @@ def _fallback_candles(sym: str, tf: str) -> Tuple[List[Candle], str]:
     return [], "public empty"
 
 
+def _topup_daily(
+    r: redis.Redis,
+    symbols: Sequence[str],
+    cache: Dict[str, Dict[str, Set[int]]],
+) -> int:
+    """
+    Add missing completed daily bars from the public sources. The live
+    publisher only writes a day's bar if it is still running at the close
+    (+ grace), and the full seed only runs when a stream is short, so a day
+    missed by stopping at 15:30 would otherwise stay missing and pivots would
+    come from an older session. One request per symbol that is behind; dates
+    that already have a bar are left alone.
+    """
+    now = int(time.time() * 1000)
+    last_day = _now_ist().date()
+    while not (last_day.weekday() < 5 and session_completed(last_day, now)):
+        last_day -= dt.timedelta(days=1)
+    idx = _ts_index(r, STREAM_1D, cache)
+    store = CandlesStore()
+    added = 0
+    for sym in symbols:
+        existing = idx.setdefault(sym.upper(), set())
+        days = {session_date_ist(t) for t in existing}
+        if days and max(days) >= last_day:
+            continue  # up to date (holidays just fetch and add nothing)
+        try:
+            candles, src = _fallback_candles(sym, "1d")
+        except Exception as e:
+            print(f"[HISTORY] daily top-up {sym} failed: {e!r}")
+            continue
+        if not candles:
+            print(f"[HISTORY] daily top-up {sym}: no data ({src})")
+            continue
+        candles = [normalize_bar_ts(c, "1d", source=src) for c in candles]
+        candles = [c for c in candles if session_date_ist(c.ts_ms) not in days]
+        n = _write_candles(r, store, STREAM_1D, OUT_MAXLEN_1D, sym, "1d", candles,
+                           skip_today=True, existing=existing)
+        if n:
+            print(f"[HISTORY] daily top-up {sym}: added {n} bars via {src}")
+        added += n
+    return added
+
+
 def _seed_htf_from_1m(
     r: redis.Redis,
     store: CandlesStore,
@@ -405,9 +447,10 @@ def seed_history(
 
     cache: Dict[str, Dict[str, Set[int]]] = {}
     if not force and not _needs_seed(r, symbols, cache):
+        added = _topup_daily(r, symbols, cache)
         n = seed_pivots_from_daily(r, symbols)
-        print(f"[HISTORY] skip fetch: daily candles already present; pivots_written={n}")
-        return {"skipped": 1, "pivots": n}
+        print(f"[HISTORY] skip full fetch: candles already present; daily_topup={added} pivots_written={n}")
+        return {"skipped": 1, "daily_topup": added, "pivots": n}
 
     auth_token = None
     tokens: Dict[str, dict] = {}

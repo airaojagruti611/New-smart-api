@@ -169,6 +169,11 @@ start "greeks_change" python3 run_greeks_change.py
 # 4) One parquet archiver: Angel One + all layer streams -> data_lake/stream=.../dt=YYYY-MM-DD/...
 start "arch_layers" python3 run_archiver_layers.py all
 
+# 4b) Copy dashboard inputs to a cloud Redis (Streamlit Community Cloud) when configured
+if [[ -n "${CLOUD_REDIS_URL:-}" ]] || grep -qE '^\s*CLOUD_REDIS_URL\s*=\s*\S' .env 2>/dev/null; then
+  start "cloud_mirror" python3 run_cloud_mirror.py
+fi
+
 # 5) Live Streamlit UI (http://127.0.0.1:8501) — set START_DASHBOARD=0 to skip
 if [[ "${START_DASHBOARD:-1}" != "0" ]]; then
   start "dashboard" streamlit run streamlit_app.py \

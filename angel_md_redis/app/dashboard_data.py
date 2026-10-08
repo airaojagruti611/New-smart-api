@@ -31,6 +31,39 @@ except Exception:  # pragma: no cover
         return []
 
 
+# Keys/streams run_cloud_mirror.py copies to a cloud Redis for a hosted
+# dashboard. Covers the indicator/microstructure layers only, not the
+# execution / TSL / journal / ranking panels.
+MIRROR_KEY_PATTERNS = [
+    "md:supertrend:bias:latest:*",
+    "md:ema:cross:latest:*",
+    "md:htf:trend:latest:*",
+    "md:pivots:prevday:*",
+    "md:level:entry:latest:*",
+    "md:momentum:confirm:latest:*",
+    "md:regime:latest",
+    "md:volume:latest",
+    "md:bidask:latest:*",
+    "md:smartmoney:latest:*",
+    "md:orderflow:latest:*",
+    "md:imbalance:latest:*",
+    "md:stockflow:latest:*",
+    "md:composite:latest:*",
+    "md:oi:underlying:latest:*",
+    "md:greeks:phase:underlying:latest:*",
+    "md:strikeflow:latest:*",
+    "md:expected_move:latest:*",
+    "md:entry:trigger:latest:*",
+    "md:capital:alloc:latest:*",
+    "md:strike:select:latest:*",
+    "md:liquidity:score:latest:*",
+    "md:greeks_change:latest:*",
+]
+MIRROR_HASHES = ["md:active_expiry"]
+MIRROR_STREAMS = ["md:ticks:eq", "md:candles:1m", "md:candles:5m", "md:candles:10m", "md:candles:30m"]
+MIRROR_HEALTH_KEY = "md:mirror:health"
+
+
 def _env(name: str, default: str) -> str:
     return os.getenv(name, default)
 

@@ -116,6 +116,7 @@ class OptionsGreeksJoiner:
         self._spot: Dict[str, float] = {}
         self._spot_ts: Dict[str, int] = {}  # source time (stream id ms) of cached spot
         self._spot_t: float = 0.0
+        self._spot_last_id: Optional[str] = None
 
     def _load_greeks_map(self, underlying: str, expiry: str) -> Dict[str, Dict[str, Any]]:
         """
@@ -189,9 +190,18 @@ class OptionsGreeksJoiner:
         if (now - self._spot_t) < SPOT_REFRESH_SEC:
             return
         try:
-            rows = self.r.xrevrange(EQ_STREAM, count=40)
+            # Every equity tick since the last refresh: a fixed newest-N window
+            # misses most symbols once many are collected, and their spots
+            # then age past SPOT_MAX_AGE_SEC.
+            last_id = getattr(self, "_spot_last_id", None)
+            if last_id is None:
+                rows = list(reversed(self.r.xrevrange(EQ_STREAM, count=20000)))
+            else:
+                rows = self.r.xrange(EQ_STREAM, min=f"({last_id}", count=50000)
         except Exception:
             return
+        if rows:
+            self._spot_last_id = rows[-1][0]
         for mid, fields in rows:
             sym = str(fields.get("symbol") or "").strip().upper()
             ltp = _safe_float(fields.get("ltp"))

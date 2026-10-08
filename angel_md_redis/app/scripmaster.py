@@ -116,8 +116,11 @@ def resolve_eq_tokens(df: pd.DataFrame, symbols: List[str]) -> Dict[str, Dict[st
             r = hit.iloc[0]
             out[s] = {"tradingsymbol": r["symbol"], "token": str(r["token"]), "exchange": "NSE"}
         else:
-            # fallback: startwith and endswith -EQ
-            hit2 = d[d["sym_u"].str.startswith(s) & d["sym_u"].str.endswith("-EQ")]
+            # Fallback: same base symbol in another series (e.g. HFCL-BE for
+            # trade-to-trade stocks). Exact base match only: a prefix match
+            # would map PNB to PNBHOUSING.
+            hit2 = d[d["sym_u"].str.split("-").str[0] == s]
+            hit2 = hit2[hit2["sym_u"].str.endswith(("-EQ", "-BE", "-BZ"))]
             if not hit2.empty:
                 r = hit2.iloc[0]
                 out[s] = {"tradingsymbol": r["symbol"], "token": str(r["token"]), "exchange": "NSE"}
@@ -166,6 +169,24 @@ def filter_underlying(d: pd.DataFrame, underlying: str) -> pd.DataFrame:
     return d[by_name | by_sym]
 
 
+def _option_rows(df: pd.DataFrame, underlying: str) -> pd.DataFrame:
+    """
+    filter_underlying() over the NFO option rows, cached on the frame: the
+    producer plans every symbol (twice with the wide tier), and re-filtering
+    the full ScripMaster each time blocks the websocket callback for seconds.
+    """
+    cache = df.attrs.get("_opt_rows")
+    if cache is None:
+        nfo = df[(df["exch_seg"] == "NFO") & (df["instrumenttype"].str.contains("OPT", na=False))].copy()
+        nfo["sym_u"] = nfo["symbol"].str.upper()
+        cache = {"_all": nfo}
+        df.attrs["_opt_rows"] = cache
+    u = str(underlying or "").strip().upper()
+    if u not in cache:
+        cache[u] = filter_underlying(cache["_all"], u)
+    return cache[u]
+
+
 def build_atm_option_tokens(
     df: pd.DataFrame,
     underlying: str,
@@ -177,12 +198,10 @@ def build_atm_option_tokens(
       - list of {token, tradingsymbol, underlying, expiry, strike, cp, exchange}
       - expiry_str like '2026-01-27' for greeks poller
     """
-    d = df[(df["exch_seg"] == "NFO") & (df["instrumenttype"].str.contains("OPT", na=False))].copy()
-    d["sym_u"] = d["symbol"].str.upper()
-
-    d = filter_underlying(d, underlying)
+    d = _option_rows(df, underlying)
     if d.empty:
         return [], None
+    d = d.copy()
 
     expiry = pick_nearest_expiry(d)
     if not expiry:

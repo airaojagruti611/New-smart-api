@@ -145,8 +145,28 @@ Start-Worker "greeks_change" "run_greeks_change.py"
 # --- Archiver: all Angel One + layer streams -> data_lake/*.parquet ---
 Start-Worker "arch_layers" "run_archiver_layers.py" "all"
 
+# --- Copy dashboard inputs to a cloud Redis (for Streamlit Community Cloud) ---
+# Only when CLOUD_REDIS_URL is set (environment or .env).
+$HasCloudRedis = [bool]$env:CLOUD_REDIS_URL
+if (-not $HasCloudRedis -and (Test-Path "$PSScriptRoot\.env")) {
+    $HasCloudRedis = [bool](Select-String -Path "$PSScriptRoot\.env" -Pattern '^\s*CLOUD_REDIS_URL\s*=\s*\S' -Quiet)
+}
+if ($HasCloudRedis) {
+    Start-Worker "cloud_mirror" "run_cloud_mirror.py"
+}
+
+# --- Live Streamlit UI — set START_DASHBOARD=0 to skip ---
+# Binds to 127.0.0.1 by default; share it via Cloudflare Tunnel, not the LAN.
+$DashPort = if ($env:DASHBOARD_PORT) { $env:DASHBOARD_PORT } else { "8501" }
+$DashAddr = if ($env:DASHBOARD_ADDR) { $env:DASHBOARD_ADDR } else { "127.0.0.1" }
+if ($env:START_DASHBOARD -ne "0") {
+    Start-Worker "dashboard" "-m streamlit" "run streamlit_app.py --server.port $DashPort --server.address $DashAddr --server.headless true --browser.gatherUsageStats false"
+}
+
 Write-Host "`n[4/4] Success! Pipeline is running." -ForegroundColor Cyan
 Write-Host "Logs are being recorded in: $logDir" -ForegroundColor Gray
 Write-Host "PIDs: $pidDir" -ForegroundColor Gray
 Write-Host "To stop all processes (any day, also after midnight), run: .\stop_all.ps1" -ForegroundColor Yellow
-Write-Host "Dashboard (Linux): ./run_dashboard.sh  →  http://127.0.0.1:8501" -ForegroundColor Gray
+if ($env:START_DASHBOARD -ne "0") {
+    Write-Host "Dashboard: http://127.0.0.1:$DashPort" -ForegroundColor Gray
+}

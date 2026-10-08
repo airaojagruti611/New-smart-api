@@ -78,6 +78,8 @@ X_CLIENT_LOCAL_IP=
 X_CLIENT_PUBLIC_IP=
 X_MAC_ADDRESS=
 STRIKES_AROUND=10   # ATM±10 chain; Strike Intelligence Engine needs ≥ SIE_STRIKES_AROUND (5)
+STRIKES_AROUND_WIDE=2   # only used when > STRIKES_AROUND: then STRIKES_AROUND covers every symbol and the leftover
+                        # MAX_WS_SUBS budget widens symbols to this, in symbols.txt order (for large symbol lists)
 SUBSCRIBE_MODE=SNAP_QUOTE
 LOG_LEVEL=INFO
 ARCHIVE_TZ=Asia/Kolkata
@@ -382,6 +384,51 @@ Open **http://127.0.0.1:8501**
 
 `./run_all.sh` starts the dashboard as well (skip with `START_DASHBOARD=0`). Port: `DASHBOARD_PORT` (default 8501).
 
+**Windows:** `run_all.ps1` also starts it (same `START_DASHBOARD` / `DASHBOARD_PORT` switches), bound to `127.0.0.1`. The market-hours scheduler therefore starts and stops it together with the pipeline.
+
+### Password
+
+Add `DASHBOARD_PASSWORD=<something long>` to `.env` and restart the dashboard. Everyone then has to enter it before seeing anything. Leave it unset for local-only use.
+
+### Share with a few people (Cloudflare Tunnel + Access)
+
+This gives an HTTPS link like `https://dash.yourdomain.com` without opening router ports. Cloudflare checks each visitor's email before the page loads. You need a free Cloudflare account and a domain whose DNS is on Cloudflare.
+
+1. **Create the tunnel.** Cloudflare dashboard → Zero Trust → Networks → Tunnels → *Create a tunnel* → type *Cloudflared* → name it `option-rider`. Choose *Windows* and copy the `cloudflared.exe service install <TOKEN>` command it shows.
+2. **Install cloudflared on this PC** (admin PowerShell):
+   ```powershell
+   winget install --id Cloudflare.cloudflared
+   cloudflared.exe service install <TOKEN>
+   ```
+   This installs a Windows service that starts with the PC.
+3. **Public hostname.** In the tunnel → *Public Hostname* → add `dash.yourdomain.com` → service `HTTP` → `localhost:8501`.
+4. **Restrict who can open it.** Zero Trust → Access → Applications → *Add* → *Self-hosted* → domain `dash.yourdomain.com`. Add a policy: *Allow* → *Emails* → the addresses of the people who should see it. Visitors get a one-time code by email.
+5. Open the link from your phone to check. Outside 09:15–15:30 IST the dashboard is stopped, so the link shows a Cloudflare error page.
+
+Keep `DASHBOARD_PASSWORD` set as a second layer.
+
+### Host on Streamlit Community Cloud
+
+The dashboard runs on share.streamlit.io and reads a small cloud Redis. The pipeline and its full Redis stay on your PC. `run_cloud_mirror.py` copies only what the dashboard reads (latest signals, the last 1000 ticks/candles per stream, and the PC's stream sizes) every 5 seconds, which is about 1 MB.
+
+1. **Cloud Redis.** Create a free database at redis.io/try-free (Redis Cloud, 30 MB). From its *Connect* panel, copy the public endpoint and the default user's password.
+2. **Mirror on the PC.** Add this to `angel_md_redis\.env`:
+   ```env
+   CLOUD_REDIS_URL=redis://default:<password>@<endpoint-host>:<port>
+   ```
+   `run_all.ps1` / `run_all.sh` then start the `cloud_mirror` worker with the pipeline, and `stop_all` stops it. To try it alone: `python run_cloud_mirror.py`. It logs `[MIRROR] ok ...` once a minute.
+3. **Deploy.** share.streamlit.io → *Create app* → *Deploy a public app from GitHub* → repository `airaojagruti611/New-smart-api`, the branch you want, main file `angel_md_redis/streamlit_app.py`. Your GitHub account needs access to the repo, and Streamlit must be allowed to read it.
+   - *Advanced settings* → Python **3.11** (matches `requirements.txt`).
+   - *Secrets*:
+     ```toml
+     REDIS_URL = "redis://default:<password>@<endpoint-host>:<port>"
+     DASHBOARD_PASSWORD = "<something long>"
+     ```
+     The app copies these into environment variables at start-up, and Secrets win over `.env`.
+4. **Who can open it.** Anyone with the link reaches the password prompt. Streamlit's own *Share* settings can also limit viewers to invited emails.
+
+While the pipeline is stopped, the hosted dashboard shows the last copied data, and the sidebar shows **PC DATA PAUSED** with the time of the last sync. Streamlit puts apps with no visitors to sleep after a while; opening the link wakes them up.
+
 ---
 
 ## Pipeline order (dependency map)
@@ -425,6 +472,22 @@ Start **producer first**; signal workers need candles/ticks flowing (market hour
 
 ---
 
+## Auto-run during market hours (Windows)
+
+`market_scheduler.ps1` keeps the pipeline up **Mon–Fri 09:15–15:30 IST** and stops it outside that window. It checks every 30s, so switching the PC on mid-session starts the pipeline too.
+
+```powershell
+.\install_scheduler.ps1              # register "OptionRider Market Scheduler" task
+.\install_scheduler.ps1 -Uninstall   # remove it and stop the pipeline
+```
+
+- The task runs at user logon and daily at 09:05 IST, waking the PC from sleep. It doesn't run while you're signed out or the PC is off.
+- Starts Docker Desktop if needed. Gives up for the day after 3 failed starts.
+- Optional `market_holidays.txt` (one `yyyy-MM-dd` per line): those days are skipped.
+- Log: `logs\scheduler.log`
+
+---
+
 ## Stop services
 
 - Windows launcher: `.\stop_all.ps1`
@@ -445,4 +508,5 @@ Start **producer first**; signal workers need candles/ticks flowing (market hour
 | No `data_lake` parquet | Confirm `arch_layers` is running; wait for a flush; do not run old archivers in parallel |
 | Empty `md:greeks_change:signal` | Needs `run_expected_move.py` plus an ATM/strikeflow (or strike_select OK) candidate. Restart `run_greeks_change.py` so it joins group `greeks-change-em`. |
 | `AG8004 Invalid API Key` on optionGreek | Leave `X_CLIENT_LOCAL_IP` blank (not `127.0.0.1`). Confirm the public IP is allowlisted on the Angel app. |
+| Option ticks stop after a websocket reconnect | Fixed: the producer resubscribes options on reconnect, reconnects if no tick arrives for `WS_STALE_SEC` (default 90s) in market hours, and logs in again if the socket closes for good. |
 | Duplicate / missing archive files | Stop old `arch_eq` / candle / CSV processes, then restart with `run_all` |

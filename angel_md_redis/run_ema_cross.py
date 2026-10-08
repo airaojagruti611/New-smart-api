@@ -5,7 +5,7 @@ from collections import defaultdict, deque
 
 import redis
 
-from app.candle_io import parse_candle_fields, read_last_candles, upsert_candle_window
+from app.candle_io import parse_candle_fields, read_last_candles_multi, upsert_candle_window
 from app.candle_types import Candle
 from app.config import load_symbols
 from app.ema_cross import last_ema_cross_signal
@@ -66,8 +66,10 @@ def main():
     )
 
     now_ms = int(time.time() * 1000)
+    # One backwards walk for all symbols (the stream interleaves them).
+    seed = read_last_candles_multi(r, IN_1M, list(symbols), WINDOW)
     for sym in symbols:
-        bars = read_last_candles(r, IN_1M, sym, WINDOW)
+        bars = seed.get(sym.upper(), [])
         if bars:
             windows[sym].extend(bars)
         pt = last_ema_cross_signal(list(windows[sym]), fast=EMA_FAST, slow=EMA_SLOW)

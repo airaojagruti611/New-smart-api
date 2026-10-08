@@ -80,11 +80,19 @@ def read_last_candles(
     limit: int,
     scan: int = 0,
 ) -> List[Candle]:
-    """Scan `stream`, return oldest-first unique candles for `symbol` (by ts_ms)."""
+    """
+    Return oldest-first unique candles for `symbol` (by ts_ms).
+
+    scan > 0: look only at the newest `scan` stream entries (cheap, may find
+    fewer than `limit`). scan == 0: walk back until `limit` candles are found
+    or the stream ends; the stream interleaves every symbol, so a fixed window
+    holds only a few bars per symbol when many symbols are collected.
+    """
     if limit <= 0:
         return []
-    count = scan if scan > 0 else max(8000, limit * 20)
-    resp = r.xrevrange(stream, max="+", min="-", count=count)
+    if scan <= 0:
+        return read_last_candles_multi(r, stream, [symbol], limit).get(symbol.upper(), [])
+    resp = r.xrevrange(stream, max="+", min="-", count=scan)
     found: List[Candle] = []
     want = symbol.upper()
     for _msg_id, fields in resp:
@@ -140,6 +148,49 @@ def read_symbol_candles(
             continue
         found[parsed[0]].append(parsed[1])
     return {s: sort_unique_candles(c, limit=limit) for s, c in found.items()}
+
+
+
+def read_last_candles_multi(
+    r: redis.Redis,
+    stream: str,
+    symbols: List[str],
+    limit: int,
+    chunk: int = 20000,
+    max_scan: int = 0,
+) -> Dict[str, List[Candle]]:
+    """
+    Newest `limit` candles per symbol (oldest-first), in one backwards walk
+    over `stream` shared by all symbols. Stops when every symbol has `limit`
+    candles, the stream ends, or `max_scan` entries were read (0 = no cap).
+    """
+    want = {s.upper() for s in symbols}
+    found: Dict[str, Dict[int, Candle]] = {s: {} for s in want}
+    if limit <= 0 or not want:
+        return {s: [] for s in want}
+    need = set(want)
+    max_id = "+"
+    scanned = 0
+    while need:
+        rows = r.xrevrange(stream, max=max_id, min="-", count=chunk)
+        if not rows:
+            break
+        for _msg_id, fields in rows:
+            parsed = parse_candle_fields(fields)
+            if parsed is None:
+                continue
+            sym, candle = parsed
+            if sym not in need:
+                continue
+            bucket = found[sym]
+            bucket[int(candle.ts_ms)] = bucket.get(int(candle.ts_ms), candle)  # newest write wins
+            if len(bucket) >= limit:
+                need.discard(sym)
+        scanned += len(rows)
+        if len(rows) < chunk or (max_scan and scanned >= max_scan):
+            break
+        max_id = f"({rows[-1][0]}"
+    return {s: sort_unique_candles(list(found[s].values()), limit=limit) for s in want}
 
 
 def existing_ts_set(

@@ -1,4 +1,6 @@
+import datetime as dt
 import os
+import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -8,10 +10,20 @@ from .config import (
     WS_WARMUP_SEC, STRIKES_AROUND, MAX_WS_SUBS, SUBSCRIBE_MODE,
     STREAM_EQ, STREAM_OPT,
     STREAM_MAXLEN_EQ, STREAM_MAXLEN_OPT,
+    WS_STALE_SEC, STRIKES_AROUND_WIDE,
 )
 from .utils import now_ms, paise_to_rupees
 from .redis_store import RedisStore
 from .scripmaster import load_scripmaster, resolve_eq_tokens, build_atm_option_tokens
+
+_IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+
+
+def _in_market_hours() -> bool:
+    now = dt.datetime.now(_IST)
+    if now.weekday() >= 5:
+        return False
+    return "09:15" <= now.strftime("%H:%M") < "15:30"
 
 
 # Equity ticks unchanged in every core field are still re-emitted after this
@@ -109,6 +121,8 @@ class MarketDataProducer:
         self.options_subscribed = False          # first option pass done (run_greeks waits on it)
         self.options_planned: set = set()        # symbols whose option chain has been planned
         self._opt_batch_no = 0
+        self.last_data_t: float = time.time()
+        self._stop_watchdog = threading.Event()
 
         self.sws = SmartWebSocketV2(
             auth_token=self.auth_token,
@@ -146,12 +160,47 @@ class MarketDataProducer:
         self.sws.on_close = self.on_close
 
     def start(self):
+        """Blocks until the socket is closed for good (max retries or stale feed)."""
         if not self.eq_map:
             raise RuntimeError("No NSE EQ tokens resolved from ScripMaster.")
         print(f"[WS] EQ tokens resolved: {len(self.eq_map)}")
-        self.sws.connect()
+        wd = threading.Thread(target=self._watchdog, name="ws-watchdog", daemon=True)
+        wd.start()
+        try:
+            self.sws.connect()
+        finally:
+            self._stop_watchdog.set()
+
+    def _watchdog(self):
+        """
+        A half-dead socket can stay silent for many minutes before the library
+        notices. During market hours, close it when no tick arrived for
+        WS_STALE_SEC; start() then returns and the caller reconnects.
+        """
+        while not self._stop_watchdog.wait(10):
+            if self.ws_open_t is None or not _in_market_hours():
+                continue
+            silent = time.time() - self.last_data_t
+            if silent > WS_STALE_SEC:
+                print(f"[WS] no ticks for {silent:.0f}s during market hours; closing socket to reconnect")
+                self._stop_watchdog.set()
+                try:
+                    self.sws.close_connection()
+                except Exception as e:
+                    print("[WS] close on stale feed failed:", repr(e))
+                return
 
     def on_open(self, wsapp):
+        # SmartWebSocketV2 reconnects by calling close_connection() (which clears
+        # RESUBSCRIBE_FLAG) and then connect(), so every reconnect lands here.
+        # Reset its bookkeeping: the retry counter otherwise never goes back to
+        # zero (10 drops per day and the socket closes for good), and its
+        # subscription record would keep growing with duplicates.
+        self.sws.current_retry_attempt = 0
+        self.sws.input_request_dict = {}
+        self.last_data_t = time.time()
+
+        reconnect = self.ws_open_t is not None
         self.ws_open_t = time.time()
         eq_tokens = [info["token"] for info in self.eq_map.values()]
 
@@ -165,7 +214,22 @@ class MarketDataProducer:
 
         token_list = [{"exchangeType": self.EXCH_NSE, "tokens": eq_tokens}]
         self.sws.subscribe(correlation_id="EQ01", mode=self.mode_eq, token_list=token_list)
-        print(f"[WS] opened; subscribed EQ={len(eq_tokens)} mode={SUBSCRIBE_MODE}")
+        print(f"[WS] {'re' if reconnect else ''}opened; subscribed EQ={len(eq_tokens)} mode={SUBSCRIBE_MODE}")
+
+        # Options were planned on earlier connections; without this they are
+        # never subscribed again after a reconnect and md:ticks:opt goes silent.
+        if self.opt_meta:
+            self._subscribe_option_tokens(list(self.opt_meta.keys()))
+            print(f"[WS] resubscribed OPT={len(self.opt_meta)} after reconnect")
+
+    def _subscribe_option_tokens(self, tokens: List[str]) -> None:
+        # batches of 50; correlation ids unique across passes
+        BATCH = 50
+        for i in range(0, len(tokens), BATCH):
+            batch = tokens[i:i + BATCH]
+            token_list = [{"exchangeType": self.EXCH_NFO, "tokens": batch}]
+            self._opt_batch_no += 1
+            self.sws.subscribe(correlation_id=f"OPT{self._opt_batch_no:03d}", mode=self.mode_opt, token_list=token_list)
 
     def on_error(self, wsapp, error):
         print("[WS] error:", error)
@@ -176,8 +240,15 @@ class MarketDataProducer:
     def _publish_active_expiry(self):
         """
         ✅ Publish active expiries for greeks poller to Redis.
+
+        Replaces the hash: entries left from an older symbols.txt would
+        otherwise stay forever and the poller keeps querying expired contracts.
         """
-        self.rs.hset_meta("md:active_expiry", self.active_expiry_by_underlying)
+        pipe = self.rs.r.pipeline()
+        pipe.delete("md:active_expiry")
+        if self.active_expiry_by_underlying:
+            pipe.hset("md:active_expiry", mapping=self.active_expiry_by_underlying)
+        pipe.execute()
         self.rs.set_latest("md:active_expiry:ts_ms", str(now_ms()), ex_sec=3600)
 
     def _maybe_subscribe_options(self):
@@ -198,35 +269,63 @@ class MarketDataProducer:
             return
         first = not self.options_subscribed
 
-        # build option token plan
-        planned: List[dict] = []
+        # Option token plan, two tiers within MAX_WS_SUBS:
+        #   1. STRIKES_AROUND strikes (ATM call+put at 0) for every symbol, so
+        #      each stock gets option data;
+        #   2. leftover budget widens symbols to STRIKES_AROUND_WIDE, in
+        #      symbols.txt order (put priority stocks first). Room for the ATM
+        #      tier of symbols still waiting for their first spot is kept free.
+        eq_count = len(self.eq_map)
+        budget = max(0, MAX_WS_SUBS - eq_count - len(self.opt_meta))
+        seen = set(self.opt_meta)  # dedupe against contracts already subscribed
+        unique: List[dict] = []
+        expiry_of: Dict[str, str] = {}
+        tier1 = 2 * (2 * STRIKES_AROUND + 1)
+
+        def add(contracts: List[dict]) -> None:
+            for c in contracts:
+                if c["token"] not in seen:
+                    seen.add(c["token"])
+                    unique.append(c)
+
         for sym in pending:
             self.options_planned.add(sym)
             contracts, expiry_iso = build_atm_option_tokens(self.df, sym, self.spot_ltp[sym], STRIKES_AROUND)
             if not contracts:
                 continue
-
+            new = [c for c in contracts if c["token"] not in seen]
+            room = budget - len(unique)
+            if len(new) > room:
+                # Fill the budget with as much of this chain as fits, then stop.
+                add(new[:max(0, room)])
+                if room > 0 and expiry_iso:
+                    expiry_of[sym] = expiry_iso
+                print(f"[WS] capped option tokens at {sym} to stay under MAX_WS_SUBS={MAX_WS_SUBS}")
+                break
+            add(new)
             if expiry_iso:
-                self.active_expiry_by_underlying[sym] = expiry_iso
+                expiry_of[sym] = expiry_iso
 
-            planned.extend(contracts)
+        waiting = sum(1 for s in self.symbols if s in self.eq_map and s not in self.options_planned)
+        wide_budget = budget - waiting * tier1
+        wide_n = 0
+        if STRIKES_AROUND_WIDE > STRIKES_AROUND:
+            for sym in pending:
+                if sym not in expiry_of:
+                    continue
+                contracts, _ = build_atm_option_tokens(self.df, sym, self.spot_ltp[sym], STRIKES_AROUND_WIDE)
+                extra = [c for c in contracts if c["token"] not in seen]
+                if len(unique) + len(extra) > wide_budget:
+                    continue  # a symbol with fewer listed strikes may still fit
+                add(extra)
+                wide_n += 1
 
-        # dedupe by token (also against contracts already subscribed)
-        seen = set(self.opt_meta)
-        unique = []
-        for c in planned:
-            t = c["token"]
-            if t not in seen:
-                seen.add(t)
-                unique.append(c)
-
-        eq_count = len(self.eq_map)
-        total = eq_count + len(self.opt_meta) + len(unique)
-
-        if total > MAX_WS_SUBS:
-            cap = max(0, MAX_WS_SUBS - eq_count - len(self.opt_meta))
-            unique = unique[:cap]
-            print(f"[WS] capped option tokens to {len(unique)} to stay under MAX_WS_SUBS={MAX_WS_SUBS}")
+        # Only underlyings that actually got option tokens (the greeks poller
+        # queries every entry in md:active_expiry).
+        self.active_expiry_by_underlying.update(expiry_of)
+        if expiry_of:
+            print(f"[WS] option plan: {len(expiry_of)} symbols at +/-{STRIKES_AROUND}, "
+                  f"{wide_n} widened to +/-{STRIKES_AROUND_WIDE}; new tokens={len(unique)} (budget {budget})")
 
         self.options_subscribed = True
 
@@ -252,13 +351,7 @@ class MarketDataProducer:
                 "exchange": "NFO",
             })
 
-        # subscribe in batches (correlation ids unique across passes)
-        BATCH = 50
-        for i in range(0, len(tokens), BATCH):
-            batch = tokens[i:i + BATCH]
-            token_list = [{"exchangeType": self.EXCH_NFO, "tokens": batch}]
-            self._opt_batch_no += 1
-            self.sws.subscribe(correlation_id=f"OPT{self._opt_batch_no:03d}", mode=self.mode_opt, token_list=token_list)
+        self._subscribe_option_tokens(tokens)
 
         # ✅ publish active expiries for greeks poller
         self._publish_active_expiry()
@@ -358,6 +451,7 @@ class MarketDataProducer:
         self.rs.xadd(STREAM_OPT, payload, maxlen=STREAM_MAXLEN_OPT)
 
     def on_data(self, wsapp, data: Dict[str, Any]):
+        self.last_data_t = time.time()
         tok = str(data.get("token", ""))
 
         # equity tick
