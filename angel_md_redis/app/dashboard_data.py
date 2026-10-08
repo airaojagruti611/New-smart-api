@@ -72,19 +72,25 @@ def pick_stream(r: redis.Redis, stream: str, symbol: str, n: int = 120) -> dict:
 
 
 def last_candles(r: redis.Redis, symbol: str, stream: str = "md:candles:1m", n: int = 80) -> List[dict]:
+    """Last `n` entries for `symbol`, oldest-first (walks back past other symbols' rows)."""
     want = symbol.upper()
-    out: List[dict] = []
-    try:
-        rows = r.xrevrange(stream, count=max(n * 8, 200))
-    except Exception:
-        return []
-    for _mid, fields in reversed(rows):
-        if str(fields.get("symbol") or "").upper() != want:
-            continue
-        out.append(dict(fields))
-        if len(out) >= n:
+    newest_first: List[dict] = []
+    max_id, scanned = "+", 0
+    while len(newest_first) < n and scanned < 200000:
+        try:
+            rows = r.xrevrange(stream, max=max_id, count=5000)
+        except Exception:
             break
-    return out
+        if not rows:
+            break
+        for _mid, fields in rows:
+            if str(fields.get("symbol") or "").upper() == want:
+                newest_first.append(dict(fields))
+                if len(newest_first) >= n:
+                    break
+        scanned += len(rows)
+        max_id = f"({rows[-1][0]}"
+    return list(reversed(newest_first))
 
 
 def fnum(v: Any, default: Optional[float] = None) -> Optional[float]:
@@ -106,54 +112,138 @@ def age_sec(doc: Any) -> Optional[float]:
         return None
 
 
-def collect_symbol(r: redis.Redis, sym: str) -> Dict[str, Any]:
-    s = sym.upper()
-    vol_blob = load_json(r, "md:volume:latest") or {}
-    vol = vol_blob.get(s) if isinstance(vol_blob, dict) else None
-    if not isinstance(vol, dict):
-        vol = {}
-    expiry = r.hgetall("md:active_expiry") or {}
-    strike = load_json(r, f"md:strike:select:latest:{s}") or {}
-    greeks_ce = load_json(r, f"md:greeks:phase:underlying:latest:{s}:CE") or {}
-    tsym = str(strike.get("tradingsymbol") or greeks_ce.get("tradingsymbol") or "")
-    liq = load_json(r, f"md:liquidity:score:latest:{tsym}") if tsym else None
-    gchg = load_json(r, f"md:greeks_change:latest:{s}") or {}
-    if not gchg and tsym:
-        gchg = load_json(r, f"md:greeks_change:latest:{tsym}") or {}
+# Per-symbol snapshot keys: output field -> key template.
+_SYMBOL_KEYS = {
+    "st": "md:supertrend:bias:latest:{s}",
+    "ema": "md:ema:cross:latest:{s}",
+    "htf": "md:htf:trend:latest:{s}",
+    "pivots": "md:pivots:prevday:{s}",
+    "level": "md:level:entry:latest:{s}",
+    "momentum": "md:momentum:confirm:latest:{s}",
+    "bidask": "md:bidask:latest:{s}",
+    "smartmoney": "md:smartmoney:latest:{s}",
+    "orderflow": "md:orderflow:latest:{s}",
+    "imbalance": "md:imbalance:latest:{s}",
+    "stockflow": "md:stockflow:latest:{s}",
+    "composite": "md:composite:latest:{s}",
+    "oi_und": "md:oi:underlying:latest:{s}",
+    "greeks_ce": "md:greeks:phase:underlying:latest:{s}:CE",
+    "greeks_pe": "md:greeks:phase:underlying:latest:{s}:PE",
+    "strikeflow": "md:strikeflow:latest:{s}",
+    "expected": "md:expected_move:latest:{s}",
+    "entry": "md:entry:trigger:latest:{s}",
+    "strike": "md:strike:select:latest:{s}",
+    "capital": "md:capital:alloc:latest:{s}",
+    "greeks_change": "md:greeks_change:latest:{s}",
+}
 
-    return {
-        "tick": pick_stream(r, "md:ticks:eq", s, 150),
-        "c1m": pick_stream(r, "md:candles:1m", s, 40),
-        "c5m": pick_stream(r, "md:candles:5m", s, 20),
-        "c10m": pick_stream(r, "md:candles:10m", s, 20),
-        "c30m": pick_stream(r, "md:candles:30m", s, 20),
-        "expiry": expiry.get(s, ""),
-        "st": load_json(r, f"md:supertrend:bias:latest:{s}") or {},
-        "ema": load_json(r, f"md:ema:cross:latest:{s}") or {},
-        "htf": load_json(r, f"md:htf:trend:latest:{s}") or {},
-        "pivots": load_json(r, f"md:pivots:prevday:{s}") or {},
-        "level": load_json(r, f"md:level:entry:latest:{s}") or {},
-        "momentum": load_json(r, f"md:momentum:confirm:latest:{s}") or {},
-        "volume": vol,
-        "regime": load_json(r, "md:regime:latest") or {},
-        "bidask": load_json(r, f"md:bidask:latest:{s}") or {},
-        "smartmoney": load_json(r, f"md:smartmoney:latest:{s}") or {},
-        "orderflow": load_json(r, f"md:orderflow:latest:{s}") or {},
-        "imbalance": load_json(r, f"md:imbalance:latest:{s}") or {},
-        "stockflow": load_json(r, f"md:stockflow:latest:{s}") or {},
-        "composite": load_json(r, f"md:composite:latest:{s}") or {},
-        "oi_und": load_json(r, f"md:oi:underlying:latest:{s}") or {},
-        "greeks_ce": greeks_ce,
-        "greeks_pe": load_json(r, f"md:greeks:phase:underlying:latest:{s}:PE") or {},
-        "strikeflow": load_json(r, f"md:strikeflow:latest:{s}") or {},
-        "expected": load_json(r, f"md:expected_move:latest:{s}") or {},
-        "entry": load_json(r, f"md:entry:trigger:latest:{s}") or {},
-        "strike": strike,
-        "capital": load_json(r, f"md:capital:alloc:latest:{s}") or {},
-        "liquidity": liq or {},
-        "greeks_change": gchg or {},
-        "candles_1m": last_candles(r, s, "md:candles:1m", 60),
-    }
+
+def _json_or_empty(raw: Optional[str]) -> Any:
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw) or {}
+    except Exception:
+        return {}
+
+
+def latest_per_symbol(r: redis.Redis, stream: str, symbols: List[str], max_scan: int = 30000) -> Dict[str, dict]:
+    """Newest entry per symbol in one backwards walk (stops when all are found or at max_scan)."""
+    want = {s.upper() for s in symbols}
+    out: Dict[str, dict] = {}
+    max_id, scanned = "+", 0
+    while want - set(out) and scanned < max_scan:
+        try:
+            rows = r.xrevrange(stream, max=max_id, count=5000)
+        except Exception:
+            break
+        if not rows:
+            break
+        for _mid, fields in rows:
+            for k in ("symbol", "underlying", "key"):
+                v = str(fields.get(k) or "").upper()
+                base = v.split(":", 1)[0]
+                if base in want and base not in out:
+                    out[base] = dict(fields)
+                    break
+        scanned += len(rows)
+        max_id = f"({rows[-1][0]}"
+    return out
+
+
+def collect_all(r: redis.Redis, symbols: List[str], detail: Optional[List[str]] = None) -> Dict[str, Dict[str, Any]]:
+    """
+    Snapshot for many symbols with few round trips: one pipeline for every
+    latest key, one shared walk per stream. `detail` symbols also get the
+    5m/10m/30m bars and the 1m candle history (the per-symbol views).
+    """
+    syms = [s.upper() for s in symbols]
+    detail = [s.upper() for s in (detail or [])]
+
+    pipe = r.pipeline()
+    pipe.get("md:volume:latest")
+    pipe.hgetall("md:active_expiry")
+    pipe.get("md:regime:latest")
+    for s in syms:
+        for tmpl in _SYMBOL_KEYS.values():
+            pipe.get(tmpl.format(s=s))
+    res = pipe.execute()
+    vol_blob = _json_or_empty(res[0])
+    expiry = res[1] or {}
+    regime = _json_or_empty(res[2])
+
+    out: Dict[str, Dict[str, Any]] = {}
+    fields = list(_SYMBOL_KEYS)
+    i = 3
+    for s in syms:
+        d: Dict[str, Any] = {}
+        for f in fields:
+            d[f] = _json_or_empty(res[i])
+            i += 1
+        vol = vol_blob.get(s) if isinstance(vol_blob, dict) else None
+        d["volume"] = vol if isinstance(vol, dict) else {}
+        d["regime"] = regime
+        d["expiry"] = expiry.get(s, "")
+        out[s] = d
+
+    # Option-level keys depend on the selected contract.
+    pipe = r.pipeline()
+    lookups = []
+    for s in syms:
+        d = out[s]
+        tsym = str(d["strike"].get("tradingsymbol") or d["greeks_ce"].get("tradingsymbol") or "")
+        if tsym:
+            pipe.get(f"md:liquidity:score:latest:{tsym}")
+            lookups.append((s, "liquidity"))
+            if not d["greeks_change"]:
+                pipe.get(f"md:greeks_change:latest:{tsym}")
+                lookups.append((s, "greeks_change"))
+    for (s, f), raw in zip(lookups, pipe.execute() if lookups else []):
+        out[s][f] = _json_or_empty(raw)
+    for s in syms:
+        out[s].setdefault("liquidity", {})
+
+    ticks = latest_per_symbol(r, "md:ticks:eq", syms)
+    c1m = latest_per_symbol(r, "md:candles:1m", syms, max_scan=20000)
+    for s in syms:
+        out[s]["tick"] = ticks.get(s, {})
+        out[s]["c1m"] = c1m.get(s, {})
+        out[s]["c5m"] = out[s]["c10m"] = out[s]["c30m"] = {}
+        out[s]["candles_1m"] = []
+    if detail:
+        for stream, f in (("md:candles:5m", "c5m"), ("md:candles:10m", "c10m"), ("md:candles:30m", "c30m")):
+            got = latest_per_symbol(r, stream, detail, max_scan=20000)
+            for s in detail:
+                if s in out:
+                    out[s][f] = got.get(s, {})
+        for s in detail:
+            if s in out:
+                out[s]["candles_1m"] = last_candles(r, s, "md:candles:1m", 60)
+    return out
+
+
+def collect_symbol(r: redis.Redis, sym: str) -> Dict[str, Any]:
+    return collect_all(r, [sym], detail=[sym])[sym.upper()]
 
 
 def redis_health(r: redis.Redis) -> Dict[str, Any]:

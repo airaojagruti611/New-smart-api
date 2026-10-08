@@ -21,7 +21,7 @@ from typing import Dict, Set
 
 import redis
 
-from app.candle_io import parse_candle_fields, read_last_candles
+from app.candle_io import parse_candle_fields, read_last_candles_multi
 from app.candle_types import Candle
 from app.config import load_symbols
 from app.volume_analyzer import VolumeAnalyzer, VolumeResult
@@ -117,8 +117,9 @@ def main() -> None:
         f"avg_window={AVG_WINDOW}, symbols={sorted(symbols)}"
     )
 
+    seed = read_last_candles_multi(r, IN_1M, list(symbols), AVG_WINDOW + 1)
     for sym in sorted(symbols):
-        bars = read_last_candles(r, IN_1M, sym, AVG_WINDOW + 1)
+        bars = seed.get(sym.upper(), [])
         analyzer = VolumeAnalyzer(avg_window=AVG_WINDOW)
         analyzers[sym] = analyzer
         if not bars:

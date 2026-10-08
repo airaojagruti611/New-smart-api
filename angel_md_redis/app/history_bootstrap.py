@@ -15,7 +15,7 @@ import redis
 from .angel_auth import login
 from .angel_rest import api_error_text, api_failed, candle_rows, fetch_candle_data
 from .candle_builder import resample_candles
-from .candle_io import count_symbol_candles, existing_ts_set
+from .candle_io import existing_ts_set, parse_candle_fields, read_last_candles_multi
 from .candle_types import Candle
 from .candles_store import CandlesStore
 from .config import load_symbols
@@ -150,6 +150,12 @@ def _range_for(interval: str, lookback_days: int) -> Tuple[str, str]:
     return _fmt(start), _fmt(end)
 
 
+def _bar_counts(r: redis.Redis, stream: str, symbols: Sequence[str], need: int) -> Dict[str, int]:
+    """Bars per symbol, counted up to `need`, in one walk over the whole stream if necessary."""
+    bars = read_last_candles_multi(r, stream, list(symbols), need)
+    return {s.upper(): len(bars.get(s.upper(), [])) for s in symbols}
+
+
 def _needs_seed(r: redis.Redis, symbols: Sequence[str]) -> bool:
     checks = [
         (STREAM_1D, 2),
@@ -159,20 +165,50 @@ def _needs_seed(r: redis.Redis, symbols: Sequence[str]) -> bool:
         (STREAM_30M, 8),
     ]
     for stream, need in checks:
-        counts = count_symbol_candles(r, stream, list(symbols), per_symbol_limit=need)
+        counts = _bar_counts(r, stream, symbols, need)
         if any(counts.get(s.upper(), 0) < need for s in symbols):
             return True
     return False
 
 
+class _StreamIndex:
+    """
+    Candle timestamps per symbol for one stream, from a single full pass.
+    Per-symbol windowed scans miss bars once many symbols are interleaved
+    (or written as whole-history blocks), which let duplicates through.
+    """
+
+    def __init__(self, r: redis.Redis, stream: str):
+        self.r = r
+        self.stream = stream
+        self._by_sym: Optional[Dict[str, set]] = None
+
+    def ts(self, sym: str) -> set:
+        if self._by_sym is None:
+            by_sym: Dict[str, set] = {}
+            last = "-"
+            while True:
+                rows = self.r.xrange(self.stream, min=last, max="+", count=50000)
+                if not rows:
+                    break
+                for _mid, fields in rows:
+                    parsed = parse_candle_fields(fields)
+                    if parsed:
+                        by_sym.setdefault(parsed[0], set()).add(int(parsed[1].ts_ms))
+                if len(rows) < 50000:
+                    break
+                last = f"({rows[-1][0]}"
+            self._by_sym = by_sym
+        return self._by_sym.setdefault(sym.upper(), set())
+
+
 def seed_pivots_from_daily(r: redis.Redis, symbols: Sequence[str], store: Optional[CandlesStore] = None) -> int:
     """Write today's prev-day pivots from the latest closed 1d bar per symbol."""
-    from .candle_io import read_last_candles
-
     store = store or CandlesStore()
     written = 0
+    last_two = read_last_candles_multi(r, STREAM_1D, list(symbols), 2)
     for sym in symbols:
-        bars = read_last_candles(r, STREAM_1D, sym, limit=2, scan=8000)
+        bars = last_two.get(sym.upper(), [])
         if not bars:
             continue
         src = bars[-1]
@@ -208,10 +244,13 @@ def _write_candles(
     tf: str,
     candles: Sequence[Candle],
     skip_today: bool,
+    existing: Optional[set] = None,
 ) -> int:
+    """`existing`: the symbol's ts set from a _StreamIndex (updated in place)."""
     today = _now_ist().date()
     now_ms = int(time.time() * 1000) + 120_000
-    existing = existing_ts_set(r, stream, sym, scan=20000)
+    if existing is None:
+        existing = existing_ts_set(r, stream, sym, scan=20000)
     # Daily bars from different sources carry different timestamps for the
     # same day, so dedupe 1d by IST date as well as by ts.
     existing_dates = {
@@ -303,22 +342,23 @@ def _seed_htf_from_1m(
     written: Dict[str, int],
 ) -> None:
     """Fill 5m/10m/30m from seeded 1m so Supertrend MTF has ATR history."""
-    from .candle_io import read_last_candles
-
     targets = (
         (5, STREAM_5M, OUT_MAXLEN_5M, "5m"),
         (10, STREAM_10M, OUT_MAXLEN_10M, "10m"),
         (30, STREAM_30M, OUT_MAXLEN_30M, "30m"),
     )
+    all_1m = read_last_candles_multi(r, STREAM_1M, list(symbols), 4000)
+    indexes = {stream: _StreamIndex(r, stream) for _m, stream, _x, _t in targets}
     for sym in symbols:
-        bars_1m = read_last_candles(r, STREAM_1M, sym, limit=4000, scan=20000)
+        bars_1m = all_1m.get(sym.upper(), [])
         if len(bars_1m) < 8:
             print(f"[HISTORY] resample skip {sym}: only {len(bars_1m)} 1m bars")
             continue
         for minutes, stream, maxlen, tf in targets:
-            have = len(existing_ts_set(r, stream, sym, scan=8000))
+            existing = indexes[stream].ts(sym)
+            have = len(existing)
             ht = resample_candles(bars_1m, minutes)
-            n = _write_candles(r, store, stream, maxlen, sym, tf, ht, skip_today=False)
+            n = _write_candles(r, store, stream, maxlen, sym, tf, ht, skip_today=False, existing=existing)
             written[f"{sym}:{tf}:resample"] = n
             print(
                 f"[HISTORY] resampled {n} {tf} bars for {sym} "
@@ -335,7 +375,16 @@ def _topup_daily(r: redis.Redis, symbols: Sequence[str]) -> int:
     """
     store = CandlesStore()
     added = 0
+    index = _StreamIndex(r, STREAM_1D)
+    # Last completed weekday before today (holidays just fetch and add nothing).
+    last_day = _now_ist().date() - dt.timedelta(days=1)
+    while last_day.weekday() >= 5:
+        last_day -= dt.timedelta(days=1)
     for sym in symbols:
+        existing = index.ts(sym)
+        dates = {dt.datetime.fromtimestamp(t / 1000.0, tz=IST).date() for t in existing}
+        if dates and max(dates) >= last_day:
+            continue  # up to date: no request
         try:
             candles, src = _fallback_candles(sym, "1d")
         except Exception as e:
@@ -344,7 +393,8 @@ def _topup_daily(r: redis.Redis, symbols: Sequence[str]) -> int:
         if not candles:
             print(f"[HISTORY] daily top-up {sym}: no data ({src})")
             continue
-        n = _write_candles(r, store, STREAM_1D, OUT_MAXLEN_1D, sym, "1d", candles, skip_today=True)
+        n = _write_candles(r, store, STREAM_1D, OUT_MAXLEN_1D, sym, "1d", candles, skip_today=True,
+                           existing=existing)
         if n:
             print(f"[HISTORY] daily top-up {sym}: added {n} bars via {src}")
         added += n
@@ -390,15 +440,15 @@ def seed_history(
     written: Dict[str, int] = {}
     angel_usable = auth_token is not None
 
-    dailies_ready = all(
-        count_symbol_candles(r, STREAM_1D, list(symbols), per_symbol_limit=2).get(s, 0) >= 2
-        for s in symbols
-    )
+    daily_counts = _bar_counts(r, STREAM_1D, symbols, 2)
+    dailies_ready = all(daily_counts.get(s, 0) >= 2 for s in symbols)
 
     for interval, tf, stream, maxlen, lookback_days, min_bars, skip_today in FETCH_INTERVALS:
         fromdate, todate = _range_for(interval, lookback_days)
+        counts = _bar_counts(r, stream, symbols, min_bars)
+        index = _StreamIndex(r, stream)
         for sym in symbols:
-            have = len(existing_ts_set(r, stream, sym, scan=max(8000, min_bars * 40)))
+            have = counts.get(sym, 0)
             if not force and dailies_ready and have >= min_bars:
                 print(f"[HISTORY] skip {sym} {tf}: already {have} bars")
                 continue
@@ -431,7 +481,8 @@ def seed_history(
                     written[f"{sym}:{tf}"] = 0
                     continue
 
-            n = _write_candles(r, store, stream, maxlen, sym, tf, candles, skip_today)
+            n = _write_candles(r, store, stream, maxlen, sym, tf, candles, skip_today,
+                               existing=index.ts(sym))
             written[f"{sym}:{tf}"] = n
             print(f"[HISTORY] wrote {n} {tf} bars for {sym} via {source} (had={have})")
 

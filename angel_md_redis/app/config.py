@@ -38,6 +38,9 @@ REDIS_URL = env_str("REDIS_URL", "redis://localhost:6379/0")
 WS_WARMUP_SEC = env_int("WS_WARMUP_SEC", 8)
 WS_STALE_SEC = env_int("WS_STALE_SEC", 90)  # reconnect if no tick for this long in market hours
 STRIKES_AROUND = env_int("STRIKES_AROUND", 0)
+# Second tier: leftover websocket budget widens symbols (in symbols.txt order)
+# to this many strikes each side. <= STRIKES_AROUND disables the tier.
+STRIKES_AROUND_WIDE = env_int("STRIKES_AROUND_WIDE", 2)
 MAX_WS_SUBS = env_int("MAX_WS_SUBS", 950)
 SUBSCRIBE_MODE = env_str("SUBSCRIBE_MODE", "SNAP_QUOTE").upper()
 

@@ -23,7 +23,7 @@ except Exception:
 
 from app.dashboard_data import (
     age_sec,
-    collect_symbol,
+    collect_all,
     connect,
     fnum,
     redis_health,
@@ -252,8 +252,9 @@ if not health.get("ok") or r is None:
     st.error("Cannot connect to Redis. Start the pipeline with `./run_all.sh` (Redis on localhost:6379).")
     st.stop()
 
-d = collect_symbol(r, symbol)
-all_data = {s: collect_symbol(r, s) for s in symbols}
+# One batched read for every symbol; the selected one also gets its detail views.
+all_data = collect_all(r, symbols, detail=[symbol])
+d = all_data[symbol.upper()]
 
 entry = d.get("entry") or {}
 signal = str(entry.get("signal") or (d.get("momentum") or {}).get("signal") or "NEUTRAL")

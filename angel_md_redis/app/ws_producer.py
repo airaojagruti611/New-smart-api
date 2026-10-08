@@ -9,7 +9,7 @@ from .config import (
     WS_WARMUP_SEC, STRIKES_AROUND, MAX_WS_SUBS, SUBSCRIBE_MODE,
     STREAM_EQ, STREAM_OPT,
     STREAM_MAXLEN_EQ, STREAM_MAXLEN_OPT,
-    WS_STALE_SEC,
+    WS_STALE_SEC, STRIKES_AROUND_WIDE,
 )
 
 _IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
@@ -225,37 +225,58 @@ class MarketDataProducer:
         if not enough:
             return
 
-        # build option token plan
-        planned: List[dict] = []
+        # Option token plan, two tiers within MAX_WS_SUBS:
+        #   1. STRIKES_AROUND strikes (ATM call+put at 0) for every symbol, so
+        #      each stock gets option data;
+        #   2. the remaining budget widens symbols to STRIKES_AROUND_WIDE, in
+        #      symbols.txt order (put priority stocks first).
+        eq_count = len(self.eq_map)
+        budget = max(0, MAX_WS_SUBS - eq_count)
+        unique: List[dict] = []
+        seen = set()
+        expiry_of: Dict[str, str] = {}
+
+        def add(contracts: List[dict]) -> None:
+            for c in contracts:
+                if c["token"] not in seen:
+                    seen.add(c["token"])
+                    unique.append(c)
+
+        base_n = 0
         for sym in self.symbols:
             if sym not in self.spot_ltp:
                 continue
-
             contracts, expiry_iso = build_atm_option_tokens(self.df, sym, self.spot_ltp[sym], STRIKES_AROUND)
             if not contracts:
                 continue
-
+            new = [c for c in contracts if c["token"] not in seen]
+            if len(unique) + len(new) > budget:
+                print(f"[WS] option budget full at {sym}; later symbols get no options (MAX_WS_SUBS={MAX_WS_SUBS})")
+                break
+            add(new)
+            base_n += 1
             if expiry_iso:
-                self.active_expiry_by_underlying[sym] = expiry_iso
+                expiry_of[sym] = expiry_iso
 
-            planned.extend(contracts)
+        wide_n = 0
+        if STRIKES_AROUND_WIDE > STRIKES_AROUND:
+            for sym in self.symbols:
+                if sym not in expiry_of:
+                    continue
+                contracts, _ = build_atm_option_tokens(self.df, sym, self.spot_ltp[sym], STRIKES_AROUND_WIDE)
+                extra = [c for c in contracts if c["token"] not in seen]
+                if len(unique) + len(extra) > budget:
+                    continue  # a symbol with fewer listed strikes may still fit
+                add(extra)
+                wide_n += 1
 
-        # dedupe by token
-        seen = set()
-        unique = []
-        for c in planned:
-            t = c["token"]
-            if t not in seen:
-                seen.add(t)
-                unique.append(c)
-
-        eq_count = len(self.eq_map)
-        total = eq_count + len(unique)
-
-        if total > MAX_WS_SUBS:
-            cap = max(0, MAX_WS_SUBS - eq_count)
-            unique = unique[:cap]
-            print(f"[WS] capped option tokens to {len(unique)} to stay under MAX_WS_SUBS={MAX_WS_SUBS}")
+        # Only underlyings that actually got option tokens; the greeks poller
+        # queries every entry in md:active_expiry.
+        self.active_expiry_by_underlying.update(expiry_of)
+        print(
+            f"[WS] option plan: {base_n} symbols at +/-{STRIKES_AROUND} strikes, "
+            f"{wide_n} widened to +/-{STRIKES_AROUND_WIDE}; tokens={len(unique)} (budget {budget})"
+        )
 
         if not unique:
             print("[WS] no option contracts planned (many symbols may not have options)")

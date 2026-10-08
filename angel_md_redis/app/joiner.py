@@ -98,6 +98,7 @@ class OptionsGreeksJoiner:
         self._cache_t: Dict[Tuple[str, str], float] = {}
         self._spot: Dict[str, float] = {}
         self._spot_t: float = 0.0
+        self._spot_last_id: Optional[str] = None
 
     def _load_greeks_map(self, underlying: str, expiry: str) -> Dict[str, Dict[str, Any]]:
         """
@@ -167,10 +168,17 @@ class OptionsGreeksJoiner:
         now = time.time()
         if (now - self._spot_t) < SPOT_REFRESH_SEC:
             return
+        # Read every equity tick since the last refresh (a fixed newest-N
+        # window misses most symbols once many are collected).
         try:
-            rows = self.r.xrevrange(EQ_STREAM, count=40)
+            if self._spot_last_id is None:
+                rows = list(reversed(self.r.xrevrange(EQ_STREAM, count=20000)))
+            else:
+                rows = self.r.xrange(EQ_STREAM, min=f"({self._spot_last_id}", count=50000)
         except Exception:
             return
+        if rows:
+            self._spot_last_id = rows[-1][0]
         for _mid, fields in rows:
             sym = str(fields.get("symbol") or "").strip().upper()
             ltp = _safe_float(fields.get("ltp"))

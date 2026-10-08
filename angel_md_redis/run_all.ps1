@@ -66,15 +66,15 @@ function Start-Worker {
     param (
         [string]$Name,
         [string]$Script,
-        [string]$Args = ""
+        [string]$WorkerArgs = ""   # not $Args: that is a PowerShell automatic variable and arrives empty
     )
     Write-Host "  -> Launching worker: $Name" -ForegroundColor Green
     $stdoutFile = Join-Path $logDir "$Name.log"
     $stderrFile = Join-Path $logDir "$Name.err.log"
     $pidFile = Join-Path $pidDir "$Name.pid"
     
-    if ($Args) {
-        $proc = Start-Process -FilePath $VenvPython -ArgumentList "$Script $Args" -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -PassThru -NoNewWindow
+    if ($WorkerArgs) {
+        $proc = Start-Process -FilePath $VenvPython -ArgumentList "$Script $WorkerArgs" -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -PassThru -NoNewWindow
     } else {
         $proc = Start-Process -FilePath $VenvPython -ArgumentList "$Script" -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -PassThru -NoNewWindow
     }

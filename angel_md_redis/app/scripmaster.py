@@ -95,12 +95,26 @@ def resolve_eq_tokens(df: pd.DataFrame, symbols: List[str]) -> Dict[str, Dict[st
             r = hit.iloc[0]
             out[s] = {"tradingsymbol": r["symbol"], "token": str(r["token"]), "exchange": "NSE"}
         else:
-            # fallback: startwith and endswith -EQ
-            hit2 = d[d["sym_u"].str.startswith(s) & d["sym_u"].str.endswith("-EQ")]
+            # Fallback: same base symbol in another series (e.g. HFCL-BE for
+            # trade-to-trade stocks). Exact base match only: a prefix match
+            # would map PNB to PNBHOUSING.
+            hit2 = d[d["sym_u"].str.split("-").str[0] == s]
+            hit2 = hit2[hit2["sym_u"].str.endswith(("-EQ", "-BE", "-BZ"))]
             if not hit2.empty:
                 r = hit2.iloc[0]
                 out[s] = {"tradingsymbol": r["symbol"], "token": str(r["token"]), "exchange": "NSE"}
     return out
+
+
+def _options_by_underlying(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """NFO option rows grouped by exact underlying name, built once per ScripMaster frame."""
+    cached = df.attrs.get("_opt_by_underlying")
+    if cached is not None:
+        return cached
+    d = df[(df["exch_seg"] == "NFO") & (df["instrumenttype"].str.contains("OPT", na=False))]
+    groups = {str(name).upper(): g for name, g in d.groupby(d["name"].astype(str).str.upper())}
+    df.attrs["_opt_by_underlying"] = groups
+    return groups
 
 def pick_nearest_expiry(d: pd.DataFrame) -> Optional[dt.date]:
     today = dt.date.today()
@@ -139,13 +153,12 @@ def build_atm_option_tokens(
       - list of {token, tradingsymbol, underlying, expiry, strike, cp, exchange}
       - expiry_str like '2026-01-27' for greeks poller
     """
-    d = df[(df["exch_seg"] == "NFO") & (df["instrumenttype"].str.contains("OPT", na=False))].copy()
-    d["sym_u"] = d["symbol"].str.upper()
-
-    # simple reliable match: tradingsymbol startswith underlying
-    d = d[d["sym_u"].str.startswith(underlying)]
-    if d.empty:
+    # Match on the exact underlying name. A tradingsymbol prefix match mixed in
+    # other stocks' options (LT -> LTF/LTM, PNB -> PNBHOUSING).
+    d = _options_by_underlying(df).get(underlying.upper())
+    if d is None or d.empty:
         return [], None
+    d = d.copy()
 
     expiry = pick_nearest_expiry(d)
     if not expiry:
