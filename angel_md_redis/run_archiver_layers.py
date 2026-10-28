@@ -20,9 +20,13 @@ from __future__ import annotations
 import sys
 import time
 import threading
+import os
+import json
+from pathlib import Path
 from typing import Dict, Tuple
 
 from app.archiver import StreamParquetArchiver
+from app.config import BASE_DIR  # loads .env before constructing Redis clients
 
 # name -> (redis stream, consumer, batch_size)
 # Existing Angel One consumers keep the same names so a restart continues
@@ -70,6 +74,7 @@ STREAMS: Dict[str, Tuple[str, str, int]] = {
     # Inputs to Module 9
     "entry_trigger": ("md:entry:trigger", "arch-entry-trigger-1", 2000),
     "strike_select": ("md:strike:select", "arch-strike-select-1", 2000),
+    "capital_alloc": ("md:capital:alloc", "arch-capital-alloc-1", 2000),
     # Module 9 — Greeks change
     "greeks_change": ("md:greeks_change:signal", "arch-greeks-change-1", 2000),
 }
@@ -77,6 +82,8 @@ STREAMS: Dict[str, Tuple[str, str, int]] = {
 GROUP = "archive"
 OUT_DIR = "data_lake"
 RESTART_SEC = 5
+STOP_EVENT = threading.Event()
+STOP_FILE = Path(os.getenv("ARCHIVER_STOP_FILE", str(BASE_DIR / "runtime" / "archiver.stop")))
 
 
 def _run_one(name: str, stream: str, consumer: str, batch: int) -> None:
@@ -91,7 +98,8 @@ def _run_one(name: str, stream: str, consumer: str, batch: int) -> None:
                 batch_size=batch,
                 flush_sec=10,
                 partition_by_symbol=True,
-            ).run_forever()
+            ).run_forever(stop_event=STOP_EVENT)
+            return
         except Exception as e:
             print(f"[ARCH_LAYERS] {name} crashed: {e!r}; restarting in {RESTART_SEC}s")
             time.sleep(RESTART_SEC)
@@ -116,6 +124,19 @@ def _start_threads(names: list[str]) -> None:
 
 
 def main() -> None:
+    if sys.platform == "win32":
+        import ctypes
+        # Keep the laptop awake during collection; the request ends when this
+        # process exits. The display may still turn off normally.
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000001)
+
+    def watch_stop() -> None:
+        while not STOP_EVENT.wait(1):
+            if STOP_FILE.exists():
+                print("[ARCH_LAYERS] shutdown requested; draining streams and flushing")
+                STOP_EVENT.set()
+
+    threading.Thread(target=watch_stop, daemon=True).start()
     arg = (sys.argv[1] if len(sys.argv) > 1 else "all").strip().lower()
 
     if arg in ("-h", "--help", "help"):
@@ -132,6 +153,10 @@ def main() -> None:
 
     if arg == "all":
         _start_threads(list(STREAMS.keys()))
+        STOP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STOP_FILE.with_name("archiver-drained.json").write_text(
+            json.dumps({"drained_at": time.time(), "streams": len(STREAMS)}), encoding="utf-8"
+        )
         return
 
     if arg not in STREAMS:

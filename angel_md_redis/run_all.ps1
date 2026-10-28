@@ -1,5 +1,14 @@
 # PowerShell Runner for Angel One Market Data Pipeline (Windows)
+param([switch]$Resume)
 Set-Location $PSScriptRoot
+. (Join-Path $PSScriptRoot 'automation_common.ps1')
+if (-not $Resume -and @(Get-PipelineWorkers).Count -gt 0) {
+    throw 'Pipeline workers are already running. Stop them before starting another session.'
+}
+if (@(Get-PipelineWorkers | Where-Object Name -eq 'arch_layers').Count -eq 0) {
+    Remove-Item -LiteralPath (Join-Path $RuntimeDir 'archiver.stop') -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $RuntimeDir 'archiver-drained.json') -Force -ErrorAction SilentlyContinue
+}
 
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host " Starting Angel One Market Data Pipeline " -ForegroundColor Cyan
@@ -36,10 +45,14 @@ $env:LOG_TO_FILE = "0"
 
 # 3. Start Redis Container
 Write-Host "`n[1/4] Ensuring Redis Docker Container is running..." -ForegroundColor Yellow
-docker compose up -d
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: Failed to start Redis Docker container. Make sure Docker Desktop is running." -ForegroundColor Red
-    exit 1
+if (-not $Resume -or @(Get-PipelineWorkers).Count -eq 0) {
+    docker compose up -d
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: Failed to start Redis Docker container. Make sure Docker Desktop is running." -ForegroundColor Red
+        exit 1
+    }
+} else {
+    Write-Host 'Reusing running Redis and collection workers.'
 }
 
 # 4. Setup Logging and PID directories
@@ -51,6 +64,7 @@ New-Item -ItemType Directory -Force -Path $pidDir | Out-Null
 Write-Host "`n[2/4] Seeding candle history for Indicator Signals..." -ForegroundColor Yellow
 $histLog = Join-Path $logDir "history_bootstrap.log"
 $histErr = Join-Path $logDir "history_bootstrap.err.log"
+if ($env:SKIP_HISTORY_BOOTSTRAP -ne '1') {
 & $VenvPython "run_history_bootstrap.py" 1> $histLog 2> $histErr
 if ($LASTEXITCODE -ne 0) {
     Write-Host "WARNING: history bootstrap failed (see $histErr). Supertrend/EMA/HTF/pivots may stay NEUTRAL until live bars accumulate." -ForegroundColor Yellow
@@ -59,6 +73,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "Waiting 8s so the next Angel login uses a fresh TOTP..." -ForegroundColor Gray
 Start-Sleep -Seconds 8
+}
 
 Write-Host "`n[3/4] Spawning Background Workers..." -ForegroundColor Yellow
 
@@ -68,21 +83,36 @@ function Start-Worker {
         [string]$Script,
         [string]$WorkerArgs = ""   # not $Args: that is a PowerShell automatic variable and arrives empty
     )
+    if ($Resume -and @(Get-PipelineWorkers | Where-Object Name -eq $Name).Count -gt 0) {
+        Write-Host "  -> Already running: $Name"
+        return
+    }
     Write-Host "  -> Launching worker: $Name" -ForegroundColor Green
     $stdoutFile = Join-Path $logDir "$Name.log"
     $stderrFile = Join-Path $logDir "$Name.err.log"
     $pidFile = Join-Path $pidDir "$Name.pid"
+    # Preserve the previous failure log when restarting a stopped worker.
+    if ($Resume) {
+        foreach ($oldLog in @($stdoutFile, $stderrFile)) {
+            if (Test-Path -LiteralPath $oldLog) {
+                Move-Item -LiteralPath $oldLog -Destination ($oldLog + '.' + (Get-Date -Format 'HHmmssfff') + '.previous')
+            }
+        }
+    }
     
     if ($WorkerArgs) {
-        $proc = Start-Process -FilePath $VenvPython -ArgumentList "$Script $WorkerArgs" -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -PassThru -NoNewWindow
+        $proc = Start-Process -FilePath $VenvPython -ArgumentList "$Script $WorkerArgs" -WorkingDirectory $PSScriptRoot -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -PassThru -WindowStyle Hidden
     } else {
-        $proc = Start-Process -FilePath $VenvPython -ArgumentList "$Script" -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -PassThru -NoNewWindow
+        $proc = Start-Process -FilePath $VenvPython -ArgumentList "$Script" -WorkingDirectory $PSScriptRoot -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -PassThru -WindowStyle Hidden
     }
     
     $proc.Id | Out-File -FilePath $pidFile -Encoding ascii
+    @{ Id = $proc.Id; Name = $Name; Script = $Script; StartTicks = $proc.StartTime.ToUniversalTime().Ticks.ToString() } |
+        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $pidDir "$Name.process.json") -Encoding UTF8
 }
 
 # --- Core Pipeline Workers ---
+Start-Worker "arch_layers" "run_archiver_layers.py" "all"
 Start-Worker "producer" "run_producer.py"
 Start-Sleep -Seconds 8
 Start-Worker "greeks" "run_greeks_only.py"
@@ -123,7 +153,7 @@ Start-Worker "expected_move" "run_expected_move.py"
 Start-Worker "greeks_change" "run_greeks_change.py"
 
 # --- Archiver: all Angel One + layer streams -> data_lake/*.parquet ---
-Start-Worker "arch_layers" "run_archiver_layers.py" "all"
+# Started before ingestion above.
 
 # --- Copy dashboard inputs to a cloud Redis (for Streamlit Community Cloud) ---
 # Only when CLOUD_REDIS_URL is set (environment or .env).

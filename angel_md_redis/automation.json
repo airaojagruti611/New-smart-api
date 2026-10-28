@@ -1,0 +1,16 @@
+{
+  "timezone": "Asia/Kolkata",
+  "prepare_time": "09:10",
+  "open_time": "09:15",
+  "close_time": "15:40",
+  "upload_interval_minutes": 30,
+  "local_retention_days": 2,
+  "drive_remote": "gdrive:SmartAPI",
+  "calendar_years": [2026],
+  "holidays": ["2026-01-15", "2026-01-26", "2026-03-03", "2026-03-26", "2026-03-31", "2026-04-03", "2026-04-14", "2026-05-01", "2026-05-28", "2026-06-26", "2026-09-14", "2026-10-02", "2026-10-20", "2026-11-10", "2026-11-24", "2026-12-25"],
+  "special_sessions": {},
+  "sources": [
+    "https://www.nseindia.com/resources/exchange-communication-holidays?article_id=432919950.0",
+    "https://nsearchives.nseindia.com/content/circulars/FAOP71777.pdf"
+  ]
+}

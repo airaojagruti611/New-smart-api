@@ -2,6 +2,10 @@
 
 Step-by-step guide for `smartapi_new/angel_md_redis`.
 
+For automatic market-hours collection and Google Drive archival on Windows, see
+[the developer setup guide](DATA-COLLECTION-SETUP.md) and
+[the operations reference](MARKET-AUTOMATION.md).
+
 The launcher starts every worker through **Module 9 (Greeks Change)** and one parquet archiver that writes Angel One ticks **and** all layer outputs into `data_lake/` (same folder layout as Angel One data).
 
 ---

@@ -1,5 +1,7 @@
 import os
 import time
+import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -152,7 +154,7 @@ class StreamParquetArchiver:
         folder.mkdir(parents=True, exist_ok=True)
 
         # atomic-ish write: write tmp then rename
-        ts = int(time.time() * 1000)
+        ts = f"{int(time.time() * 1000)}-{uuid.uuid4().hex}"
         tmp_path = folder / f".tmp-part-{ts}.parquet"
         final_path = folder / f"part-{ts}.parquet"
 
@@ -238,7 +240,7 @@ class StreamParquetArchiver:
     # Main loop
     # ---------------------------
 
-    def run_forever(self) -> None:
+    def run_forever(self, stop_event: Optional[threading.Event] = None) -> None:
         print(
             f"[ARCHIVER] running stream={self.stream} group={self.group} consumer={self.consumer} "
             f"batch_size={self.batch_size} flush_sec={self.flush_sec}"
@@ -250,8 +252,9 @@ class StreamParquetArchiver:
             got = self._ingest_messages(resp) if resp else 0
             if got == 0:
                 break
-            if len(self._buf_rows) >= self.batch_size:
-                self._flush()
+            # ACK each pending page before reading ID 0 again. Otherwise the
+            # same unacknowledged page is ingested repeatedly up to batch_size.
+            self._flush()
 
         self._flush()
 
@@ -260,6 +263,13 @@ class StreamParquetArchiver:
             resp = self._xreadgroup(">")
             if resp:
                 self._ingest_messages(resp)
+
+            # The launcher stops producers/analytics before requesting this.
+            # Drain every remaining stream entry, then flush the final batch.
+            if stop_event is not None and stop_event.is_set():
+                self._flush()
+                if not resp or not any(msgs for _, msgs in resp):
+                    return
 
             # flush conditions
             if len(self._buf_rows) >= self.batch_size:

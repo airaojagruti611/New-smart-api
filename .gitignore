@@ -43,6 +43,9 @@ logs/
 # If you WANT data_lake in git, remove this line.
 # -------------------------
 data_lake/
+angel_md_redis/tools/
+angel_md_redis/runtime/
+angel_md_redis/automation.local.json
 
 # -------------------------
 # OS / Editor junk
