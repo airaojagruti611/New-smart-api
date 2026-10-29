@@ -23,7 +23,7 @@ sleep. Keep the laptop plugged in and connected to the internet.
   request the archiver to drain Redis and flush all remaining buffered rows.
 - After the archiver confirms completion: stop this project's Redis container
   and upload the final files. Docker Desktop and other projects are left alone.
-- Every 30 minutes: upload completed files in the background. Slow uploads do
+- At the configured interval (30 minutes by default): upload completed files in the background. Slow uploads do
   not delay the close controller. Failed uploads retain local data and retry
   while the controller is scheduled, or on the next signed-in market day.
 - After checksum verification, remove local files older than two days. Keep
@@ -145,6 +145,10 @@ account, `uploaded_checked`, `last_verified_at`, and `last_verified_files`.
 The uploader transfers today's partitions before historical backfill, in bounded
 batches (40 files on this laptop). It checkpoints verified files in SQLite so
 interrupted uploads resume without hashing the full historical archive first.
+Each run is bounded by `upload_max_batches` (default 8) and yields when the
+calendar day changes, so the next run can prioritize the current day's files.
+Set `upload_interval_minutes` and `upload_max_batches` in the local configuration
+to tune how often the uploader refreshes that priority.
 The progress count is for the current uploader run. `pass_complete: false` means
 there is still pending work; it must not be read as a complete backup receipt.
 Errors: `logs/automation/*upload.err.log` and the scheduled task's result/history.

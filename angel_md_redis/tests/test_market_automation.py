@@ -113,6 +113,14 @@ class UploadTests(unittest.TestCase):
         self.assertTrue((self.base / 'runtime' / 'upload-progress.json').exists())
         self.assertFalse((self.base / 'runtime' / 'upload-status.json').exists())
 
+    def test_configured_batch_limit_bounds_each_upload_run(self):
+        self.old_file()
+        self.uploader.config['upload_max_batches'] = 1
+        result = self.uploader.upload(final=True, cleanup=False)
+        self.assertFalse(result['pass_complete'])
+        self.assertEqual(result['uploaded_checked'], 1)
+        self.assertTrue((self.base / 'runtime' / 'upload-progress.json').exists())
+
     def test_verified_files_skipped_but_later_retention_still_runs(self):
         path = self.old_file()
         first = self.uploader.upload(final=True, cleanup=False)

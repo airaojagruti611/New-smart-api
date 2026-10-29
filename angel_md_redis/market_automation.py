@@ -144,6 +144,10 @@ class DriveUploader:
             yield [self._files(source, source, now, today, final)]
 
     def upload(self, final: bool = False, cleanup: bool = True, max_batches: int | None = None) -> dict:
+        if max_batches is None:
+            max_batches = int(self.config.get('upload_max_batches', 8))
+        if max_batches < 1:
+            raise ValueError('upload_max_batches must be at least 1')
         if (self.runtime / "uploads.paused").exists():
             raise RuntimeError("Drive uploads paused pending confirmation of the correct Google account")
         if not self.ready():
@@ -222,7 +226,12 @@ class DriveUploader:
                 progress.with_suffix('.tmp').write_text(json.dumps(report, indent=2), encoding='utf-8')
                 progress.with_suffix('.tmp').replace(progress)
                 batch_count += 1
-                if max_batches is not None and batch_count >= max_batches:
+                # Reopen partition iterators on the next run so an overnight
+                # backfill cannot keep serving yesterday's snapshot forever.
+                current_day = datetime.now(ZoneInfo(self.config['timezone'])).date().isoformat()
+                if current_day != today:
+                    return report
+                if batch_count >= max_batches:
                     return report
         finally:
             database.close()

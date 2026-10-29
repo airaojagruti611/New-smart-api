@@ -122,6 +122,7 @@ Create ignored `automation.local.json` beside `automation.json`:
   "drive_remote": "gdrive:SmartAPI",
   "upload_interval_minutes": 30,
   "upload_batch_files": 40,
+  "upload_max_batches": 8,
   "local_retention_days": 2
 }
 ```
@@ -266,6 +267,11 @@ The uploader prioritizes today's partitions, copies bounded batches, verifies
 checksums, then checkpoints file metadata in `runtime/verified-uploads.sqlite3`.
 An interrupted pass resumes from those checkpoints. Historical backfill and many
 tiny files can take substantial time; this is batch archival, not instant mirroring.
+Each uploader run processes at most `upload_max_batches` and yields when the date
+changes. The next scheduled run refreshes its file list so a multi-day backfill
+does not indefinitely block the current market day's files. Tune the interval
+and batch limit together; a five-minute interval with two batches is one option
+when frequent current-day refreshes matter more than long backfill passes.
 
 ## 8. Manual controls and troubleshooting
 
