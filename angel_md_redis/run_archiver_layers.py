@@ -25,7 +25,7 @@ import json
 from pathlib import Path
 from typing import Dict, Tuple
 
-from app.archiver import StreamParquetArchiver
+from app.archiver import ArchiveDataLossError, StreamParquetArchiver
 from app.config import BASE_DIR  # loads .env before constructing Redis clients
 
 # name -> (redis stream, consumer, batch_size)
@@ -84,6 +84,30 @@ OUT_DIR = "data_lake"
 RESTART_SEC = 5
 STOP_EVENT = threading.Event()
 STOP_FILE = Path(os.getenv("ARCHIVER_STOP_FILE", str(BASE_DIR / "runtime" / "archiver.stop")))
+ERROR_FILE = BASE_DIR / "runtime" / "archiver-errors.json"
+FATAL_ERRORS: Dict[str, str] = {}
+ERROR_LOCK = threading.Lock()
+
+
+def _positive_env(name: str, default: int) -> int:
+    value = int(os.getenv(name, str(default)))
+    if value < 1:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+def archiver_options(batch: int) -> dict:
+    return {
+        "batch_size": _positive_env("ARCHIVE_BATCH_SIZE", max(batch, 32_000)),
+        "read_count": _positive_env("ARCHIVE_READ_COUNT", 2_000),
+        "flush_sec": _positive_env("ARCHIVE_FLUSH_SEC", 60),
+        "max_buffer_bytes": _positive_env("ARCHIVE_MAX_BUFFER_MB", 16) * 1024 * 1024,
+        "partition_by_symbol": os.getenv("ARCHIVE_PARTITION_BY_SYMBOL", "0").lower() in ("1", "true", "yes"),
+        "status_dir": str(BASE_DIR / "runtime" / "archive_metrics"),
+    }
+
+
+WRITE_SEMAPHORE = threading.BoundedSemaphore(_positive_env("ARCHIVE_WRITE_CONCURRENCY", 2))
 
 
 def _run_one(name: str, stream: str, consumer: str, batch: int) -> None:
@@ -95,10 +119,20 @@ def _run_one(name: str, stream: str, consumer: str, batch: int) -> None:
                 group=GROUP,
                 consumer=consumer,
                 out_dir=OUT_DIR,
-                batch_size=batch,
-                flush_sec=10,
-                partition_by_symbol=True,
+                write_semaphore=WRITE_SEMAPHORE,
+                **archiver_options(batch),
             ).run_forever(stop_event=STOP_EVENT)
+            return
+        except ArchiveDataLossError as error:
+            # XAUTOCLAIM can remove tombstones from Redis' pending list. Persist
+            # the gap so a retry/restart cannot turn that into a false all-clear.
+            with ERROR_LOCK:
+                FATAL_ERRORS[name] = str(error)
+                ERROR_FILE.parent.mkdir(parents=True, exist_ok=True)
+                temporary = ERROR_FILE.with_suffix(".tmp")
+                temporary.write_text(json.dumps(FATAL_ERRORS, indent=2), encoding="utf-8")
+                temporary.replace(ERROR_FILE)
+            print(f"[ARCH_LAYERS] DATA GAP {name}: {error}; inspect {ERROR_FILE}", flush=True)
             return
         except Exception as e:
             print(f"[ARCH_LAYERS] {name} crashed: {e!r}; restarting in {RESTART_SEC}s")
@@ -124,6 +158,7 @@ def _start_threads(names: list[str]) -> None:
 
 
 def main() -> None:
+    archiver_options(8_000)  # reject invalid settings before spawning workers
     if sys.platform == "win32":
         import ctypes
         # Keep the laptop awake during collection; the request ends when this
@@ -151,8 +186,13 @@ def main() -> None:
             print(f"{name:18s}  {stream:32s}  {consumer}  batch={batch}")
         raise SystemExit(0)
 
+    if ERROR_FILE.exists():
+        raise RuntimeError(f"Unresolved archive data gap: inspect {ERROR_FILE} before restarting")
+
     if arg == "all":
         _start_threads(list(STREAMS.keys()))
+        if FATAL_ERRORS:
+            raise RuntimeError(f"Archive data gaps detected; no drain confirmation written. Inspect {ERROR_FILE}")
         STOP_FILE.parent.mkdir(parents=True, exist_ok=True)
         STOP_FILE.with_name("archiver-drained.json").write_text(
             json.dumps({"drained_at": time.time(), "streams": len(STREAMS)}), encoding="utf-8"

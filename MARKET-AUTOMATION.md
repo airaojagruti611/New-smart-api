@@ -91,6 +91,11 @@ Google Drive / SmartAPI /
 
 The archiver now includes the capital allocation stream that the launcher
 already runs. Existing Parquet files remain in their original partition layout.
+New archives from the combined launcher default to larger files directly under
+`stream=.../dt=.../`, containing multiple symbols. `symbol` and `underlying`
+remain columns in the files. Legacy per-symbol files remain readable alongside
+the new files. Set `ARCHIVE_PARTITION_BY_SYMBOL=1` in `.env` to retain per-symbol
+folders at the cost of more files and slower disk/Drive operations.
 Temporary parts, PID records and process identity files are excluded. Environment
 files, code, OAuth tokens and active Docker/Redis persistence are not uploaded.
 Automation's own operational transcripts remain local in `logs/automation` to
@@ -155,6 +160,54 @@ Errors: `logs/automation/*upload.err.log` and the scheduled task's result/histor
 If archiver drain times out, Redis is retained for recovery and a later tick
 retries. Existing processes started by old scripts lack identity records; stop
 those with their original launcher before relying on this automation.
+
+## Archiver performance and accuracy
+
+The launcher batches up to 32,000 records per stream, with a 60-second live
+flush interval and an approximate 16 MiB buffered-row memory limit per stream.
+Shutdown uses the same batching and flushes the last partial batch when drained;
+it does not force a new file for every Redis page. Direct Arrow conversion avoids
+the previous DataFrame/grouping overhead. Only two streams write at once by
+default to limit disk contention. Reads, Arrow construction and other stream
+workers can still use additional memory beyond the buffered-row limit.
+
+Configure these positive integer settings in `.env` before the next start:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `ARCHIVE_BATCH_SIZE` | 32000 | Maximum rows per buffered batch |
+| `ARCHIVE_READ_COUNT` | 2000 | Maximum records requested per Redis read |
+| `ARCHIVE_FLUSH_SEC` | 60 | Target normal flush interval while consuming |
+| `ARCHIVE_MAX_BUFFER_MB` | 16 | Approximate memory limit for buffered Python rows |
+| `ARCHIVE_WRITE_CONCURRENCY` | 2 | Maximum simultaneous batch writers |
+| `ARCHIVE_PARTITION_BY_SYMBOL` | 0 | Set 1 for legacy symbol directories |
+
+Files are flushed to disk, synchronized, checked for a complete Parquet footer
+and matching row count, then atomically published before Redis acknowledgement.
+Parquet pages include checksums. Recovery advances through pending IDs without
+re-reading the same page and can reclaim pending messages idle for at least
+60 seconds under abandoned consumer names. Only one archive process per stream
+and consumer group should run at a time.
+
+Identical-batch retries reuse the same deterministic part filename. Recovery
+with different batch boundaries is still at least once: downstream merging must
+deduplicate stream name plus `_redis_id`. Missing partition values are retained;
+malformed UTF-8 is reported rather than silently changed. Receive dates fall
+back to Redis entry timestamps so replayed records keep their original day.
+
+Per-stream counters and last-flush timing are available in
+`runtime/archive_metrics/md_ticks_opt.json` (and equivalent stream files).
+Counters are for the current process, not lifetime totals. A detected missing or
+trimmed pending payload is persisted to `runtime/archiver-errors.json`; no
+successful drain marker is emitted. Investigate and reconcile that gap before
+clearing the error file and restarting. Archiving cannot restore data that was
+already trimmed from Redis and has no archive copy.
+
+Run `scripts/benchmark_archiver.py` for a synthetic temporary-file benchmark.
+The final 10,000-row/100-symbol shutdown comparison measured 4.19 seconds and 1,000
+files before optimization versus 0.12 seconds and one file after optimization,
+with every unique input ID verified. This measures local synthetic archive work;
+it is not a guaranteed live throughput, shutdown time, or Drive upload speed.
 
 Google Drive cannot add RAM to the laptop. Redis/Docker retain their own local
 working state; the task stops this Redis after collection to release its RAM.

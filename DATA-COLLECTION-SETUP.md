@@ -254,11 +254,14 @@ In the **verified Google account**, browse:
 
 ```text
 My Drive / SmartAPI / data_lake /
-  stream=md_ticks_opt / dt=YYYY-MM-DD / underlying=SYMBOL / part-....parquet
-  stream=md_ticks_eq  / dt=YYYY-MM-DD / symbol=SYMBOL     / part-....parquet
+  stream=md_ticks_opt / dt=YYYY-MM-DD / part-....parquet
+  stream=md_ticks_eq  / dt=YYYY-MM-DD / part-....parquet
 ```
 
-Other signal streams use the same date layout, sometimes without a symbol folder.
+New parts contain multiple symbols; `symbol`/`underlying` remain data columns.
+Existing archives can also have `symbol=...` or `underlying=...` subdirectories.
+All signal streams use the same stream/date layout. Legacy symbol partitioning
+can be restored with `ARCHIVE_PARTITION_BY_SYMBOL=1` in `.env`.
 Folder creation alone is not upload completion. Open a date/symbol folder and
 compare actual files with `last_verified_files`. Drive may not preview Parquet;
 download it and read it with pandas or another Parquet reader.
@@ -314,6 +317,13 @@ and an unchanged-file check. Remote archives are not deleted by local cleanup.
 Budget local disk for the backlog; Drive quota does not eliminate local buffering.
 
 ## 9. Developer validation and repository hygiene
+
+The combined archiver defaults to 32,000-row batches, a 60-second flush interval,
+16 MiB of approximate buffered-row memory per stream, and two simultaneous
+writers. Shutdown retains batching to avoid producing thousands of tiny files.
+See [archiver tuning and accuracy](MARKET-AUTOMATION.md#archiver-performance-and-accuracy)
+for settings, recovery guarantees and per-stream progress counters. New settings
+apply when archivers next start; they do not rewrite existing historical files.
 
 ```powershell
 & .\.venv\Scripts\python.exe -m unittest discover -s tests -v
