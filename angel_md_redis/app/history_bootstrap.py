@@ -188,14 +188,14 @@ class _StreamIndex:
             by_sym: Dict[str, set] = {}
             last = "-"
             while True:
-                rows = self.r.xrange(self.stream, min=last, max="+", count=50000)
+                rows = self.r.xrange(self.stream, min=last, max="+", count=5000)
                 if not rows:
                     break
                 for _mid, fields in rows:
                     parsed = parse_candle_fields(fields)
                     if parsed:
                         by_sym.setdefault(parsed[0], set()).add(int(parsed[1].ts_ms))
-                if len(rows) < 50000:
+                if len(rows) < 5000:
                     break
                 last = f"({rows[-1][0]}"
             self._by_sym = by_sym
@@ -430,7 +430,7 @@ def seed_history(
     try:
         print(f"[HISTORY] Angel login + ScripMaster for {len(symbols)} symbols")
         _obj, auth_token, _feed = login(retries=1, delay_sec=2.0)
-        df = load_scripmaster()
+        df = load_scripmaster(symbols=symbols, equities_only=True)
         tokens = resolve_eq_tokens(df, list(symbols))
     except Exception as e:
         print(f"[HISTORY] Angel login skipped: {e!r}; Yahoo NSE fallback for all TFs")

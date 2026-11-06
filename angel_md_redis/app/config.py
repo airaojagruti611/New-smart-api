@@ -33,7 +33,7 @@ ANGEL_CLIENT_CODE = env_str("ANGEL_CLIENT_CODE")
 ANGEL_PIN = env_str("ANGEL_PIN")
 ANGEL_TOTP_SECRET = env_str("ANGEL_TOTP_SECRET")
 
-REDIS_URL = env_str("REDIS_URL", "redis://localhost:6379/0")
+REDIS_URL = env_str("REDIS_URL", "redis://127.0.0.1:6380/0")
 
 WS_WARMUP_SEC = env_int("WS_WARMUP_SEC", 8)
 WS_STALE_SEC = env_int("WS_STALE_SEC", 90)  # reconnect if no tick for this long in market hours

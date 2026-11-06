@@ -67,7 +67,7 @@ class MarketDataProducer:
         self.symbols = symbols
 
         self.rs = RedisStore()
-        self.df = load_scripmaster()
+        self.df = load_scripmaster(symbols=symbols)
 
         self.eq_map = resolve_eq_tokens(self.df, symbols)
         self.eq_token_to_symbol = {v["token"]: k for k, v in self.eq_map.items()}

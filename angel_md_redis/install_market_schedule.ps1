@@ -3,6 +3,9 @@ param([switch]$Remove)
 $taskName = 'SmartAPI-MarketHours'
 if ($Remove) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    if (Get-ScheduledTask -TaskName 'SmartAPI-DriveUploads' -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName 'SmartAPI-DriveUploads' -Confirm:$false
+    }
     return
 }
 # Windows triggers use local time. Refuse a silent timezone mismatch.
@@ -36,5 +39,15 @@ $logon = New-ScheduledTaskTrigger -AtLogOn -User ([System.Security.Principal.Win
 $settings = New-ScheduledTaskSettingsSet -WakeToRun -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 12)
 $principal = New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger ($triggers + @($logon)) -Settings $settings -Principal $principal -Description 'SmartAPI: NSE market-hours collection, graceful close, Google Drive uploads and verified local retention.' -Force | Out-Null
+# Upload checks are independent of market hours. They run while the user is
+# signed in/awake; do not wake the laptop every five minutes overnight.
+$uploadAction = New-ScheduledTaskAction -Execute $windowlessPython -Argument ('"' + (Join-Path $ProjectRoot 'run_upload_hidden.py') + '"') -WorkingDirectory $ProjectRoot
+$uploadDaily = New-ScheduledTaskTrigger -Daily -At ([datetime]::Today)
+$uploadTemplate = New-ScheduledTaskTrigger -Once -At ([datetime]::Today) -RepetitionInterval (New-TimeSpan -Minutes ([int]$config.upload_interval_minutes)) -RepetitionDuration (New-TimeSpan -Days 1)
+$uploadDaily.Repetition = $uploadTemplate.Repetition
+$uploadSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 24)
+$uploadSettings.Priority = 4 # Normal priority; avoid starving rclone startup/disk reads during capture.
+Register-ScheduledTask -TaskName 'SmartAPI-DriveUploads' -Action $uploadAction -Trigger @($uploadDaily, $logon) -Settings $uploadSettings -Principal $principal -Description 'SmartAPI: independent checksum-verified Drive uploads, continuing after market close until caught up.' -Force | Out-Null
 Get-ScheduledTask -TaskName $taskName | Select-Object TaskName,State
+Get-ScheduledTask -TaskName 'SmartAPI-DriveUploads' | Select-Object TaskName,State
 Write-Host "Installed: prepare $($config.prepare_time), collect $($config.open_time)-$($config.close_time) IST, holidays excluded. Requires your Windows session to stay signed in."

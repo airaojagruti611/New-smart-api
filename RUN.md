@@ -32,7 +32,7 @@ cd c:\Users\Dell\Downloads\smartapi-angelone-main\smartapi-angelone-main\smartap
 docker compose up -d
 ```
 
-Redis listens on `localhost:6379`.
+Project Redis listens on `127.0.0.1:6380` (container port 6379).
 
 Check it:
 
@@ -74,7 +74,8 @@ ANGEL_CLIENT_CODE=your_client_code
 ANGEL_PIN=your_pin
 ANGEL_TOTP_SECRET=your_totp_secret
 
-REDIS_URL=redis://localhost:6379/0
+REDIS_URL=redis://127.0.0.1:6380/0
+REDIS_HOST_PORT=6380
 
 # Optional
 X_CLIENT_LOCAL_IP=127.0.0.1

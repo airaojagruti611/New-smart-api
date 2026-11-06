@@ -145,7 +145,8 @@ ANGEL_API_KEY=OWNER_ENTERS_PRIVATELY
 ANGEL_CLIENT_CODE=OWNER_ENTERS_PRIVATELY
 ANGEL_PIN=OWNER_ENTERS_PRIVATELY
 ANGEL_TOTP_SECRET=OWNER_ENTERS_PRIVATELY
-REDIS_URL=redis://localhost:6379/0
+REDIS_URL=redis://127.0.0.1:6380/0
+REDIS_HOST_PORT=6380
 ARCHIVE_TZ=Asia/Kolkata
 LOG_LEVEL=INFO
 ARCHIVE_BATCH_SIZE=32000
@@ -192,7 +193,7 @@ docker inspect md_redis --format '{{json .Mounts}}'
 Expect `PONG`, a persistent `/data` volume, and the repository Redis config mount.
 The checked-in config uses AOF with `appendfsync everysec` plus snapshots; this
 reduces crash loss but does not promise zero loss under abrupt power failure.
-Container name `md_redis` and host port 6379 must be available on this machine.
+Container name `md_redis` and host port 6380 must be available on this machine.
 If an unrelated Redis already uses them, investigate before changing anything.
 
 Validate the URL actually used by Python:
@@ -233,8 +234,8 @@ properties into it instead of overwriting unrelated settings.
   "expected_drive_email": "devarshsheladiya8084@gmail.com",
   "drive_remote": "gdrive:SmartAPI/device-02",
   "upload_interval_minutes": 5,
-  "upload_batch_files": 40,
-  "upload_max_batches": 2,
+  "upload_batch_files": 256,
+  "upload_max_batches": 8,
   "local_retention_days": 2
 }
 '@ | Set-Content -LiteralPath .\automation.local.json -Encoding UTF8
@@ -384,13 +385,26 @@ Starting this task during market hours starts collection. Outside hours it obeys
 the calendar and can service uploads without starting live ingestion. Do not use
 `run_all.ps1` to bypass the calendar during deployment verification.
 
-The normal task checks every minute from 09:10 until 30 minutes after the cutoff
+The installer also registers `SmartAPI-DriveUploads`, which checks every five
+minutes while signed in/awake and continues draining after market close. See
+[upload operations](DRIVE-UPLOAD-OPERATIONS.md) for monitoring and retry behavior.
+
+The collection task checks every minute from 09:10 until 30 minutes after the cutoff
 (16:10 with present settings), plus at sign-in. The machine must remain powered
 on, signed in, online, with Docker available. Locking the screen is fine. Configure
 plugged-in sleep/lid behavior so the PC stays awake; wake timers cannot power on
 a shut-down laptop. Do not assume collection starts if the user has signed out.
 
 ## 11. Prove live collection and archive accuracy
+
+Install the independent local inspection UI as well:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install_operations_dashboard.ps1
+```
+
+Open `http://127.0.0.1:8502`. See [operations dashboard](OPERATIONS-DASHBOARD.md)
+for session history, verification coverage and access limits.
 
 During an actual open market session, inspect:
 

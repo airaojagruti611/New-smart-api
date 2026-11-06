@@ -61,7 +61,7 @@ def main():
     ensure_group(r, IN_STREAM, GROUP)
 
     log.info("loading ScripMaster ...")
-    df = load_scripmaster()
+    df = load_scripmaster(symbols=symbols)
     log.info(
         "START reading %s, writing %s (offset_base=%s, offset_strong=%s, cooldown_ms=%s symbols=%d)",
         IN_STREAM,

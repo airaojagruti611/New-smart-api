@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light"><title>SmartAPI · Operations</title>
+  <link rel="stylesheet" href="/styles.css"><script src="/app.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to overview</a>
+<aside class="sidebar" aria-label="Workspace navigation">
+  <a class="brand" href="/" aria-label="SmartAPI home"><span class="brand-mark">S<span></span></span><span>SmartAPI<small>COLLECTION WORKSPACE</small></span></a>
+  <div class="nav-label">WORKSPACE</div>
+  <a class="nav-link selected" href="#main" aria-current="page"><span aria-hidden="true">◫</span> Overview</a>
+  <a class="nav-link" href="#uploads"><span aria-hidden="true">↥</span> Drive uploads</a>
+  <a class="nav-link" href="#archive"><span aria-hidden="true">▤</span> Data archive</a>
+  <a class="nav-link" href="#activity"><span aria-hidden="true">◷</span> Activity</a>
+  <div class="sidebar-bottom"><span class="sidebar-dot"></span> Local workspace<small>Data stays on this device<br>until its Drive copy is verified.</small></div>
+</aside>
+<div class="workspace">
+  <header class="topbar"><div class="breadcrumb">Workspace <span>/</span> <strong>Operations</strong></div><div class="topbar-right"><span id="connection" class="connection"><i></i> Connecting</span><span class="timezone">IST · UTC+05:30</span></div></header>
+  <main id="main" tabindex="-1">
+    <div class="page-heading"><div><p class="eyebrow">YOUR DAILY OPERATIONS</p><h1>Pipeline overview</h1><p class="subtitle">From the first market tick to the verified Drive copy.</p></div><div class="page-tools"><label for="session-date">Session date<input id="session-date" type="date"></label><button id="refresh" class="icon-button" type="button" aria-label="Refresh dashboard"><span aria-hidden="true">↻</span></button></div></div>
+    <div id="error-banner" class="error-banner" role="alert" hidden></div>
+    <section id="session-banner" class="session-banner" aria-label="Collection status"><div class="status-symbol" id="banner-symbol" aria-hidden="true">◷</div><div><h2 id="headline">Loading your session…</h2><p id="headline-detail">Reading collection and verification records.</p></div><span id="session-badge" class="badge neutral">Connecting</span></section>
+    <div id="alerts" aria-live="polite"></div>
+    <section class="metrics" aria-label="Session summary">
+      <article class="metric-card"><div class="metric-label">Market ticks archived <span aria-hidden="true">↗</span></div><div id="tick-count" class="metric-value">—</div><div id="tick-detail" class="metric-detail">Equities + options</div></article>
+      <article class="metric-card"><div class="metric-label">Archive files <span aria-hidden="true">▤</span></div><div id="file-count" class="metric-value">—</div><div id="file-detail" class="metric-detail">Completed Parquet parts</div></article>
+      <article class="metric-card"><div class="metric-label">Verified on Drive <span aria-hidden="true">↥</span></div><div id="verified-count" class="metric-value">—</div><div id="verified-detail" class="metric-detail">Checksum verification</div></article>
+      <article class="metric-card"><div class="metric-label"><span id="worker-label">Workers right now</span><span aria-hidden="true">◉</span></div><div id="worker-count" class="metric-value">—</div><div id="worker-detail" class="metric-detail">Checking process identities</div></article>
+    </section>
+    <div class="main-grid">
+      <section class="panel session-panel"><div class="panel-heading"><div><p class="eyebrow">COLLECTION</p><h2>Session timeline</h2></div><span class="small-note" id="timeline-day">All times in IST</span></div><ol id="timeline" class="timeline"><li class="empty">Session milestones will appear here.</li></ol><div class="panel-footer"><span class="small-status-dot"></span><span id="next-session">Checking the next scheduled session…</span></div></section>
+      <section id="uploads" class="panel upload-panel"><div class="panel-heading"><div><p class="eyebrow">GOOGLE DRIVE</p><h2>Archive verification</h2></div><span id="upload-state" class="badge neutral">Checking</span></div><div class="upload-body"><div id="upload-ring" class="upload-ring" role="img" aria-label="Verification progress"><div><strong id="upload-percent">—</strong><span>VERIFIED</span></div></div><div class="upload-summary"><h3 id="upload-title">Finding your files…</h3><p id="upload-description">Only checksum-verified files count toward completion.</p><div class="progress-track" role="progressbar" id="upload-progress" aria-label="Archive files verified" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div><div class="upload-numbers"><span id="upload-verified">— verified</span><span id="upload-pending">— pending</span></div></div></div><div class="destination"><div class="drive-icon" aria-hidden="true">△</div><div><strong id="drive-account">Drive account</strong><span id="drive-folder">My Drive / SmartAPI</span></div></div><div class="upload-footer"><span id="last-verified">No verified upload recorded yet</span><span id="batch-progress"></span></div></section>
+    </div>
+    <section id="archive" class="panel archive-panel"><div class="panel-heading"><div><p class="eyebrow">DATA ARCHIVE</p><h2>Collected streams <span id="stream-count" class="count-badge">—</span></h2></div><label class="search-box"><span aria-hidden="true">⌕</span><span class="sr-only">Filter streams</span><input id="stream-search" type="search" placeholder="Filter streams…"></label></div><div class="table-scroll" tabindex="0" role="region" aria-label="Collected stream table"><table><caption class="sr-only">Archived records, files and Drive verification by stream</caption><thead><tr><th scope="col">Stream</th><th scope="col" class="number">Records archived</th><th scope="col" class="number">Files</th><th scope="col">Drive verification</th><th scope="col" class="number">Archive size</th></tr></thead><tbody id="stream-rows"><tr><td colspan="5" class="empty">Loading stream records…</td></tr></tbody></table></div><div class="panel-footer"><span id="archive-summary">Reading the selected session</span><span>Parquet · multi-symbol parts</span></div></section>
+    <div class="bottom-grid"><section id="activity" class="panel activity-panel"><div class="panel-heading"><div><p class="eyebrow">RECENT EVENTS</p><h2>Activity</h2></div><span class="small-note">Recorded milestones</span></div><ul id="activity-list" class="activity-list"><li class="empty">No events loaded yet.</li></ul></section><section class="panel schedule-panel"><div class="panel-heading"><div><p class="eyebrow">AUTOMATION</p><h2>Schedules &amp; storage</h2></div></div><dl class="settings-list"><div><dt>Collection schedule</dt><dd id="collection-task">Checking</dd></div><div><dt>Drive upload service</dt><dd id="upload-task">Checking</dd></div><div><dt>Local disk available</dt><dd id="disk-free">—</dd></div><div><dt>After market close</dt><dd>Uploads continue</dd></div></dl></section></div>
+    <footer class="page-footer"><span id="updated-at">Waiting for the first snapshot</span><span>Verification uses saved checksum checkpoints. Manual Drive changes are not re-audited.</span></footer>
+  </main>
+</div>
+</body></html>

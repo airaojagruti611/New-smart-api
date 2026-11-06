@@ -98,18 +98,30 @@ try {
     }
     $due = $UploadOnly -or -not $state.LastAttempt -or ((Get-Date) - [datetime]$state.LastAttempt).TotalMinutes -ge $config.upload_interval_minutes
     if ($final -and $state.FinalUpload -ne $session.date) { $due = $true }
+    # Retention is independent of Drive: it protects every Redis consumer's
+    # checkpoint and pending entries, and preserves candle warm-up history.
+    $retentionPath = Join-Path $RuntimeDir 'redis-retention.json'
+    $retentionDue = -not (Test-Path -LiteralPath $retentionPath)
+    if (-not $retentionDue) {
+        $retentionDue = ((Get-Date) - (Get-Item -LiteralPath $retentionPath).LastWriteTime).TotalMinutes -ge 5
+    }
+    if ($session.phase -eq 'open' -and $retentionDue) {
+        $retentionLog = Join-Path $logFolder ($session.date + '-retention.log')
+        $retentionErr = Join-Path $logFolder ($session.date + '-retention.err.log')
+        $retention = Start-Process -FilePath $PipelinePython -ArgumentList ('"' + (Join-Path $ProjectRoot 'run_redis_retention.py') + '"') -WorkingDirectory $ProjectRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput $retentionLog -RedirectStandardError $retentionErr
+        if (-not $retention.WaitForExit(30000)) {
+            & taskkill.exe /PID $retention.Id /T /F 2>$null | Out-Null
+            Write-Warning 'Retention exceeded 30 seconds; keeping remaining history.'
+        }
+    }
     if ($due) {
         # Persist failures too, so a missing connection is retried at a bounded rate.
         if ($state.LastAttempt -and ((Get-Date) - [datetime]$state.LastAttempt).TotalMinutes -lt 5 -and -not $UploadOnly) { return }
         $state.LastAttempt = (Get-Date).ToString('o')
         Save-State
-        $uploadArgs = '"' + (Join-Path $ProjectRoot 'market_automation.py') + '" upload'
-        if ($final) { $uploadArgs += ' --final' }
-        $stamp = Get-Date -Format 'yyyy-MM-dd-HHmmss'
-        # Slow uploads must never block the market-close controller.
-        Start-Process -FilePath $PipelinePython -ArgumentList $uploadArgs -WorkingDirectory $ProjectRoot -WindowStyle Hidden `
-            -RedirectStandardOutput (Join-Path $logFolder "$stamp-upload.log") `
-            -RedirectStandardError (Join-Path $logFolder "$stamp-upload.err.log") | Out-Null
+        # An independent task continues after this controller's market window.
+        # IgnoreNew plus the Python upload lock prevents overlapping uploads.
+        Start-ScheduledTask -TaskName 'SmartAPI-DriveUploads'
     }
 } finally {
     Stop-Transcript | Out-Null

@@ -47,7 +47,7 @@ class ArchiverShutdownTests(unittest.TestCase):
 @unittest.skipUnless(os.getenv("RUN_REDIS_INTEGRATION") == "1", "explicit local Redis integration opt-in")
 class RedisDrainTests(unittest.TestCase):
     def test_actual_redis_pending_and_new_messages_are_archived_once(self):
-        url = "redis://localhost:6379/15"
+        url = os.getenv("TEST_REDIS_URL", "redis://127.0.0.1:6380/15")
         client = redis.Redis.from_url(url)
         stream = "test:archive:" + uuid.uuid4().hex
         self.addCleanup(client.delete, stream)
@@ -67,7 +67,7 @@ class RedisDrainTests(unittest.TestCase):
             self.assertEqual(client.xpending(stream, "archive")["pending"], 0)
 
     def test_multiple_pending_pages_and_new_messages_are_batched_without_duplicates(self):
-        url = 'redis://localhost:6379/15'
+        url = os.getenv('TEST_REDIS_URL', 'redis://127.0.0.1:6380/15')
         client = redis.Redis.from_url(url)
         stream = 'test:archive:' + uuid.uuid4().hex
         self.addCleanup(client.delete, stream)
@@ -91,7 +91,7 @@ class RedisDrainTests(unittest.TestCase):
             self.assertEqual(client.xpending(stream, 'archive')['pending'], 0)
 
     def test_stale_consumer_pending_is_recovered(self):
-        url = 'redis://localhost:6379/15'
+        url = os.getenv('TEST_REDIS_URL', 'redis://127.0.0.1:6380/15')
         client = redis.Redis.from_url(url)
         stream = 'test:archive:' + uuid.uuid4().hex
         self.addCleanup(client.delete, stream)
@@ -111,7 +111,7 @@ class RedisDrainTests(unittest.TestCase):
             self.assertEqual(client.xpending(stream, 'archive')['pending'], 0)
 
     def test_failed_ack_replay_reuses_the_complete_part(self):
-        url = 'redis://localhost:6379/15'
+        url = os.getenv('TEST_REDIS_URL', 'redis://127.0.0.1:6380/15')
         client = redis.Redis.from_url(url)
         stream = 'test:archive:' + uuid.uuid4().hex
         self.addCleanup(client.delete, stream)
@@ -134,7 +134,7 @@ class RedisDrainTests(unittest.TestCase):
 
 
     def test_trimmed_abandoned_payload_is_reported_as_a_data_gap(self):
-        url = 'redis://localhost:6379/15'
+        url = os.getenv('TEST_REDIS_URL', 'redis://127.0.0.1:6380/15')
         client = redis.Redis.from_url(url)
         stream = 'test:archive:' + uuid.uuid4().hex
         self.addCleanup(client.delete, stream)

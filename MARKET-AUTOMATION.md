@@ -1,3 +1,5 @@
+
+
 # Laptop collection and Google Drive storage
 
 For installation on another developer's machine, start with
@@ -108,6 +110,10 @@ The archive provides at-least-once delivery; deduplicate `_redis_id` within a
 stream when merging records after a crash.
 
 ## Commands
+
+Uploads now have an independent `SmartAPI-DriveUploads` task which continues
+after the collection window. See [upload backlog operations](DRIVE-UPLOAD-OPERATIONS.md)
+for installation, continuous drain behavior and today's verification coverage.
 
 ```powershell
 cd D:\New-smart-api\angel_md_redis

@@ -59,7 +59,8 @@ ANGEL_API_KEY=replace_me
 ANGEL_CLIENT_CODE=replace_me
 ANGEL_PIN=replace_me
 ANGEL_TOTP_SECRET=replace_me
-REDIS_URL=redis://localhost:6379/0
+REDIS_URL=redis://127.0.0.1:6380/0
+REDIS_HOST_PORT=6380
 ARCHIVE_TZ=Asia/Kolkata
 LOG_LEVEL=INFO
 ```
@@ -120,8 +121,8 @@ Create ignored `automation.local.json` beside `automation.json`:
 {
   "expected_drive_email": "your-storage-account@example.com",
   "drive_remote": "gdrive:SmartAPI",
-  "upload_interval_minutes": 30,
-  "upload_batch_files": 40,
+  "upload_interval_minutes": 5,
+  "upload_batch_files": 256,
   "upload_max_batches": 8,
   "local_retention_days": 2
 }
@@ -220,6 +221,11 @@ hardware support; the task cannot power on a shut-down laptop.
 
 ## 7. Verify real data and real uploads
 
+For a lightweight local UI covering session history, archive health and Drive
+verification, install [the operations dashboard](OPERATIONS-DASHBOARD.md) with
+`powershell -NoProfile -ExecutionPolicy Bypass -File .\install_operations_dashboard.ps1`,
+then open `http://127.0.0.1:8502`. Its sign-in task is independent of collection.
+
 Check the task and connection state:
 
 ```powershell
@@ -270,11 +276,14 @@ The uploader prioritizes today's partitions, copies bounded batches, verifies
 checksums, then checkpoints file metadata in `runtime/verified-uploads.sqlite3`.
 An interrupted pass resumes from those checkpoints. Historical backfill and many
 tiny files can take substantial time; this is batch archival, not instant mirroring.
-Each uploader run processes at most `upload_max_batches` and yields when the date
-changes. The next scheduled run refreshes its file list so a multi-day backfill
-does not indefinitely block the current market day's files. Tune the interval
-and batch limit together; a five-minute interval with two batches is one option
-when frequent current-day refreshes matter more than long backfill passes.
+Each upload chunk processes at most `upload_max_batches` and yields when the date
+changes. New chunks refresh the file priorities so historical backfill does not
+indefinitely block the current market day's files. During market hours the worker
+returns after a chunk; the next scheduled check resumes it.
+The independent `SmartAPI-DriveUploads` task uses `upload --drain` to keep going
+after market close until caught up; it is not limited to the collection window.
+Use the current 256-file/eight-batch defaults for this workload. See
+[upload operations](DRIVE-UPLOAD-OPERATIONS.md) for coverage checks and logs.
 
 ## 8. Manual controls and troubleshooting
 
@@ -343,5 +352,6 @@ or downloaded binaries. Check staged changes before committing.
 
 The archive is at least once: recovery after a crash can repeat rows. Deduplicate
 using stream name and `_redis_id` when building downstream merged datasets.
-See [MARKET-AUTOMATION.md](MARKET-AUTOMATION.md) for the operational reference and
+See [Redis memory and instance identity](REDIS-MEMORY-OPERATIONS.md) for retention
+and controlled migration. See [MARKET-AUTOMATION.md](MARKET-AUTOMATION.md) for the operational reference and
 [RUN.md](RUN.md) for the underlying broker pipeline.

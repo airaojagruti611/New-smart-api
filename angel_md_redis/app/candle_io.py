@@ -111,7 +111,7 @@ def read_last_candles_multi(
     stream: str,
     symbols: List[str],
     limit: int,
-    chunk: int = 20000,
+    chunk: int = 5000,
     max_scan: int = 0,
 ) -> Dict[str, List[Candle]]:
     """

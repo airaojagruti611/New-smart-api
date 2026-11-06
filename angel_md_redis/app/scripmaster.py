@@ -29,7 +29,54 @@ def to_float(x) -> Optional[float]:
     except:
         return None
 
-def load_scripmaster(cache_path: Path = CACHE_PATH) -> pd.DataFrame:
+def _iter_master_rows(cache_path: Path):
+    """Decode the JSON array incrementally, without retaining the full JSON tree."""
+    decoder = json.JSONDecoder()
+    with cache_path.open(encoding="utf-8-sig") as source:
+        buffer, eof = "", False
+
+        def more():
+            nonlocal buffer, eof
+            chunk = source.read(65536)
+            buffer += chunk
+            eof = not chunk
+
+        more()
+        buffer = buffer.lstrip()
+        if not buffer.startswith("["):
+            raise ValueError("ScripMaster must be a JSON array")
+        buffer = buffer[1:]
+        first = True
+        while True:
+            buffer = buffer.lstrip()
+            while not buffer and not eof:
+                more()
+                buffer = buffer.lstrip()
+            if buffer.startswith("]"):
+                if (buffer[1:] + source.read()).strip():
+                    raise ValueError("Unexpected content after ScripMaster array")
+                return
+            if not first:
+                if not buffer.startswith(","):
+                    raise ValueError("Missing ScripMaster array delimiter")
+                buffer = buffer[1:].lstrip()
+            while True:
+                try:
+                    row, end = decoder.raw_decode(buffer)
+                    break
+                except json.JSONDecodeError:
+                    if eof:
+                        raise
+                    more()
+                    buffer = buffer.lstrip()
+            if not isinstance(row, dict):
+                raise ValueError("ScripMaster entries must be objects")
+            buffer = buffer[end:]
+            first = False
+            yield row
+
+
+def load_scripmaster(cache_path: Path = CACHE_PATH, *, symbols=None, equities_only: bool = False) -> pd.DataFrame:
     use_cache = False
     if cache_path.exists():
         age_hours = (time.time() - cache_path.stat().st_mtime) / 3600.0
@@ -41,8 +88,21 @@ def load_scripmaster(cache_path: Path = CACHE_PATH) -> pd.DataFrame:
         r.raise_for_status()
         cache_path.write_bytes(r.content)
 
-    data = json.loads(cache_path.read_text(encoding="utf-8"))
+    wanted = None if symbols is None else {str(s).upper() for s in symbols}
+    def relevant(row):
+        if wanted is None and not equities_only:
+            return True
+        exchange = str(row.get("exch_seg", "")).upper()
+        trading = str(row.get("symbol", row.get("tradingsymbol", ""))).upper()
+        equity = exchange == "NSE" and (wanted is None or trading.rsplit("-", 1)[0] in wanted)
+        option = (not equities_only and exchange == "NFO" and
+                  "OPT" in str(row.get("instrumenttype", "")).upper() and
+                  (wanted is None or str(row.get("name", "")).upper() in wanted))
+        return equity or option
+    data = [row for row in _iter_master_rows(cache_path) if relevant(row)]
     df = pd.DataFrame(data)
+    if df.empty:
+        df = pd.DataFrame(columns=["exch_seg", "token", "symbol", "instrumenttype", "name", "expiry", "strike"])
 
     df["exch_seg"] = df["exch_seg"].astype(str).str.upper()
 
@@ -70,8 +130,10 @@ def load_scripmaster(cache_path: Path = CACHE_PATH) -> pd.DataFrame:
         df["name"] = ""
     df["name"] = df["name"].astype(str)
 
-    df["expiry_date"] = df.get("expiry", "").apply(parse_expiry)
-    df["strike_f"] = df.get("strike", None).apply(to_float)
+    expiry = df.get("expiry", pd.Series("", index=df.index))
+    # The same few expiry strings occur thousands of times.
+    df["expiry_date"] = expiry.map({value: parse_expiry(value) for value in expiry.unique()})
+    df["strike_f"] = df.get("strike", pd.Series(None, index=df.index, dtype=object)).apply(to_float)
 
     sym_u = df["symbol"].str.upper()
     df["opt_type"] = None
@@ -108,12 +170,14 @@ def resolve_eq_tokens(df: pd.DataFrame, symbols: List[str]) -> Dict[str, Dict[st
 
 def _options_by_underlying(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     """NFO option rows grouped by exact underlying name, built once per ScripMaster frame."""
-    cached = df.attrs.get("_opt_by_underlying")
+    # pandas copies attrs when slicing/copying frames. Keeping a dict of full
+    # frames in attrs recursively duplicated the option cache on routine slices.
+    cached = df.__dict__.get("_smartapi_option_groups")
     if cached is not None:
         return cached
     d = df[(df["exch_seg"] == "NFO") & (df["instrumenttype"].str.contains("OPT", na=False))]
     groups = {str(name).upper(): g for name, g in d.groupby(d["name"].astype(str).str.upper())}
-    df.attrs["_opt_by_underlying"] = groups
+    df.__dict__["_smartapi_option_groups"] = groups
     return groups
 
 def pick_nearest_expiry(d: pd.DataFrame) -> Optional[dt.date]:

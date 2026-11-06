@@ -35,6 +35,9 @@ if ($env:VIRTUAL_ENV -and (Test-Path "$env:VIRTUAL_ENV\Scripts\python.exe")) {
 }
 
 # 2. Environment Variables
+$resolvedRedisUrl = & $VenvPython -c "from app.config import REDIS_URL; print(REDIS_URL)"
+if ($LASTEXITCODE -ne 0 -or -not $resolvedRedisUrl) { throw 'Could not resolve pipeline Redis configuration' }
+$env:REDIS_URL = ($resolvedRedisUrl | Select-Object -Last 1).Trim()
 $env:PYTHONUNBUFFERED = "1"
 $env:PYTHONIOENCODING = "utf-8"
 $env:PYTHONUTF8 = "1"
@@ -51,6 +54,7 @@ if (-not $Resume -or @(Get-PipelineWorkers).Count -eq 0) {
         Write-Host "ERROR: Failed to start Redis Docker container. Make sure Docker Desktop is running." -ForegroundColor Red
         exit 1
     }
+    Assert-PipelineRedis
 } else {
     Write-Host 'Reusing running Redis and collection workers.'
 }
