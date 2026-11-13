@@ -94,6 +94,11 @@ class ICAREConfig:
     min_ev: float = 0.0
     min_history_samples: int = 30
     include_charges: bool = True            # net EV = gross - round-trip charges
+    # Module 17 dynamic risk: factor = clamp(baseline / expected-move %, min, max) scales MAX_RISK.
+    # baseline 0 disables it (factor 1.0). max_factor 1.0 => risk is only ever cut, never raised.
+    vol_risk_baseline_pct: float = 0.0
+    vol_risk_min_factor: float = 0.5
+    vol_risk_max_factor: float = 1.0
     charge_rates: ChargeRates = field(default_factory=load_rates)
 
 
@@ -133,6 +138,8 @@ class ICAREInputs:
     fo_banned: bool = False
     # Module 13: Trade Ranking CONDITIONAL (60-69) is capped like SMALL_POSITION
     rank_conditional: bool = False
+    # Module 17: |expected move| as % of spot (volatility proxy); None = unknown (factor 1.0)
+    expected_move_pct: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -191,6 +198,7 @@ class ICAREResult:
     lots_by_sector: Optional[int] = None
     lots_by_daily_loss: Optional[int] = None
     daily_loss_room: Optional[float] = None
+    vol_risk_factor: float = 1.0                # Module 17 multiplier applied to max_risk_allowed
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -326,8 +334,22 @@ def margin_per_lot(premium: float, lot: float, cfg: ICAREConfig) -> float:
     return round(premium * lot * (1.0 + cfg.margin_buffer_pct / 100.0), 2)
 
 
-def max_risk_allowed(capital: float, cfg: ICAREConfig) -> float:
-    return round(min(cfg.max_risk_per_trade, max(capital, 0.0) * cfg.max_risk_pct / 100.0), 2)
+def vol_risk_factor(expected_move_pct: Optional[float], cfg: ICAREConfig) -> float:
+    """
+    Module 17 dynamic risk: clamp(baseline / expected-move %, min, max). Higher expected
+    volatility than the baseline shrinks the risk budget. 1.0 when disabled (baseline <= 0)
+    or the move is unknown / non-positive (never guesses a bigger budget).
+    """
+    base = cfg.vol_risk_baseline_pct
+    if not base or base <= 0 or expected_move_pct is None or expected_move_pct <= 0:
+        return 1.0
+    lo = max(cfg.vol_risk_min_factor, 0.0)
+    hi = max(cfg.vol_risk_max_factor, lo)
+    return round(min(max(base / expected_move_pct, lo), hi), 4)
+
+
+def max_risk_allowed(capital: float, cfg: ICAREConfig, factor: float = 1.0) -> float:
+    return round(min(cfg.max_risk_per_trade, max(capital, 0.0) * cfg.max_risk_pct / 100.0) * factor, 2)
 
 
 def presize_lots(
@@ -379,7 +401,10 @@ def evaluate(inp: ICAREInputs, pf: PortfolioState, cfg: Optional[ICAREConfig] = 
 
     capital = max(_finite(pf.total_capital) or 0.0, 0.0)
     max_capital = round(capital * alloc_pct / 100.0, 2)
-    max_risk = max_risk_allowed(capital, cfg)
+    vol_factor = vol_risk_factor(_finite(inp.expected_move_pct), cfg)
+    max_risk = max_risk_allowed(capital, cfg, vol_factor)
+    if vol_factor != 1.0:
+        flags.append("VOL_RISK_SCALED")
 
     # ── Gates that need no sizing ──
     if decision not in ALLOWED_PROB_DECISIONS:
@@ -529,4 +554,5 @@ def evaluate(inp: ICAREInputs, pf: PortfolioState, cfg: Optional[ICAREConfig] = 
         lots_by_sector=lots_sector,
         lots_by_daily_loss=lots_daily,
         daily_loss_room=day_room,
+        vol_risk_factor=vol_factor,
     )

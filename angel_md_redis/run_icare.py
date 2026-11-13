@@ -104,6 +104,9 @@ CFG = ICAREConfig(
     margin_buffer_pct=float(os.getenv("ICARE_MARGIN_BUFFER_PCT", "1.0")),
     min_ev=float(os.getenv("ICARE_MIN_EV", "0")),
     min_history_samples=int(os.getenv("PROB_MIN_HISTORICAL_SAMPLES", "30")),
+    vol_risk_baseline_pct=float(os.getenv("ICARE_VOL_RISK_BASELINE_PCT", "0")),   # 0 = off
+    vol_risk_min_factor=float(os.getenv("ICARE_VOL_RISK_MIN_FACTOR", "0.5")),
+    vol_risk_max_factor=float(os.getenv("ICARE_VOL_RISK_MAX_FACTOR", "1.0")),    # >1 raises risk: opt-in
 )
 
 log = setup_logger("icare")
@@ -275,6 +278,14 @@ def accept_message(stream: str, fields: dict) -> bool:
     return True
 
 
+def expected_move_pct(prob: dict) -> Optional[float]:
+    """|expected_move| / spot x 100 (Module 17 volatility proxy), None when either is missing."""
+    em, spot = _f(prob.get("expected_move")), _f(prob.get("spot"))
+    if em is None or not spot or spot <= 0:
+        return None
+    return abs(em) / spot * 100.0
+
+
 def build_inputs(
     prob: dict, liq: dict, sectors: Dict[str, str], blocked: bool = False, fo_banned: bool = False,
 ) -> ICAREInputs:
@@ -314,6 +325,7 @@ def build_inputs(
         blocked=blocked,
         fo_banned=fo_banned,
         rank_conditional=str(prob.get("rank_confidence") or "") == "CONDITIONAL",
+        expected_move_pct=expected_move_pct(prob),
     )
 
 
