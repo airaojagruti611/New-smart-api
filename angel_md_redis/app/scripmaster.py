@@ -128,6 +128,14 @@ def detect_strike_scale(median_strike: float, spot: float) -> float:
     # some masters use 1000 scaling (rare) – you can extend later
     return 1.0
 
+def _opt_int(v) -> Optional[int]:
+    try:
+        f = float(v)
+        return int(f) if f == f and f > 0 else None
+    except Exception:
+        return None
+
+
 def build_atm_option_tokens(
     df: pd.DataFrame,
     underlying: str,
@@ -187,7 +195,9 @@ def build_atm_option_tokens(
                 "expiry": expiry.isoformat(),
                 "strike": float(row.get("strike_rupees") or st),
                 "cp": row.get("opt_type"),
-                "exchange": "NFO"
+                "exchange": "NFO",
+                "lotsize": _opt_int(row.get("lotsize")),
+                "freeze_qty": _opt_int(row.get("freeze_qty")),
             })
 
     return out, expiry.isoformat()

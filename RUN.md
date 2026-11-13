@@ -314,6 +314,34 @@ Open **http://127.0.0.1:8501**
 
 ---
 
+## Strike / Capital / Learning tunables (env vars)
+
+All optional; defaults shown. Set in `.env` before `run_all`. Workers: `run_strike_select.py`, `run_capital_alloc.py`, `run_paper_tracker.py`, `run_strike_learning.py`, `run_archiver_outcomes.py` (all started by `run_all.ps1` / `run_all.sh`).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `STRIKE_CANDIDATES_AROUND` | 3 (max 10) | Strikes each side of ATM scored (signal side only; no extra WS tokens) |
+| `STRIKE_W_LIQUIDITY` / `_EM_FIT` / `_DELTA` / `_THETA` / `_GAMMA` / `_VEGA` | 0.25/0.25/0.20/0.15/0.10/0.05 | Strike score weights |
+| `STRIKE_MIN_LIQUIDITY` / `STRIKE_MAX_SPREAD_PCT` / `STRIKE_MAX_AGE_SEC` | 70 / 5 / 120 | Hard filters |
+| `STRIKE_MIN_CONFIDENCE` | 70 | Below this => `SKIP reason=below_confidence` |
+| `STRIKE_BAND_STRONG_TREND` / `_NORMAL` / `_HIGH_VOL` / `_EXPIRY_DAY` | 0.60,0.75 / 0.45,0.60 / 0.35,0.50 / 0.55,0.70 | Target abs(delta) band per regime |
+| `STRIKE_EXPECTED_HOLD_MIN` / `STRIKE_THETA_RISK_MAX` | 30 / 0.10 | Theta cost over hold vs premium |
+| `STRIKE_IV_VIEW` | (empty) | `CONTRACT` penalises vega; empty = neutral |
+| `STRIKE_HIGH_VOL_EM_PCT` | 2.0 | EM % of spot that classifies HIGH_VOL |
+| `STRIKE_EXEC_NO_LIVE` / `STRIKE_MISSING_PENALTY` / `STRIKE_OI_TARGET_BONUS` | 50 / 5 / 5 | Missing-data handling, OI target bonus |
+| `STRIKE_USE_LEARNING` / `LEARN_MIN_SAMPLES` / `STRIKE_W_LEARNING` | 0 / 50 / 0.15 | Use historical bucket score (off = record mode) |
+| `TOTAL_CAPITAL` / `MAX_RISK_PER_TRADE_PCT` | 100000 / 5 | Capital and max loss per trade |
+| `CAPITAL_RESERVE_PCT` / `CAPITAL_U_MAX_PCT` | 20 / 80 | Reserve and max utilisation of deployable capital |
+| `CAPITAL_SL_PCT` / `CAPITAL_MAX_POSITION_PCT` / `CAPITAL_LIQ_DEPTH_FRACTION` | 30 / 25 / 0.25 | Lot limits (risk / portfolio / depth) |
+| `CAPITAL_HIGH_VOL_FACTOR` / `CAPITAL_POOR_LIQ_FACTOR` / `CAPITAL_POOR_LIQ_BELOW` | 0.7 / 0.7 / 40 | Weight scaling |
+| `CAPITAL_BATCH_WINDOW_MS` | 60000 | Signals batched before joint allocation |
+| `CHG_BROKERAGE_PER_ORDER` / `CHG_STT_SELL_PCT` / `CHG_EXCH_TXN_PCT` / `CHG_SEBI_PER_CRORE` / `CHG_STAMP_BUY_PCT` / `CHG_GST_PCT` | 20 / 0.15 / 0.03503 / 10 / 0.003 / 18 | Charge model (options) |
+| `PAPER_TARGET_PCT` / `PAPER_SL_PCT` / `PAPER_MAX_HOLD_MIN` | 30 / 20 / 60 | Paper-trade exits (target fallback when no delta/EM) |
+| `PAPER_NO_TICK_TIMEOUT_SEC` / `PAPER_SESSION_END_HHMM` | 120 / 1520 (IST) | Pending timeout, session end |
+| `LEARN_INTERVAL_SEC` / `LEARN_MAX_ROWS` / `LEARN_PRIOR_N` / `LEARN_EXP_SCALE_PCT` | 300 / 50000 / 20 / 20 | Bucket stats recompute |
+
+---
+
 ## Pipeline order (dependency map)
 
 ```

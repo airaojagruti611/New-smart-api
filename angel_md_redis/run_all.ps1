@@ -118,6 +118,11 @@ Start-Worker "entry_trigger" "run_entry_trigger.py"
 Start-Worker "strike_select" "run_strike_select.py"
 Start-Worker "capital_alloc" "run_capital_alloc.py"
 
+# --- Adaptive Learning (record mode): paper trades -> outcomes -> bucket stats ---
+Start-Worker "paper_tracker" "run_paper_tracker.py"
+Start-Worker "strike_learning" "run_strike_learning.py"
+Start-Worker "arch_outcomes" "run_archiver_outcomes.py"
+
 # --- Volatility (Modules 8-9) ---
 Start-Worker "expected_move" "run_expected_move.py"
 Start-Worker "greeks_change" "run_greeks_change.py"

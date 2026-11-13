@@ -126,6 +126,11 @@ start "strike_select" python3 run_strike_select.py
 # 3h) Capital alloc: regime bias + strike -> sized CALL/PUT notional
 start "capital_alloc" python3 run_capital_alloc.py
 
+# 3h2) Adaptive learning (record mode): paper trades -> md:journal:outcome -> bucket stats
+start "paper_tracker" python3 run_paper_tracker.py
+start "strike_learning" python3 run_strike_learning.py
+start "arch_outcomes" python3 run_archiver_outcomes.py
+
 # 3i) Expected move (Module 8) + Greeks change (Module 9)
 start "expected_move" python3 run_expected_move.py
 start "greeks_change" python3 run_greeks_change.py
