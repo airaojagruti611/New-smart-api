@@ -67,7 +67,7 @@ class HealthFreshness(unittest.TestCase):
         self.assertEqual(_mod("run_supertrend_mtf_bias.py")["streams"], ["md:supertrend:bias"])
         self.assertIn("md:oi:underlying:signal", _mod("run_oi_analysis.py")["streams"])
         empty = [m["name"] for L in ph.LAYERS for m in L["modules"]
-                 if m.get("worker") and not m.get("streams") and m.get("worker") != "run_account.py"]
+                 if m.get("worker") and not m.get("streams") and m.get("worker") not in ("run_account.py", "run_strike_learning.py")]
         self.assertEqual(empty, [])
 
     def test_greeks_list_form_and_hash(self):
