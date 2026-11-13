@@ -97,7 +97,7 @@ def _num(v) -> Optional[float]:
 
 
 def parse_tick(fields: dict) -> dict:
-    """Subset of an md:ticks:eq entry; circuit fields are optional (ws_producer does not emit them today)."""
+    """Subset of an md:ticks:eq entry; circuit fields come from ws_producer SNAP_QUOTE (empty if the feed omits them)."""
     return {
         "ltp": _num(fields.get("ltp")), "prev_close": _num(fields.get("c")), "open": _num(fields.get("o")),
         "cum_vol": _num(fields.get("vol")), "tbq": _num(fields.get("tbq")), "tsq": _num(fields.get("tsq")),

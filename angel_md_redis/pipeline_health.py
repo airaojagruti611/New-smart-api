@@ -367,9 +367,14 @@ LAYERS = [
             },
             {
                 "name": "Module 16: Circuit Breaker / Kill Switch",
-                "worker": None,
-                "description": "PARTIAL — manual kill switch `md:control:kill_switch`=1 blocks new trades in "
-                               "Trade Ranking; circuit-limit check flag-only (no data source)",
+                "worker": "run_circuit_breaker.py",
+                "streams": ["md:circuit:events"],
+                "latest_prefix": None,
+                "latest_key": "md:circuit:latest",
+                "description": "Loss caps, entry/exit mismatch, command watchdog, abnormal behaviour -> trips "
+                               "md:control:kill_switch (sticky; reset with --reset). Emergency exits only if "
+                               "CB_EMERGENCY_EXIT=1",
+                "sample_fields": ["state", "severity", "reason", "pnl", "open_positions"],
             },
         ],
     },
@@ -377,7 +382,16 @@ LAYERS = [
         "id": "1.5",
         "name": "Risk Layer",
         "modules": [
-            {"name": "Module 17: Risk Management", "worker": None, "description": "NOT IMPLEMENTED"},
+            {
+                "name": "Module 17: Risk Management",
+                "worker": "run_icare.py",
+                "streams": ["md:icare"],
+                "latest_prefix": "md:icare:latest:*",
+                "latest_key": None,
+                "description": "Inside ICARE: capital vs margin, risk-based sizing, daily loss, sector/portfolio caps, "
+                               "volatility-scaled risk (ICARE_VOL_RISK_BASELINE_PCT, off by default)",
+                "sample_fields": ["status", "max_risk_allowed", "vol_risk_factor", "limiting_factor"],
+            },
             {
                 "name": "Module 18: Adaptive Trailing SL & Re-entry",
                 "worker": "run_adaptive_tsl.py",
@@ -387,7 +401,16 @@ LAYERS = [
                 "description": "Volatility + trend → dynamic TSL % (ratchet), confirmed exits, swing-break re-entry (TSL_MODE shadow/active)",
                 "sample_fields": ["status", "current_trailing_stop", "trailing_percentage", "tsl_rule", "reentry_state", "event"],
             },
-            {"name": "Module 19: Slippage Estimator", "worker": None, "description": "NOT IMPLEMENTED"},
+            {
+                "name": "Module 19: Slippage Estimator",
+                "worker": "run_slippage_estimator.py",
+                "streams": ["md:slippage:estimate"],
+                "latest_prefix": "md:slippage:latest:*",
+                "latest_key": None,
+                "description": "Pre-order estimate per ICARE APPROVED sizing: walks 5 depth levels -> VWAP fill, "
+                               "slippage vs best/mid, unfilled qty, round-trip cost (advisory)",
+                "sample_fields": ["tradingsymbol", "vwap_fill", "slippage_pct", "unfilled_qty"],
+            },
         ],
     },
     {
@@ -416,7 +439,15 @@ LAYERS = [
         "id": "1.7",
         "name": "Monitoring Layer",
         "modules": [
-            {"name": "Module 21: Portfolio Exposure Monitor", "worker": None, "description": "NOT IMPLEMENTED"},
+            {
+                "name": "Module 21: Portfolio Exposure Monitor",
+                "worker": "run_portfolio_exposure.py",
+                "streams": ["md:portfolio:exposure:stream"],
+                "latest_prefix": None,
+                "latest_key": "md:portfolio:exposure",
+                "description": "Open positions -> premium deployed, unrealized PnL at bid, risk to SL, per "
+                               "underlying / sector / side, utilization %, ICARE limit-breach flags",
+            },
             {
                 "name": "Module 22: Trade Journal Engine (paper)",
                 "worker": "run_trade_journal.py",
@@ -449,7 +480,24 @@ LAYERS = [
                 "latest_key": None,
                 "description": "md:journal:outcome -> data_lake CSV",
             },
-            {"name": "Module 23: Accumulation Phase Detector", "worker": None, "description": "NOT IMPLEMENTED"},
+            {"name": "Module 23: Accumulation Phase Detector", "worker": None,
+             "description": "Dropped from the -3.docx spec (not built)"},
+        ],
+    },
+    {
+        "id": "1.8",
+        "name": "Add-ons",
+        "modules": [
+            {
+                "name": "Add-ons 1-11 (circuit, volume, box, spikes, sector, pre-market, flow, fast move)",
+                "worker": "run_addons.py",
+                "streams": ["md:addons:signal"],
+                "latest_prefix": "md:addons:latest:*",
+                "latest_key": None,
+                "description": "Per-symbol add-on scanners on each 1m candle + market-wide "
+                               "md:addons:sector_heatmap / md:addons:sector_change",
+                "sample_fields": ["symbol", "flags"],
+            },
         ],
     },
 ]
@@ -487,6 +535,10 @@ MAX_AGE_SEC_BY_WORKER = {
     "run_order_executor.py": None,
     "run_adaptive_tsl.py": None,
     "run_trade_journal.py": None,
+    "run_circuit_breaker.py": 60,
+    "run_portfolio_exposure.py": 60,
+    "run_slippage_estimator.py": None,        # event-driven: only on ICARE approvals
+    "run_addons.py": 150,
 }
 
 _TS_FIELDS = ("ts_ms", "updated_ms", "timestamp", "ts_recv", "bar_ts_ms", "rank_ts_ms")

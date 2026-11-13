@@ -158,6 +158,11 @@ start "order_executor" python3 run_order_executor.py
 start "trade_journal" python3 run_trade_journal.py
 # Module 18 Adaptive Trailing SL & Re-entry (TSL_MODE=shadow by default: observes only)
 start "adaptive_tsl" python3 run_adaptive_tsl.py
+# Module 16 Circuit Breaker (trips md:control:kill_switch; emergency exits only with CB_EMERGENCY_EXIT=1)
+start "circuit_breaker" python3 run_circuit_breaker.py
+# Module 19 Slippage Estimator (advisory) + Module 21 Portfolio Exposure Monitor
+start "slippage" python3 run_slippage_estimator.py
+start "exposure" python3 run_portfolio_exposure.py
 
 # 3h) Capital alloc: regime bias + strike -> sized CALL/PUT notional
 start "capital_alloc" python3 run_capital_alloc.py
@@ -166,6 +171,9 @@ start "capital_alloc" python3 run_capital_alloc.py
 start "paper_tracker" python3 run_paper_tracker.py
 start "strike_learning" python3 run_strike_learning.py
 start "arch_outcomes" python3 run_archiver_outcomes.py
+
+# 3h3) Add-ons 1-11 (scanners on 1m candles)
+start "addons" python3 run_addons.py
 
 # 3i) Expected move (Module 8) + Greeks change (Module 9)
 start "expected_move" python3 run_expected_move.py

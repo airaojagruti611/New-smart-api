@@ -136,12 +136,18 @@ Start-Worker "icare" "run_icare.py"
 Start-Worker "order_executor" "run_order_executor.py"
 Start-Worker "trade_journal" "run_trade_journal.py"
 Start-Worker "adaptive_tsl" "run_adaptive_tsl.py"
+Start-Worker "circuit_breaker" "run_circuit_breaker.py"
+Start-Worker "slippage" "run_slippage_estimator.py"
+Start-Worker "exposure" "run_portfolio_exposure.py"
 Start-Worker "capital_alloc" "run_capital_alloc.py"
 
 # --- Adaptive Learning (record mode): paper trades -> outcomes -> bucket stats ---
 Start-Worker "paper_tracker" "run_paper_tracker.py"
 Start-Worker "strike_learning" "run_strike_learning.py"
 Start-Worker "arch_outcomes" "run_archiver_outcomes.py"
+
+# --- Add-ons 1-11 ---
+Start-Worker "addons" "run_addons.py"
 
 # --- Volatility (Modules 8-9) ---
 Start-Worker "expected_move" "run_expected_move.py"

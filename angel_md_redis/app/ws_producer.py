@@ -407,6 +407,9 @@ class MarketDataProducer:
             "bid_depth5_px": ",".join(str(x) for x in bid_prices),
             "ask_depth5_px": ",".join(str(x) for x in ask_prices),
             "ltq": str(ltq_raw if ltq_raw not in (None, "") else ""),
+            # SNAP_QUOTE circuit band (paise -> rupees); read by run_addons.py add-on 1
+            "upper_circuit_limit": str(paise_to_rupees(data.get("upper_circuit_limit")) or ""),
+            "lower_circuit_limit": str(paise_to_rupees(data.get("lower_circuit_limit")) or ""),
         }
         self.rs.xadd(STREAM_EQ, payload, maxlen=STREAM_MAXLEN_EQ)
         self._last_eq_core[sym] = dict(core, emitted_ms=now)

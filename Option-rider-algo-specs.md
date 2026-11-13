@@ -41,27 +41,34 @@ Module 18 is implemented as the **Adaptive Trailing Stop Loss & Re-entry Engine*
 Module 14 is implemented as the **Order Executor / Trade Entry Engine** (`app/order_executor/`,
 `run_order_executor.py`; DECISION.md §7): limit orders only, shadow / paper by default, live trading disabled.
 
-**Note:** Modules 1–8 have full design detail in the source material (reproduced below). Modules 9, 10–23 are named in the index but not yet specified in detail — flag these as TODO/backlog items for the coding agent; do not invent logic for them.
+Also implemented (2026-11-13): Module 16 **Circuit Breaker** (`app/circuit_breaker.py`, `run_circuit_breaker.py`),
+Module 17 **Risk Management** inside ICARE (incl. volatility-scaled risk, `ICARE_VOL_RISK_*`),
+Module 19 **Slippage Estimator** (`app/slippage_estimator.py`, `run_slippage_estimator.py`),
+Module 21 **Portfolio Exposure Monitor** (`app/portfolio_exposure.py`, `run_portfolio_exposure.py`),
+and the **Expected Move step 6** learning loop (paper tracker records actual vs expected spot move →
+`md:journal:outcome` → `md:learning:strike_stats`). Module 23 Accumulation Phase Detector was dropped
+from `Option Rider Algo For Algobuilders-3.docx` and is not built.
 
-### Add-ons (backlog, not yet specified)
-1. Upper circuit / lower circuit logic
+**Note:** Modules 1–8 have full design detail in the source material (reproduced below). Later modules are
+specified in `DECISION.md` and the `-3.docx`, not in this file.
+
+### Add-ons (implemented: `app/addons.py`, `run_addons.py`)
+1. Upper circuit / lower circuit logic (circuit band from the SNAP_QUOTE feed via `md:ticks:eq`)
 2. Daily volume % gain compared with 20 SMA
 3. Box breakout/breakdown from last 60-minute range
 4. Volume spike
-5. Sector-wise buying/selling heatmap
-6. Pre-market data analyser
+5. Sector-wise buying/selling heatmap (`md:addons:sector_heatmap`)
+6. Pre-market data analyser (09:00–09:15 IST capture; falls back to first 1m open vs previous close)
 7. Heavy buying/selling detection in past few minutes
 8. Fast price moving up/down
 9. Volume breakers up/down
 10. Volume increase % intraday
-11. Avg sector change
+11. Avg sector change (`md:addons:sector_change`)
 
-### Outstanding Infrastructure Requirement
-**Broker Bridge (AngelOne SmartAPI)** — explicit module still needed:
-- Order placement
-- Order status polling
-- Rejection handling
-- Lot size / freeze quantity enforcement for NSE options
+### Broker Bridge (AngelOne SmartAPI)
+Implemented in `app/order_executor/broker.py` (LIMIT + DAY orders, place / modify / cancel, status
+fallback, trade-book reconcile, rejection handling, freeze-qty slicing) — **disabled** until a static IP
+is registered (DECISION.md §7, X-Q11). Still open: order-update WebSocket, live exit path E17, 1-lot live check.
 
 ---
 

@@ -1,11 +1,12 @@
-# Option Rider — Remaining & Partly Done Work
+# Option Rider — Remaining Work
 
-> Gap analysis of `Option Rider Algo For Algobuilders-3.docx` against the code in `angel_md_redis/app/`.
-> Status as of 2026-11-11 (last commit: `56a99f2 Testing changes`). The repo is built through **Module 9 — Greeks Change Predictor**.
+> Gap analysis of `Option Rider Algo For Algobuilders-3.docx` against the code in `angel_md_redis/`.
+> Status as of 2026-11-13. All code items are built and unit-tested (686 passed, 2 Linux-only skipped).
+> What remains needs a live Angel One account, market hours, or accumulated trade data.
 
 ---
 
-## ✅ Done (for reference)
+## ✅ Done
 
 | # | Module | Code |
 |---|---|---|
@@ -16,173 +17,33 @@
 | 5 | Open Interest Calculations | `oi_analysis.py` |
 | 6 | Greeks Calculator | `greeks_poller.py`, `option_pricing.py` |
 | 7 | Liquidity Score | `liquidity_score.py` |
-| 8 | Expected Move Calculator | `expected_move.py` |
+| 8 | Expected Move Calculator + Step 6 adaptive learning (record mode) | `expected_move.py`; `trade_outcome.py` / `run_paper_tracker.py` (actual vs expected spot move) → `strike_learning.py` |
 | 9 | Greeks Change Predictor | `greeks_change.py`, `greeks_phase.py` |
+| 10 | Strike Price Selector / Strike Intelligence Engine | `strike_select.py`, `strike_intel.py` |
+| 11 + 20 | Lot Sizing + Capital Allocation (ICARE) | `icare.py`, `capital_alloc.py`, `broker_funds.py` (reads `md:account:latest`) |
+| 12 | Probability Engine | `probability_engine.py` |
+| 13 | Trade Ranking Engine | `app/trade_ranking/` |
+| 14 | Order Executor / Trade Entry | `app/order_executor/` |
+| 15 | Exit Order Module | `app/order_executor/exit_engine.py`, `run_trade_journal.py` |
+| 16 | Circuit Breaker / Kill Switch | `circuit_breaker.py`, `run_circuit_breaker.py` |
+| 17 | Risk Management (incl. volatility-scaled risk) | `icare.py` (`ICARE_VOL_RISK_*`) |
+| 18 | Adaptive Trailing SL & Re-entry | `adaptive_tsl.py` |
+| 19 | Slippage Estimator | `slippage_estimator.py`, `run_slippage_estimator.py` |
+| 21 | Portfolio Exposure Monitor | `portfolio_exposure.py`, `run_portfolio_exposure.py` |
+| 22 | Trade Journal Engine | `trade_journal.py`, `run_trade_journal.py` |
+| — | Broker Bridge (Angel SmartAPI) | `app/order_executor/broker.py` (disabled until static IP) |
+| — | Add-ons 1–11 | `addons.py`, `run_addons.py` |
+
+Module 23 (Accumulation Phase Detector) was dropped from the `-3.docx` spec.
 
 ---
 
-## ⚠️ Partly Done (needs rework to match the doc)
+## ⏳ Needs live account / market time (cannot be finished in code alone)
 
-### 10. Strike Price Selector — `strike_select.py`
-- **Current:** only picks ATM, OTM-n or the OI-target strike.
-- **Doc requires:** a *Strike Intelligence Engine* that scores ATM ±10 strikes 0–100 and ranks them, weighing:
-  - [x] Expected move fit
-  - [x] Liquidity (OI + Volume) — uses `md:liquidity:score`; volume-only fallback (Greeks API has no OI)
-  - [x] Bid-ask execution quality
-  - [x] Greeks (Delta / Gamma / Theta / Vega) + projected Greeks at +1 EM (in-process reprice)
-  - [x] Historical performance of similar setups — behind `STRIKE_USE_LEARNING=1`, needs >= 50 samples/bucket
-  - [x] Trade only if the top-ranked strike clears a confidence threshold — `STRIKE_MIN_CONFIDENCE` (default 70)
-- **Status:** done; ATM +/- `STRIKE_CANDIDATES_AROUND` (default 3, max 10). Not yet validated on live Redis.
-
-### Capital Allocation — `capital_alloc.py`
-- **Current:** only splits capital between calls and puts by market regime.
-- **Doc requires:** capital handling folded into **Risk Management (18)** and **Trade Ranking (section 21 – Capital Allocation)** — extend accordingly.
-- [x] Reserve + max utilisation budget, charges model, whole-lot limits (budget/risk/liquidity/portfolio/side), score-weighted batch allocation, low-capital fallback to next top3 strike
-- [ ] Broker funds (`app/broker_funds.py` is a stub) and real open-position schema
-
-### 8. Expected Move — Step 6: Adaptive Learning
-- **Current:** not implemented.
-- **Doc requires:** store every trade's expected vs actual move and learn which strike (ATM / ATM+1 / ATM+2 / ITM / OTM) performed best per setup.
-- [x] Record mode: paper tracker -> `md:journal:outcome` -> bucket stats `md:learning:strike_stats`
-- [ ] Actual underlying move vs expected (needs a spot source in the tracker)
-- [ ] Turn on `STRIKE_USE_LEARNING=1` after enough samples
-
----
-
-## ❌ Not Started
-
-### 11. Lot Sizing
-- [ ] Account information input
-- [ ] Inputs from Trade Decision Layer, Strike Engine, Portfolio Engine
-- [ ] Low-capital affordability logic
-
-### 12. Probability Engine
-- [ ] Pure function — combines weighted module signals into one 0–100 confidence score
-- [ ] Modules must NOT be weighted equally
-- [ ] Returns a JSON object
-- [ ] Never places orders, calculates SL, or selects strikes
-
-### 13. Trailing Stoploss
-- [ ] Initial SL
-- [ ] Dynamic trailing SL logic
-- [ ] Reset only when the Probability Engine generates a completely new setup
-
-### 14. Trade Ranking Engine (27 sub-sections)
-- [ ] Inputs from all upstream modules; weighted (not equal)
-- [ ] Normalize every score
-- [ ] First-layer quality check
-- [ ] Directional agreement + directional conflict penalty
-- [ ] Probability as a separate factor (not just another score)
-- [ ] Expected profitability
-- [ ] Strike selection / lot sizing / trailing SL scores
-- [ ] Dynamic stop-loss selection and logic
-- [ ] Final trade score + decision bands (TAKE / WATCH / REJECT / NO TRADE)
-- [ ] Hard rejection conditions
-- [ ] Compare ALL candidates; don't force multiple trades
-- [ ] Capital allocation
-- [ ] Final output object
-
-### 15. Order Executor / Trade Entry (30 sub-sections)
-- [ ] Receive and re-verify the command from Trade Ranking
-- [ ] Latest bid-ask; spread calculation
-- [ ] Near-available-rate execution
-- [ ] Slippage budget (executor's responsibility)
-- [ ] Available margin check; maximum affordable lots
-- [ ] Lot sizing vs executor quantity
-- [ ] Brokerage / per-order cost; brokerage-aware completion decision
-- [ ] Partial fill manager; don't keep reordering forever
-- [ ] Liquidity-based order slicing
-- [ ] Execution state machine + decision logic
-- [ ] Market-runaway and margin-change handling
-- [ ] Kill switch integration
-- [ ] Final execution record → Trade Journal; feed back into Trade Ranking
-
-### 16. Exit Order Module
-- [ ] Seven exit conditions
-- [ ] Exit priority (which condition wins)
-- [ ] Exit decision configuration
-- [ ] Output command to Order Executor
-- [ ] Developer acceptance checklist
-
-### 17. Circuit Breaker / Kill Switch
-- [ ] Daily loss cap
-- [ ] Max loss per trade and total exposure
-- [ ] Entry/exit mismatch detection
-- [ ] Command watchdog (commands not followed / not filled)
-- [ ] Software bug / abnormal behaviour detection
-- [ ] Emergency open-position protection
-- [ ] Manual kill switch
-- [ ] Recovery and restart protection
-- [ ] Loss-cap config + circuit breaker state machine
-
-### 18. Risk Management
-- [ ] Distinguish capital from margin
-- [ ] Dynamic capital utilisation engine
-- [ ] Capital distribution among trades
-- [ ] Low-capital mode (maximise affordability without forcing trades)
-- [ ] Risk-based position sizing
-- [ ] Dynamic risk adjustment by volatility
-- [ ] Portfolio-level risk and correlated trades
-- [ ] Broker margin and funds synchronisation
-
-### 19. Slippage Estimator
-- [ ] Best available bid/ask
-- [ ] Spread and expected slippage
-- [ ] Execution cost from order-book depth
-- [ ] Estimate before order placement
-
-### 20. Portfolio Exposure Monitor
-- [ ] Live exposure across open positions
-
-### 21. Trade Journal Engine
-- [ ] Store every trade (stock, strike, expected/actual move, entry, exit, OI, volume, bid-ask, P&L)
-- [ ] Feed back into Trade Ranking and Expected Move learning
-
-### Broker Bridge — AngelOne SmartAPI
-> The code has no order placement at all.
-- [ ] Order placement
-- [ ] Order status polling
-- [ ] Rejection handling
-- [ ] Lot size and freeze quantity rules for NSE options
-
----
-
-## ❌ Add-ons (none built)
-
-- [ ] 1. Upper/lower circuit logic
-- [ ] 2. Daily volume % gain vs 20 SMA
-- [ ] 3. Box breakout/breakdown from the last 60-minute range
-- [ ] 4. Volume spike
-- [ ] 5. Sector-wise buying/selling heatmap
-- [ ] 6. Pre-market data analyser
-- [ ] 7. Heavy buying/selling in the past few minutes
-- [ ] 8. Fast price move up/down
-- [ ] 9. Volume breakers up/down
-- [ ] 10. Intraday volume increase %
-- [ ] 11. Average sector change
-
----
-
-## 🧹 Housekeeping
-
-- [ ] `Option-rider-algo-specs.md` is out of date. It still lists 23 modules, including "Smart Stop Loss", a separate "Capital Allocation" layer and "Accumulation Phase Detector", which the new doc removed or merged. It also marks 10–23 as not yet specified. Regenerate it from `-3.docx`.
-- [ ] Git shows the old `Option Rider Algo For Algobuilders.docx` and its lock files as deleted, and the new `-3.docx` as untracked. Commit that rename if intended.
-
----
-
-## Suggested Build Order
-
-1. Broker Bridge
-2. Strike Selector (rework)
-3. Lot Sizing
-4. Probability Engine
-5. Trailing Stoploss
-6. Trade Ranking Engine
-7. Slippage Estimator
-8. Risk Management
-9. Order Executor
-10. Exit Order Module
-11. Circuit Breaker / Kill Switch
-12. Portfolio Exposure Monitor
-13. Trade Journal Engine
-14. Add-ons
+- [ ] Register a static IP with Angel One, then enable live trading (`EXEC_LIVE_ENABLED=1`) — DECISION.md §7 X-Q11
+- [ ] Order-update WebSocket, live exit path E17, and the 1-lot live check of modify-quantity (P29)
+- [ ] Run the full pipeline against live Redis during market hours; replay the 2026-09-21 archive in shadow mode (P22, P30)
+- [ ] Turn on `STRIKE_USE_LEARNING=1` once `md:learning:strike_stats` has ≥ 50 samples per bucket
+- [ ] Check that the SNAP_QUOTE feed fills `upper_circuit_limit` / `lower_circuit_limit` (add-on 1)
+- [ ] Decide whether to enable `CB_EMERGENCY_EXIT=1` and `ICARE_VOL_RISK_BASELINE_PCT` (both off by default)
+- [ ] Add critical worker streams to `CB_HEARTBEAT_STREAMS` once you know which run steadily

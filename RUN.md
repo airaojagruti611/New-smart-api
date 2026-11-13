@@ -207,6 +207,10 @@ default are recorded in [`DECISION.md`](DECISION.md).
 | 32b | `python run_order_executor.py` | Module 14 Order Executor: re-validates each ICARE approval (kill switch, 09:20–15:20, quote ≤ 3 s, spread ≤ 1 %, drift ≤ 2 %, margin, exposure), buys with **limit orders only** (mid → ask + 0.5 % cap, never chased), slices by depth / freeze qty, partial fills continue only if EV beats the extra cost, 10 s timeout → `md:exec`, `md:exec:fill`, `md:exec:latest:{trade_id}`. `EXEC_MODE=shadow` (default) simulates; live is disabled |
 | 33 | `python run_trade_journal.py` | Paper-trades ICARE `APPROVED` (entry at ask, exits SL/target/time/15:20 at bid; with `EXEC_MODE=paper` entry = executor's actual fill) → `md:journal`, `md:journal:stats`. PnL is net of charges (`charges.json`), gross kept as `gross_pnl` |
 | 34 | `python run_adaptive_tsl.py` | Module 18 Adaptive Trailing SL & Re-entry: dynamic trail % (only tightens), confirmed exits, swing-break re-entry via ICARE → `md:tsl`, `md:tsl:latest:{TSYM}`, `md:tsl:reentry`. `TSL_MODE=shadow` (default) observes only |
+| 35 | `python run_circuit_breaker.py` | Module 16 Circuit Breaker: daily/per-trade loss caps, exposure cap, entry/exit mismatch, command watchdog, abnormal behaviour → trips `md:control:kill_switch` (sticky across restarts) → `md:circuit:latest`, `md:circuit:events`. `--status` shows state, `--reset` clears a trip. Emergency exits of open positions only with `CB_EMERGENCY_EXIT=1` |
+| 36 | `python run_slippage_estimator.py` | Module 19 Slippage Estimator: for each ICARE approval walks 5 depth levels → VWAP fill, slippage, unfilled qty, round-trip cost → `md:slippage:estimate`, `md:slippage:latest:{TSYM}` (advisory) |
+| 37 | `python run_portfolio_exposure.py` | Module 21 Portfolio Exposure Monitor: open positions → premium deployed, unrealized PnL, risk to SL, per underlying / sector / side, ICARE limit breaches → `md:portfolio:exposure` |
+| 38 | `python run_addons.py` | Add-ons 1–11 on each 1m candle → `md:addons:signal`, `md:addons:latest:{SYM}`, `md:addons:sector_heatmap`, `md:addons:sector_change` |
 
 Key settings (`.env`, all optional — defaults shown):
 
@@ -220,6 +224,9 @@ TOTAL_CAPITAL=100000
 ICARE_MAX_RISK_PER_TRADE=7500   # also capped at ICARE_MAX_RISK_PCT=2 (% of capital)
 ICARE_MAX_OPEN_TRADES=5
 ICARE_DAILY_LOSS_LIMIT_PCT=2
+ICARE_VOL_RISK_BASELINE_PCT=0  # Module 17: >0 shrinks risk when expected move % > baseline (0 = off)
+CB_DAILY_LOSS_CAP=25000         # circuit breaker trip; also CB_MAX_LOSS_PER_TRADE, CB_MAX_TOTAL_EXPOSURE
+CB_EMERGENCY_EXIT=0             # 1 = on EMERGENCY trip, send exit requests for all open positions
 ICARE_MAX_PORTFOLIO_RISK_PCT=5
 ICARE_MAX_MARGIN_UTIL_PCT=80
 PAPER_TRADING=1              # 0 = journal worker records nothing
