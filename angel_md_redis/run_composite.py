@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import redis
 
@@ -45,6 +45,7 @@ from app.composite_score import (
     sr_proximity_component,
 )
 from app.config import load_symbols
+from app.freshness import env_ms, is_fresh_payload
 from app.logging_setup import setup_logger
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -58,6 +59,9 @@ BIDASK_LATEST_PREFIX = os.getenv("BIDASK_LATEST_PREFIX", "md:bidask:latest:")
 STRIKEFLOW_LATEST_PREFIX = os.getenv("STRIKEFLOW_LATEST_PREFIX", "md:strikeflow:latest:")
 OPTEXIT_LATEST_PREFIX = os.getenv("OPTEXIT_LATEST_PREFIX", "md:optexit:latest:")
 GREEKS_PHASE_LATEST_PREFIX = os.getenv("GREEKS_PHASE_LATEST_PREFIX", "md:greeks:phase:latest:")
+POSITION_OPEN_PREFIX = os.getenv("POSITION_OPEN_PREFIX", "md:position:open:")
+# FORCE_EXIT overrides only consider optexit / greeks-phase docs at most this old.
+OVERRIDE_MAX_AGE_MS = env_ms("COMPOSITE_OVERRIDE_MAX_AGE_SEC", 60)
 
 OUT_STREAM = os.getenv("STREAM_COMPOSITE_SIGNAL", "md:composite:signal")
 OUT_MAXLEN = int(os.getenv("STREAM_MAXLEN_COMPOSITE", "50000"))
@@ -98,6 +102,62 @@ def _load_json(r: redis.Redis, key: str) -> Optional[dict]:
         return data if isinstance(data, dict) else None
     except Exception:
         return None
+
+
+def held_positions_by_underlying(r: redis.Redis) -> Dict[str, List[dict]]:
+    """Open paper positions (md:position:open:{TSYM}, written by
+    run_trade_journal.py as a PaperPosition JSON) grouped by underlying."""
+    out: Dict[str, List[dict]] = {}
+    for key in r.scan_iter(match=f"{POSITION_OPEN_PREFIX}*", count=500):
+        key = key.decode() if isinstance(key, bytes) else str(key)
+        tsym = key[len(POSITION_OPEN_PREFIX):].strip().upper()
+        doc = _load_json(r, key) or {}
+        und = str(doc.get("symbol") or "").strip().upper()
+        if not tsym or not und:
+            continue
+        out.setdefault(und, []).append({
+            "tradingsymbol": str(doc.get("tradingsymbol") or tsym).strip().upper(),
+            "side": str(doc.get("side") or "").strip().upper(),
+        })
+    return out
+
+
+def _tsym_cp(tsym: str) -> str:
+    t = tsym.upper()
+    return "CE" if t.endswith("CE") else ("PE" if t.endswith("PE") else "")
+
+
+def liquidity_override(r: redis.Redis, positions: List[dict], now_ms: int, max_age_ms: int) -> Tuple[bool, str, dict]:
+    """
+    FORCE_EXIT only for contracts we actually HOLD, and only on FRESH docs:
+      - md:optexit:latest:{TSYM} exit_status EXIT_NOW / ALREADY_TRAPPED, or
+      - md:greeks:phase:latest:{TSYM} phase DISTRIBUTION,
+    with ts_ms no older than max_age_ms. Side is respected: the doc must be
+    for the held contract itself, whose CE/PE must match the position side
+    (when both are known). Returns (override, reason, held_position).
+    """
+    for pos in positions:
+        tsym = pos["tradingsymbol"]
+        side = pos.get("side") or ""
+        cp = _tsym_cp(tsym)
+        if side in ("CE", "PE") and cp and cp != side:
+            continue
+        oe_doc = _load_json(r, f"{OPTEXIT_LATEST_PREFIX}{tsym}")
+        if oe_doc and is_fresh_payload(oe_doc, now_ms, max_age_ms):
+            status = str(oe_doc.get("exit_status") or "")
+            if status in ("EXIT_NOW", "ALREADY_TRAPPED"):
+                return True, f"{tsym}:{status}", pos
+    for pos in positions:
+        tsym = pos["tradingsymbol"]
+        side = pos.get("side") or ""
+        cp = _tsym_cp(tsym)
+        if side in ("CE", "PE") and cp and cp != side:
+            continue
+        gp_doc = _load_json(r, f"{GREEKS_PHASE_LATEST_PREFIX}{tsym}")
+        if gp_doc and is_fresh_payload(gp_doc, now_ms, max_age_ms):
+            if str(gp_doc.get("phase") or "") == "DISTRIBUTION":
+                return True, f"{tsym}:GREEKS_DISTRIBUTION", pos
+    return False, "", {}
 
 
 def main() -> None:
@@ -155,6 +215,7 @@ def main() -> None:
             continue
         next_eval = now + EVAL_INTERVAL_SEC
         now_ms = int(now * 1000)
+        positions = held_positions_by_underlying(r)
 
         for sym in symbols:
             spot = spot_by_sym.get(sym)
@@ -185,28 +246,11 @@ def main() -> None:
             score = compute_composite(components)
 
             # Option-liquidity-exit override: liquidity loss always wins,
-            # regardless of composite score.
-            override_exit = False
-            override_reason = ""
-            for tsym in contracts_by_underlying.get(sym, ()):
-                oe_doc = _load_json(r, f"{OPTEXIT_LATEST_PREFIX}{tsym}")
-                if not oe_doc:
-                    continue
-                status = str(oe_doc.get("exit_status") or "")
-                if status in ("EXIT_NOW", "ALREADY_TRAPPED"):
-                    override_exit = True
-                    override_reason = f"{tsym}:{status}"
-                    break
-
-            if not override_exit:
-                for tsym in contracts_by_underlying.get(sym, ()):
-                    gp_doc = _load_json(r, f"{GREEKS_PHASE_LATEST_PREFIX}{tsym}")
-                    if not gp_doc:
-                        continue
-                    if str(gp_doc.get("phase") or "") == "DISTRIBUTION":
-                        override_exit = True
-                        override_reason = f"{tsym}:GREEKS_DISTRIBUTION"
-                        break
+            # regardless of composite score — but only for a contract we
+            # currently hold, on a fresh optexit / greeks-phase doc.
+            override_exit, override_reason, held = liquidity_override(
+                r, positions.get(sym, []), now_ms, OVERRIDE_MAX_AGE_MS,
+            )
 
             status, reason = classify_composite(score, override_exit, override_reason)
 
@@ -228,6 +272,8 @@ def main() -> None:
                 "component_sr_proximity": f"{components['sr_proximity']:.4f}",
                 "component_option_flow": f"{components['option_flow']:.4f}",
                 "override_exit": "1" if override_exit else "0",
+                "force_exit_tradingsymbol": held.get("tradingsymbol", "") if override_exit else "",
+                "force_exit_side": held.get("side", "") if override_exit else "",
             }
             r.xadd(OUT_STREAM, payload, maxlen=OUT_MAXLEN, approximate=True)
             r.set(

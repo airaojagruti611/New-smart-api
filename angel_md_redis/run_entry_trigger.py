@@ -16,6 +16,7 @@ import redis
 
 from app.config import load_symbols
 from app.entry_trigger import entry_trigger
+from app.freshness import env_ms, is_fresh_ts, is_stale_message, ts_field_ms
 from app.logging_setup import setup_logger
 
 
@@ -38,6 +39,9 @@ GROUP = os.getenv("ENTRY_TRIGGER_GROUP", "entry-trigger")
 CONSUMER = os.getenv("ENTRY_TRIGGER_CONSUMER", "entry-trigger-1")
 
 MAX_AGE_MS = int(os.getenv("ENTRY_TRIGGER_MAX_AGE_MS", "120000"))
+# A level message is only acted on if both its source bar (bar_ts_ms) and its
+# stream id (XADD time) are this recent. Replayed / backlog breaks are dropped.
+MAX_SIGNAL_AGE_MS = env_ms("ENTRY_MAX_SIGNAL_AGE_SEC", 120)
 
 log = setup_logger("entry_trigger")
 
@@ -103,18 +107,225 @@ def _load_volume_for_symbol(r: redis.Redis, symbol: str) -> dict | None:
     return entry
 
 
+def process_level_message(r, msg_id, fields: dict, now_ms: int, symbols) -> dict | None:
+    """Evaluate one md:level:entry message. Returns the published payload or None.
+
+    Never raises for missing/partial latest keys: a missing HTF / OI / volume
+    slice simply fails its confirmation gate.
+    """
+    sym = str(fields.get("symbol") or "").strip().upper()
+    log.debug("MSG_IN id=%s symbol=%s fields=%s", msg_id, sym, fields)
+
+    if not sym or sym not in symbols:
+        log.debug("SKIP unknown_symbol id=%s symbol=%r", msg_id, sym)
+        return None
+
+    level_signal = str(fields.get("signal") or "").strip()
+    # Only evaluate on actual level breaks.
+    if not level_signal.startswith("BUY"):
+        log.debug("SKIP not_buy_level symbol=%s signal=%s", sym, level_signal)
+        return None
+
+    # Staleness: stream id (cannot be re-stamped) and source bar timestamp.
+    bar_ts_ms = ts_field_ms(fields, "bar_ts_ms")
+    if is_stale_message(msg_id, now_ms, MAX_SIGNAL_AGE_MS):
+        log.info("SKIP stale id=%s symbol=%s reason=stream_id_age max_age_ms=%d", msg_id, sym, MAX_SIGNAL_AGE_MS)
+        return None
+    if not is_fresh_ts(bar_ts_ms, now_ms, MAX_SIGNAL_AGE_MS):
+        log.info(
+            "SKIP stale id=%s symbol=%s reason=bar_ts bar_ts_ms=%s max_age_ms=%d",
+            msg_id,
+            sym,
+            bar_ts_ms,
+            MAX_SIGNAL_AGE_MS,
+        )
+        return None
+
+    st_key = f"{ST_LATEST_PREFIX}{sym}"
+    ema_key = f"{EMA_LATEST_PREFIX}{sym}"
+    htf_key = f"{HTF_LATEST_PREFIX}{sym}"
+    oi_key = f"{OI_UNDERLYING_LATEST_PREFIX}{sym}"
+    st = _load_latest(r, st_key)
+    ema = _load_latest(r, ema_key)
+    htf = _load_latest(r, htf_key) or {}
+    oi = _load_latest(r, oi_key) or {}
+    vol = _load_volume_for_symbol(r, sym) or {}
+    gp_ce = _load_latest(r, f"{GREEKS_PHASE_UNDERLYING_PREFIX}{sym}:CE") or {}
+    gp_pe = _load_latest(r, f"{GREEKS_PHASE_UNDERLYING_PREFIX}{sym}:PE") or {}
+
+    fresh_st = _is_fresh(st, now_ms)
+    fresh_ema = _is_fresh(ema, now_ms)
+    fresh_vol = _is_fresh(vol, now_ms)
+    log.debug(
+        "INPUTS symbol=%s level_signal=%s st=%s fresh_st=%s ema=%s fresh_ema=%s "
+        "htf=%s oi=%s vol=%s fresh_vol=%s",
+        sym,
+        level_signal,
+        st,
+        fresh_st,
+        ema,
+        fresh_ema,
+        htf,
+        oi,
+        vol,
+        fresh_vol,
+    )
+
+    # Module 1 needs fresh ST + EMA. HTF / volume / OI / Greeks
+    # are confirmation gates — still evaluate so module1_signal is visible.
+    if not fresh_st or not fresh_ema:
+        log.info(
+            "SKIP stale_st_or_ema symbol=%s fresh_st=%s fresh_ema=%s "
+            "htf_present=%s oi_present=%s fresh_vol=%s",
+            sym,
+            fresh_st,
+            fresh_ema,
+            bool(htf),
+            bool(oi),
+            fresh_vol,
+        )
+        return None
+
+    st_bias = str(st.get("bias") or "").strip()
+    ema_state = str(ema.get("state") or "").strip()
+    htf_bias = str(htf.get("bias") or "").strip()
+    raw_volume_signal = str(vol.get("signal") or "").strip()
+    # Volume gate requires a fresh volume reading; stale volume fails the gate.
+    volume_signal = raw_volume_signal if fresh_vol else ""
+    oi_positioning = str(oi.get("positioning") or "").strip()
+    oi_resistance = _safe_float_local(oi.get("primary_resistance"))
+    oi_support = _safe_float_local(oi.get("primary_support"))
+    level = str(fields.get("level") or "").strip()
+    strength = str(fields.get("strength") or "").strip()
+
+    result = entry_trigger(
+        st_bias=st_bias,
+        ema_state=ema_state,
+        level_signal=level_signal,
+        level=level,
+        strength=strength,
+        htf_bias=htf_bias,
+        volume_signal=volume_signal,
+        oi_positioning=oi_positioning,
+        oi_resistance=oi_resistance,
+        oi_support=oi_support,
+        greeks_phase_ce=str(gp_ce.get("phase") or ""),
+        greeks_phase_pe=str(gp_pe.get("phase") or ""),
+    )
+    reason = result.reason
+    if not fresh_vol and raw_volume_signal:
+        reason = f"{reason}|volume_stale" if reason else "volume_stale"
+
+    payload = {
+        "ts_ms": str(now_ms),
+        "symbol": sym,
+        "signal": result.signal,
+        "strength": result.strength,
+        "level": result.level or level,
+        "side": str(fields.get("side") or ""),
+        "price": str(fields.get("price") or ""),
+        "st_bias": st_bias,
+        "ema_state": ema_state,
+        "htf_bias": htf_bias,
+        "htf_daily": str(htf.get("daily") or ""),
+        "htf_weekly": str(htf.get("weekly") or ""),
+        "htf_monthly": str(htf.get("monthly") or ""),
+        "volume_signal": volume_signal,
+        "volume_signal_raw": raw_volume_signal,
+        "volume_fresh": "1" if fresh_vol else "0",
+        # Stale volume must not leak through its companion fields either
+        # (probability scores volume_surge / buy_pct on their own).
+        "buy_pct": str(vol.get("buy_pct") or "") if fresh_vol else "",
+        "sell_pct": str(vol.get("sell_pct") or "") if fresh_vol else "",
+        "volume_surge": str(vol.get("volume_surge") or "") if fresh_vol else "",
+        "aligned": "1" if result.signal.startswith("BUY") else "0",
+        "ema9": str(ema.get("ema9") or ""),
+        "ema26": str(ema.get("ema26") or ""),
+        "bar_ts_ms": str(bar_ts_ms),
+        "reason": reason,
+        "module1_signal": result.module1_signal,
+        "module1_reason": result.module1_reason,
+        "oi_positioning": oi_positioning,
+        "oi_target_strike": "" if result.oi_target_strike is None else str(result.oi_target_strike),
+    }
+
+    log.info(
+        "LOGIC symbol=%s module1=%s final=%s reason=%s "
+        "in=(htf=%s st=%s ema=%s vol=%s fresh_vol=%s lvl_sig=%s lvl=%s)",
+        sym,
+        result.module1_signal,
+        result.signal,
+        reason,
+        htf_bias,
+        st_bias,
+        ema_state,
+        raw_volume_signal,
+        fresh_vol,
+        level_signal,
+        level,
+    )
+
+    r.xadd(OUT_STREAM, payload, maxlen=OUT_MAXLEN, approximate=True)
+    r.set(
+        f"{LATEST_KEY_PREFIX}{sym}",
+        json.dumps(payload, separators=(",", ":")),
+        ex=3600,
+    )
+
+    if result.signal.startswith("BUY"):
+        log.info("EMIT symbol=%s payload=%s", sym, payload)
+    else:
+        log.debug("NEUTRAL_EMIT symbol=%s payload=%s", sym, payload)
+    return payload
+
+
+def process_batch(r, resp, symbols, now_ms: int | None = None) -> list:
+    """Process one XREADGROUP response; every message is ACKed even if it fails."""
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    ack_ids = []
+    try:
+        for _stream, msgs in resp or []:
+            for msg_id, fields in msgs:
+                ack_ids.append(msg_id)
+                try:
+                    process_level_message(r, msg_id, fields or {}, now_ms, symbols)
+                except Exception:
+                    log.exception("ERROR processing id=%s fields=%s (acked, skipped)", msg_id, fields)
+    finally:
+        if ack_ids:
+            r.xack(IN_LEVEL, GROUP, *ack_ids)
+    return ack_ids
+
+
 def main():
     symbols = set(load_symbols())
     r = redis.from_url(REDIS_URL, decode_responses=True)
     ensure_group(r, IN_LEVEL, GROUP)
 
     log.info(
-        "START reading %s + HTF/ST/EMA/volume latest, writing %s (max_age_ms=%s symbols=%d)",
+        "START reading %s + HTF/ST/EMA/volume latest, writing %s "
+        "(max_age_ms=%s max_signal_age_ms=%s symbols=%d)",
         IN_LEVEL,
         OUT_STREAM,
         MAX_AGE_MS,
+        MAX_SIGNAL_AGE_MS,
         len(symbols),
     )
+
+    # Re-read our own pending (delivered but un-ACKed, e.g. after a crash)
+    # once at startup; the staleness guard drops anything too old.
+    while True:
+        resp = r.xreadgroup(
+            groupname=GROUP,
+            consumername=CONSUMER,
+            streams={IN_LEVEL: "0"},
+            count=2000,
+        )
+        if not resp or not any(msgs for _s, msgs in resp):
+            break
+        log.info("PENDING replay n=%d", sum(len(m) for _s, m in resp))
+        process_batch(r, resp, symbols)
 
     while True:
         resp = r.xreadgroup(
@@ -126,163 +337,7 @@ def main():
         )
         if not resp:
             continue
-
-        now_ms = int(time.time() * 1000)
-        ack_ids = []
-
-        for _stream, msgs in resp:
-            for msg_id, fields in msgs:
-                ack_ids.append(msg_id)
-
-                sym = str(fields.get("symbol") or "").strip().upper()
-                log.debug("MSG_IN id=%s symbol=%s fields=%s", msg_id, sym, fields)
-
-                if not sym or sym not in symbols:
-                    log.debug("SKIP unknown_symbol id=%s symbol=%r", msg_id, sym)
-                    continue
-
-                level_signal = str(fields.get("signal") or "").strip()
-                # Only evaluate on actual level breaks.
-                if not level_signal.startswith("BUY"):
-                    log.debug(
-                        "SKIP not_buy_level symbol=%s signal=%s",
-                        sym,
-                        level_signal,
-                    )
-                    continue
-
-                st_key = f"{ST_LATEST_PREFIX}{sym}"
-                ema_key = f"{EMA_LATEST_PREFIX}{sym}"
-                htf_key = f"{HTF_LATEST_PREFIX}{sym}"
-                oi_key = f"{OI_UNDERLYING_LATEST_PREFIX}{sym}"
-                st = _load_latest(r, st_key)
-                ema = _load_latest(r, ema_key)
-                htf = _load_latest(r, htf_key)
-                oi = _load_latest(r, oi_key)
-                vol = _load_volume_for_symbol(r, sym)
-                gp_ce = _load_latest(r, f"{GREEKS_PHASE_UNDERLYING_PREFIX}{sym}:CE")
-                gp_pe = _load_latest(r, f"{GREEKS_PHASE_UNDERLYING_PREFIX}{sym}:PE")
-
-                fresh_st = _is_fresh(st, now_ms)
-                fresh_ema = _is_fresh(ema, now_ms)
-                fresh_vol = _is_fresh(vol, now_ms)
-                log.debug(
-                    "INPUTS symbol=%s level_signal=%s st_key=%s st=%s fresh_st=%s "
-                    "ema_key=%s ema=%s fresh_ema=%s htf_key=%s htf=%s oi_key=%s oi=%s vol=%s fresh_vol=%s",
-                    sym,
-                    level_signal,
-                    st_key,
-                    st,
-                    fresh_st,
-                    ema_key,
-                    ema,
-                    fresh_ema,
-                    htf_key,
-                    htf,
-                    oi_key,
-                    oi,
-                    vol,
-                    fresh_vol,
-                )
-
-                # Module 1 needs fresh ST + EMA. HTF / volume / OI / Greeks
-                # are confirmation gates — still evaluate so module1_signal is visible.
-                if not fresh_st or not fresh_ema:
-                    log.info(
-                        "SKIP stale_st_or_ema symbol=%s fresh_st=%s fresh_ema=%s "
-                        "htf_present=%s oi_present=%s fresh_vol=%s",
-                        sym,
-                        fresh_st,
-                        fresh_ema,
-                        bool(htf),
-                        bool(oi),
-                        fresh_vol,
-                    )
-                    continue
-
-                st_bias = str(st.get("bias") or "").strip()
-                ema_state = str(ema.get("state") or "").strip()
-                htf_bias = str(htf.get("bias") or "").strip()
-                volume_signal = str(vol.get("signal") or "").strip()
-                oi_positioning = str(oi.get("positioning") or "").strip()
-                oi_resistance = _safe_float_local(oi.get("primary_resistance"))
-                oi_support = _safe_float_local(oi.get("primary_support"))
-                level = str(fields.get("level") or "").strip()
-                strength = str(fields.get("strength") or "").strip()
-
-                result = entry_trigger(
-                    st_bias=st_bias,
-                    ema_state=ema_state,
-                    level_signal=level_signal,
-                    level=level,
-                    strength=strength,
-                    htf_bias=htf_bias,
-                    volume_signal=volume_signal,
-                    oi_positioning=oi_positioning,
-                    oi_resistance=oi_resistance,
-                    oi_support=oi_support,
-                    greeks_phase_ce=str((gp_ce or {}).get("phase") or ""),
-                    greeks_phase_pe=str((gp_pe or {}).get("phase") or ""),
-                )
-
-                payload = {
-                    "ts_ms": str(now_ms),
-                    "symbol": sym,
-                    "signal": result.signal,
-                    "strength": result.strength,
-                    "level": result.level or level,
-                    "side": str(fields.get("side") or ""),
-                    "price": str(fields.get("price") or ""),
-                    "st_bias": st_bias,
-                    "ema_state": ema_state,
-                    "htf_bias": htf_bias,
-                    "htf_daily": str(htf.get("daily") or ""),
-                    "htf_weekly": str(htf.get("weekly") or ""),
-                    "htf_monthly": str(htf.get("monthly") or ""),
-                    "volume_signal": volume_signal,
-                    "buy_pct": str(vol.get("buy_pct") or ""),
-                    "sell_pct": str(vol.get("sell_pct") or ""),
-                    "volume_surge": str(vol.get("volume_surge") or ""),
-                    "aligned": "1" if result.signal.startswith("BUY") else "0",
-                    "ema9": str(ema.get("ema9") or ""),
-                    "ema26": str(ema.get("ema26") or ""),
-                    "bar_ts_ms": str(fields.get("bar_ts_ms") or now_ms),
-                    "reason": result.reason,
-                    "module1_signal": result.module1_signal,
-                    "module1_reason": result.module1_reason,
-                    "oi_positioning": oi_positioning,
-                    "oi_target_strike": "" if result.oi_target_strike is None else str(result.oi_target_strike),
-                }
-
-                log.info(
-                    "LOGIC symbol=%s module1=%s final=%s reason=%s "
-                    "in=(htf=%s st=%s ema=%s vol=%s lvl_sig=%s lvl=%s)",
-                    sym,
-                    result.module1_signal,
-                    result.signal,
-                    result.reason,
-                    htf_bias,
-                    st_bias,
-                    ema_state,
-                    volume_signal,
-                    level_signal,
-                    level,
-                )
-
-                r.xadd(OUT_STREAM, payload, maxlen=OUT_MAXLEN, approximate=True)
-                r.set(
-                    f"{LATEST_KEY_PREFIX}{sym}",
-                    json.dumps(payload, separators=(",", ":")),
-                    ex=3600,
-                )
-
-                if result.signal.startswith("BUY"):
-                    log.info("EMIT symbol=%s payload=%s", sym, payload)
-                else:
-                    log.debug("NEUTRAL_EMIT symbol=%s payload=%s", sym, payload)
-
-        if ack_ids:
-            r.xack(IN_LEVEL, GROUP, *ack_ids)
+        process_batch(r, resp, symbols)
 
 
 if __name__ == "__main__":

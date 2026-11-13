@@ -11,11 +11,14 @@ Downstream signal engines read these levels for intraday pivot-break triggers.
 
 from __future__ import annotations
 
+import json
 import os
+import time
 from typing import Dict, Optional, Tuple
 
 import redis
 
+from app.candle_builder import is_degenerate_daily, session_completed, session_date_ist
 from app.candle_types import Candle
 from app.candles_store import CandlesStore
 from app.config import load_symbols
@@ -73,6 +76,36 @@ def _parse_1d_fields(fields: dict) -> Optional[Tuple[str, str, Candle]]:
     return sym, date, Candle(ts_ms=ts_ms, o=o, h=h, l=l, c=c, v=v)
 
 
+def _existing_pivots_date(raw) -> str:
+    try:
+        d = json.loads(raw) if raw else None
+    except Exception:
+        return ""
+    return str((d or {}).get("date") or "") if isinstance(d, dict) else ""
+
+
+def validate_pivot_source(
+    day_candle: Candle,
+    date_str: str,
+    existing_date: str,
+    now_ms: int,
+) -> Tuple[bool, str, str]:
+    """(ok, session_date, reason). A daily bar may replace the prev-day pivots only if
+    it is non-degenerate (H > L), belongs to a session that has CLOSED, and is not
+    older than the session the current pivots came from."""
+    bar_date = session_date_ist(day_candle.ts_ms)
+    date_iso = bar_date.isoformat()
+    if date_str and date_str != date_iso:
+        return False, date_iso, f"date field {date_str} != bar session date {date_iso}"
+    if is_degenerate_daily(day_candle):
+        return False, date_iso, f"degenerate bar H={day_candle.h} L={day_candle.l}"
+    if not session_completed(bar_date, now_ms):
+        return False, date_iso, f"session {date_iso} not completed yet"
+    if existing_date and date_iso < existing_date:
+        return False, date_iso, f"older than current pivots date {existing_date}"
+    return True, date_iso, ""
+
+
 def main():
     r = redis.from_url(REDIS_URL, decode_responses=True)
     ensure_group(r, IN_1D_STREAM, GROUP)
@@ -112,9 +145,18 @@ def main():
                 if last_ts_by_symbol.get(sym) == day_candle.ts_ms:
                     continue
 
+                key = f"md:pivots:prevday:{sym}"
+                ok, date_iso, why = validate_pivot_source(
+                    day_candle, date_str, _existing_pivots_date(r.get(key)), int(time.time() * 1000)
+                )
+                if not ok:
+                    print(f"[PIVOTS] REJECT {sym} 1d ts={day_candle.ts_ms}: {why}; keeping existing pivots")
+                    last_ts_by_symbol[sym] = day_candle.ts_ms
+                    continue
+
                 # Closed daily bar is the source for the NEXT session's pivots.
-                p = classic_pivots(day_candle, date=date_str or "")
-                store.write_pivots_prevday(f"md:pivots:prevday:{sym}", p)
+                p = classic_pivots(day_candle, date=date_iso)
+                store.write_pivots_prevday(key, p)
                 r.xadd(
                     OUT_STREAM,
                     {

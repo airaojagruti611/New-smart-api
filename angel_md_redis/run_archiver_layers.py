@@ -5,8 +5,8 @@ Redis Streams → Parquet data_lake, same layout as Angel One ticks:
 
   data_lake/stream=<stream_with_underscores>/dt=YYYY-MM-DD/[symbol=...]/part-<ts>.parquet
 
-Covers Angel One market data plus every Option Rider layer through
-Module 9 (Greeks Change), including the streams those layers consume.
+Covers Angel One market data plus every stream produced by the pipeline
+workers (signal layers, decision layer, executor, TSL, capital allocation).
 
 Usage:
   python run_archiver_layers.py              # all streams
@@ -70,8 +70,32 @@ STREAMS: Dict[str, Tuple[str, str, int]] = {
     # Inputs to Module 9
     "entry_trigger": ("md:entry:trigger", "arch-entry-trigger-1", 2000),
     "strike_select": ("md:strike:select", "arch-strike-select-1", 2000),
+    # Module 10 — Strike Intelligence Engine
+    "strike_intel": ("md:strike:intel", "arch-strike-intel-1", 2000),
+    # Module 12 — Probability, Modules 11+20 — ICARE, Module 22 — journal
+    "probability": ("md:probability", "arch-probability-1", 2000),
+    # Module 13 — Trade Ranking decisions + cycle summaries
+    "ranking": ("md:ranking", "arch-ranking-1", 2000),
+    "ranking_cycle": ("md:ranking:cycle", "arch-ranking-cycle-1", 2000),
+    "icare": ("md:icare", "arch-icare-1", 2000),
+    "journal": ("md:journal", "arch-journal-1", 500),
+    # Module 14 — Order Executor events (orders, fills, final reports, missed moves) + fills
+    "exec": ("md:exec", "arch-exec-1", 2000),
+    "exec_fill": ("md:exec:fill", "arch-exec-fill-1", 500),
+    # Live exit path (order executor): exit requests. Archiving a stream that no
+    # producer has written yet is harmless: the consumer group is created with
+    # MKSTREAM and the reader just idles until the first entry arrives.
+    "exec_exit_request": ("md:exec:exit_request", "arch-exec-exit-request-1", 500),
+    # Module 18 — Adaptive trailing SL events + re-entry signals
+    "tsl": ("md:tsl", "arch-tsl-1", 2000),
+    "tsl_reentry": ("md:tsl:reentry", "arch-tsl-reentry-1", 200),
     # Module 9 — Greeks change
     "greeks_change": ("md:greeks_change:signal", "arch-greeks-change-1", 2000),
+    # Capital allocation (run_capital_alloc.py) — sized CALL/PUT notional
+    "capital_alloc": ("md:capital:alloc", "arch-capital-alloc-1", 2000),
+    # To archive a NEW stream: add one line here
+    #   "<name>": ("<redis stream>", "arch-<name>-1", <batch_size>),
+    # (consumer names must stay stable so restarts resume from the last ACK).
 }
 
 GROUP = "archive"

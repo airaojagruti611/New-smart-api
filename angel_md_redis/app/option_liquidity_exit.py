@@ -17,9 +17,18 @@ Stage 4 — bid pull        : best bid drops > BID_PULL_DROP_PCT in one tick
 Stage 5 — one-sided book  : ask side has refreshed recently, bid side is
                              both thin AND stale (no refresh for STAGE5_STALE_SEC)
 
+Stage 5 (extreme) — bids vanished: ask side quoted (ask > 0) but there is
+                    NO bid at all (bid missing or <= 0). This is the most
+                    severe liquidity event — a long holder has no one to
+                    sell to — and is evaluated via analyze_bids_vanished()
+                    -> EXIT_NOW with stage5_one_sided + bids_vanished set.
+                    (A fully empty book, bid AND ask missing, carries no
+                    information and is still skipped by the runner.)
+
 Exit rule: Stage 3 + Stage 4 together -> EXIT_NOW (per the brief: "do not
-wait for Stage 5"). Stage 5 alone -> ALREADY_TRAPPED (still exit, but it
-means the ideal exit window already passed).
+wait for Stage 5"). Bids vanished -> EXIT_NOW. Stage 5 (thin/stale bid)
+alone -> ALREADY_TRAPPED (still exit, but it means the ideal exit window
+already passed).
 
 No I/O here — pure dataclasses + functions/classes. Redis wiring lives in
 run_option_liquidity_exit.py.
@@ -191,6 +200,7 @@ class LiquidityExitResult:
     stage5_one_sided: bool
 
     exit_status: str  # "NONE" / "WATCH" / "WARNING" / "EXIT_NOW" / "ALREADY_TRAPPED"
+    bids_vanished: bool = False  # one-sided book: asks quoted, no bid at all
 
 
 class OptionLiquidityExitDetector:
@@ -202,6 +212,49 @@ class OptionLiquidityExitDetector:
         self.refresh = RefreshRateTracker()
         self._prev_bid: Optional[float] = None
         self._prev_spot: Optional[float] = None
+
+    def analyze_bids_vanished(
+        self,
+        ts_ms: int,
+        ask: float,
+        ask_sz: float,
+        spot: Optional[float],
+    ) -> LiquidityExitResult:
+        """
+        One-sided book: ask > 0 but no bid (missing or <= 0). Most severe
+        liquidity event -> EXIT_NOW, stage 5 set. Session averages are NOT
+        updated (a 0 bid / infinite spread would poison them); the previous
+        best bid is kept so the drop is reported as 100%.
+        """
+        rr = self.refresh.update(ts_ms, 0.0, 0.0, ask, ask_sz or 0.0)
+        spot_move_pct = None
+        if spot is not None and self._prev_spot and self._prev_spot > 0:
+            spot_move_pct = abs(spot - self._prev_spot) / self._prev_spot * 100.0
+        if spot is not None:
+            self._prev_spot = spot
+        bid_drop = 100.0 if self._prev_bid and self._prev_bid > 0 else None
+        spread_avg = self.spread_avg.avg
+        bid_avg = self.bid_size_avg.avg
+        session_rate = rr["session_combined_rate"]
+        return LiquidityExitResult(
+            spread_pct=200.0,  # (ask - 0) / (ask / 2) * 100 — the maximal spread
+            spread_session_avg=round(spread_avg, 4) if spread_avg else None,
+            bid_size=0.0,
+            bid_size_session_avg=round(bid_avg, 1) if bid_avg else None,
+            refresh_rate=round(rr["combined_rate"], 3),
+            refresh_session_avg=round(session_rate, 3) if session_rate else None,
+            bid_stale_sec=round(rr["bid_stale_sec"], 2) if rr["bid_stale_sec"] is not None else None,
+            ask_stale_sec=round(rr["ask_stale_sec"], 2) if rr["ask_stale_sec"] is not None else None,
+            bid_drop_pct=bid_drop,
+            spot_move_pct=round(spot_move_pct, 4) if spot_move_pct is not None else None,
+            stage1_spread_drift=True,
+            stage2_bid_shrink=True,
+            stage3_refresh_slowing=False,
+            stage4_bid_pull=bid_drop is not None,
+            stage5_one_sided=True,
+            exit_status="EXIT_NOW",
+            bids_vanished=True,
+        )
 
     def analyze(
         self,

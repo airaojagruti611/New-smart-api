@@ -41,6 +41,9 @@ DEFAULT_IV_SHIFT_POINTS = [-2.0, 0.0, 2.0]   # in volatility POINTS (e.g. -2 = I
 DEFAULT_IV_FLOOR = 0.01                       # spec: "floor at configured minimum" on negative future IV
 
 DEFAULT_TIME_ELAPSED_MINUTES = [0.0, 15.0, 30.0, 60.0]
+# Calendar time end-to-end (same as app/strike_intel.py): BSM T and
+# theta_per_day are both calendar-day based, so elapsed scenario minutes are
+# converted with 1440 min/day, never 375 trading minutes.
 MINUTES_PER_YEAR_CALENDAR = 365.0 * 24.0 * 60.0  # matches option_pricing's calendar-day T convention
 
 # Risk-classification thresholds: NOT given numeric values in the spec
@@ -223,6 +226,11 @@ class CurrentState:
     theta_per_day: Optional[float]
     vega_per_point: Optional[float]
     greeks_source: str            # "broker_api" / "theoretical_black_scholes" / "unavailable"
+    # BSM premium at CURRENT spot / T / IV. Scenario premium_change is
+    # model(future) - model_premium so the delta is never polluted by the
+    # market-vs-model basis (observed mid - model). None only for legacy
+    # hand-built states, in which case compare_greeks falls back to premium.
+    model_premium: Optional[float] = None
 
 
 def resolve_current_state(
@@ -251,6 +259,8 @@ def resolve_current_state(
     """
     have_all_greeks = None not in (observed_delta, observed_gamma, observed_theta_per_day, observed_vega_per_point)
 
+    theo = bs_price_greeks(spot, strike, option_type, time_to_expiry_years, current_iv, risk_free_rate, dividend_or_carry)
+
     if have_all_greeks and observed_premium is not None:
         return CurrentState(
             premium=observed_premium, premium_source=observed_premium_source,
@@ -258,9 +268,8 @@ def resolve_current_state(
             delta=observed_delta, gamma=observed_gamma,
             theta_per_day=observed_theta_per_day, vega_per_point=observed_vega_per_point,
             greeks_source=observed_greeks_source,
+            model_premium=theo.premium,
         )
-
-    theo = bs_price_greeks(spot, strike, option_type, time_to_expiry_years, current_iv, risk_free_rate, dividend_or_carry)
 
     return CurrentState(
         premium=observed_premium if observed_premium is not None else theo.premium,
@@ -271,6 +280,7 @@ def resolve_current_state(
         theta_per_day=observed_theta_per_day if observed_theta_per_day is not None else theo.theta_per_day,
         vega_per_point=observed_vega_per_point if observed_vega_per_point is not None else theo.vega_per_point,
         greeks_source=observed_greeks_source if have_all_greeks else "theoretical_black_scholes",
+        model_premium=theo.premium,
     )
 
 
@@ -299,9 +309,17 @@ class ComparisonResult:
 
 
 def compare_greeks(current: CurrentState, predicted: PricingResult) -> ComparisonResult:
-    """Future - Current, per spec 5.7. None current values propagate as None (not silently zeroed)."""
+    """
+    Future - Current, per spec 5.7. None current values propagate as None (not silently zeroed).
+
+    premium_change = model(future) - model(now) (current.model_premium):
+    a scenario delta must compare like with like. Subtracting the observed
+    market mid would bake the market/model basis into every cell (e.g.
+    Base scenario showing -3.00 just because mid sits Rs3 above model).
+    """
+    ref = current.model_premium if current.model_premium is not None else (current.premium or 0.0)
     return ComparisonResult(
-        premium_change=round(predicted.premium - (current.premium or 0.0), 4),
+        premium_change=round(predicted.premium - ref, 4),
         delta_change=None if current.delta is None else round(predicted.delta - current.delta, 4),
         gamma_change=None if current.gamma is None else round(predicted.gamma - current.gamma, 6),
         theta_change=None if current.theta_per_day is None else round(predicted.theta_per_day - current.theta_per_day, 4),
@@ -452,6 +470,7 @@ def build_summary(
     direction: str,
     stress_iv_shift_points: Optional[float] = None,
     stress_elapsed_minutes: Optional[float] = None,
+    option_type: Optional[str] = None,
 ) -> ScenarioSummary:
     """
     Identifies base / expected-direction / adverse / stress scenarios for
@@ -466,8 +485,9 @@ def build_summary(
     NEUTRAL) and the spec's title-case ("Bullish" / "Strong Bullish").
 
     "Stress" is read as the worst-case combination for a LONG option
-    holder: the adverse spot direction (or -2.0 EM if direction is
-    Neutral, as a conservative default) crossed with the most negative
+    holder: spot moving AGAINST the option type (CE: down, PE: up) by
+    |adverse multiplier| (1.0 EM), or 2.0 EM when direction is Neutral,
+    crossed with the most negative
     available IV shift (IV crush hurts long vega) and the longest
     available time-elapsed step (maximum theta decay). This combination
     isn't spelled out explicitly in the spec beyond "stress scenario" --
@@ -489,9 +509,19 @@ def build_summary(
     expected = _find(matrix, expected_mult, 0.0, 0.0) if expected_mult is not None else None
     adverse = _find(matrix, adverse_mult, 0.0, 0.0) if adverse_mult is not None else None
 
-    stress_mult = adverse_mult if adverse_mult is not None else -2.0
-    if adverse_mult is None:
-        notes.append("stress_scenario_defaulted_to_-2.0EM_due_to_neutral_direction")
+    # Stress spot leg must be adverse for the OPTION TYPE held (long CE
+    # loses on down moves, long PE on up moves) — never a fixed -2EM.
+    ot = (option_type or "").strip().upper()
+    magnitude = abs(adverse_mult) if adverse_mult is not None else 2.0
+    if ot == "CE":
+        stress_mult: Optional[float] = -magnitude
+    elif ot == "PE":
+        stress_mult = magnitude
+    else:
+        stress_mult = adverse_mult
+        notes.append("stress_option_type_unknown: stress spot leg follows direction only")
+    if adverse_mult is None and stress_mult is not None:
+        notes.append(f"stress_scenario_defaulted_to_{stress_mult:+.1f}EM_adverse_for_{ot}_due_to_neutral_direction")
 
     if stress_iv_shift_points is None:
         available_iv_shifts = sorted({r.iv_scenario.shift_points for r in matrix})
@@ -500,6 +530,9 @@ def build_summary(
         available_times = sorted({r.time_scenario.elapsed_minutes for r in matrix})
         stress_elapsed_minutes = available_times[-1] if available_times else 0.0
 
-    stress = _find(matrix, stress_mult, stress_iv_shift_points, stress_elapsed_minutes)
+    stress = (
+        _find(matrix, stress_mult, stress_iv_shift_points, stress_elapsed_minutes)
+        if stress_mult is not None else None
+    )
 
     return ScenarioSummary(base=base, expected_direction=expected, adverse=adverse, stress=stress, notes=notes)

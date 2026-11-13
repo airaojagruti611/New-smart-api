@@ -14,6 +14,7 @@ Writes:
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import time
@@ -24,7 +25,7 @@ import redis
 
 from app.candle_types import Candle
 from app.config import load_symbols
-from app.htf_trend_filter import htf_trend_bias
+from app.htf_trend_filter import IST, htf_trend_bias
 from app.logging_setup import setup_logger
 
 
@@ -182,12 +183,40 @@ def main():
         len(symbols),
     )
     _bootstrap(r, symbols, daily_by_sym)
-    if not any(len(buf) >= 2 for buf in daily_by_sym.values()):
-        log.info("bootstrap empty, waiting 20s for history seed then retry")
-        time.sleep(20)
+    retries = int(os.getenv("HTF_BOOTSTRAP_RETRIES", "8"))
+    wait_sec = float(os.getenv("HTF_BOOTSTRAP_WAIT_SEC", "15"))
+    attempt = 0
+    while not any(len(buf) >= 2 for buf in daily_by_sym.values()) and attempt < retries:
+        attempt += 1
+        log.info(
+            "bootstrap empty, waiting %.0fs for history seed then retry %s/%s",
+            wait_sec,
+            attempt,
+            retries,
+        )
+        time.sleep(wait_sec)
         _bootstrap(r, symbols, daily_by_sym)
 
+    # Week/month "in-progress" detection depends on today's IST date, so
+    # recompute every symbol when the date rolls (e.g. first session of a new
+    # week: last week's bucket becomes a completed period).
+    computed_for = dt.datetime.now(tz=IST).date()
+
     while True:
+        today = dt.datetime.now(tz=IST).date()
+        if today != computed_for:
+            computed_for = today
+            roll_ms = int(time.time() * 1000)
+            for sym, buf in list(daily_by_sym.items()):
+                if len(buf) < 2:
+                    continue
+                res = htf_trend_bias(list(buf), today=today)
+                _publish(r, sym, res, roll_ms)
+                log.info(
+                    "DATE_ROLL symbol=%s date=%s bias=%s D=%s W=%s M=%s",
+                    sym, today, res.bias, res.daily, res.weekly, res.monthly,
+                )
+
         resp = r.xreadgroup(
             groupname=GROUP,
             consumername=CONSUMER,

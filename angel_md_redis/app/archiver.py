@@ -134,14 +134,14 @@ class StreamParquetArchiver:
         """
         stream_id:
           - '>' for new messages
-          - '0' to read pending (PEL)
+          - '0' / '<id>' to read this consumer's pending entries (PEL) after that id
         """
         return self.r.xreadgroup(
             groupname=self.group,
             consumername=self.consumer,
             streams={self.stream: stream_id},
             count=self.read_count,
-            block=self.block_ms if stream_id == ">" else 0,
+            block=self.block_ms if stream_id == ">" else None,
         )
 
     # ---------------------------
@@ -152,9 +152,13 @@ class StreamParquetArchiver:
         folder.mkdir(parents=True, exist_ok=True)
 
         # atomic-ish write: write tmp then rename
+        # ms timestamp + per-process sequence: two flushes in the same ms
+        # (e.g. while draining a large PEL) must not overwrite each other
         ts = int(time.time() * 1000)
-        tmp_path = folder / f".tmp-part-{ts}.parquet"
-        final_path = folder / f"part-{ts}.parquet"
+        self._part_seq = getattr(self, "_part_seq", 0) + 1
+        name = f"part-{ts}-{os.getpid()}-{self._part_seq}"
+        tmp_path = folder / f".tmp-{name}.parquet"
+        final_path = folder / f"{name}.parquet"
 
         table = pa.Table.from_pandas(df, preserve_index=False)
         pq.write_table(table, tmp_path, compression=self.compression)
@@ -166,10 +170,21 @@ class StreamParquetArchiver:
 
         df = pd.DataFrame(rows)
 
-        # Ensure ts_recv exists and is numeric
+        # Ensure ts_recv exists and is numeric. When the producer did not set it,
+        # fall back to the message's source time (stream-id ms), not archive
+        # time, so a replay after midnight still lands in the right dt= folder.
+        now_ms = int(time.time() * 1000)
+        if "_redis_id" in df.columns:
+            src_ms = pd.to_numeric(
+                df["_redis_id"].astype(str).str.split("-", n=1).str[0], errors="coerce"
+            )
+        else:
+            src_ms = pd.Series(now_ms, index=df.index)
         if "ts_recv" not in df.columns:
-            df["ts_recv"] = int(time.time() * 1000)
-        df["ts_recv"] = pd.to_numeric(df["ts_recv"], errors="coerce").fillna(int(time.time() * 1000)).astype("int64")
+            df["ts_recv"] = src_ms
+        df["ts_recv"] = (
+            pd.to_numeric(df["ts_recv"], errors="coerce").fillna(src_ms).fillna(now_ms).astype("int64")
+        )
 
         # Stream partition name safe for folders
         stream_folder = f"stream={self.stream.replace(':', '_')}"
@@ -222,17 +237,112 @@ class StreamParquetArchiver:
         self._buf_ids.clear()
         self._last_flush = time.time()
 
+    def _ingest_one(self, msg_id: Any, fields: Any) -> int:
+        mid = str(_decode(msg_id))
+        if not fields:
+            # trimmed/deleted entry: nothing to archive, just drop it from the PEL
+            self.r.xack(self.stream, self.group, mid)
+            return 0
+        row = _decode_dict(fields)
+        row["_redis_id"] = mid
+        row["_stream"] = self.stream
+        self._buf_rows.append(row)
+        self._buf_ids.append(mid)
+        return 1
+
     def _ingest_messages(self, resp) -> int:
         n = 0
-        for _stream_name, msgs in resp:
-            for msg_id, fields in msgs:
-                row = _decode_dict(fields)
-                row["_redis_id"] = _decode(msg_id)
-                row["_stream"] = self.stream
-                self._buf_rows.append(row)
-                self._buf_ids.append(_decode(msg_id))
-                n += 1
+        for _stream_name, msgs in resp or []:
+            for msg_id, fields in msgs or []:
+                if msg_id is None:
+                    continue
+                n += self._ingest_one(msg_id, fields)
         return n
+
+    # ---------------------------
+    # Pending-entries (PEL) drain on startup
+    # ---------------------------
+
+    @staticmethod
+    def _id_ms(msg_id: Any) -> Optional[int]:
+        """Milliseconds part of a stream id ('1700000000000-3' -> 1700000000000)."""
+        try:
+            return int(str(_decode(msg_id)).split("-", 1)[0])
+        except Exception:
+            return None
+
+    def _read_pending_after(self, after_id: str) -> List[Tuple[Any, Any]]:
+        """
+        Return up to read_count entries of this consumer's PEL with id > after_id.
+        Trimmed/deleted entries come back as (id, None) or (id, {}).
+        Some redis-py versions raise while parsing a nil field list; in that case
+        fall back to XPENDING + XRANGE so the archiver never crash-loops.
+        """
+        try:
+            resp = self._xreadgroup(after_id)
+        except (TypeError, AttributeError, ValueError) as e:
+            print(f"[ARCHIVER] {self.stream}: PEL parse error {e!r}; using XPENDING fallback")
+            return self._read_pending_after_slow(after_id)
+        out: List[Tuple[Any, Any]] = []
+        for _stream_name, msgs in resp or []:
+            out.extend(msgs or [])
+        return out
+
+    def _read_pending_after_slow(self, after_id: str) -> List[Tuple[Any, Any]]:
+        lo = "-" if after_id in ("0", "0-0") else f"({after_id}"
+        pend = self.r.xpending_range(
+            self.stream, self.group, min=lo, max="+", count=self.read_count,
+            consumername=self.consumer,
+        )
+        out: List[Tuple[Any, Any]] = []
+        for p in pend or []:
+            mid = p.get("message_id") if isinstance(p, dict) else p[0]
+            got = self.r.xrange(self.stream, min=mid, max=mid, count=1)
+            out.append((mid, got[0][1] if got else None))
+        return out
+
+    def _drain_pending(self) -> int:
+        """
+        Re-ingest this consumer's pending entries exactly once.
+
+        XREADGROUP with an explicit id returns PEL entries with id strictly
+        greater than it, so the cursor is advanced past the last returned id
+        (re-reading "0" in a loop would return the same entries forever ->
+        duplicated rows). Entries whose payload was trimmed by MAXLEN are
+        ACKed and skipped. Returns number of rows ingested.
+        """
+        cursor = "0"
+        total = 0
+        dead_total = 0
+        while True:
+            entries = self._read_pending_after(cursor)
+            if not entries:
+                break
+            last_id: Optional[str] = None
+            dead: List[str] = []
+            for msg_id, fields in entries:
+                if msg_id is None:
+                    continue
+                mid = str(_decode(msg_id))
+                last_id = mid
+                if not fields:
+                    dead.append(mid)
+                    continue
+                total += self._ingest_one(mid, fields)
+            if dead:
+                self.r.xack(self.stream, self.group, *dead)
+                dead_total += len(dead)
+            if len(self._buf_rows) >= self.batch_size:
+                self._flush()
+            if last_id is None or last_id == cursor:
+                break
+            cursor = last_id
+        if total or dead_total:
+            print(
+                f"[ARCHIVER] {self.stream}: drained {total} pending entries"
+                f" ({dead_total} trimmed entries acked+skipped)"
+            )
+        return total
 
     # ---------------------------
     # Main loop
@@ -244,15 +354,8 @@ class StreamParquetArchiver:
             f"batch_size={self.batch_size} flush_sec={self.flush_sec}"
         )
 
-        # 1) Drain pending (if any) first
-        while True:
-            resp = self._xreadgroup("0")
-            got = self._ingest_messages(resp) if resp else 0
-            if got == 0:
-                break
-            if len(self._buf_rows) >= self.batch_size:
-                self._flush()
-
+        # 1) Drain pending (if any) first — each PEL entry exactly once
+        self._drain_pending()
         self._flush()
 
         # 2) Tail new messages forever

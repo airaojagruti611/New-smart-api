@@ -18,7 +18,8 @@ import redis
 
 from app.config import load_symbols
 from app.candle_io import read_last_candles
-from app.level_entry import level_entry, parse_pivots_payload
+from app.freshness import env_ms
+from app.level_entry import LevelBreakTracker, parse_pivots_payload
 from app.logging_setup import setup_logger
 
 
@@ -33,6 +34,11 @@ LATEST_KEY_PREFIX = os.getenv("LEVEL_ENTRY_LATEST_PREFIX", "md:level:entry:lates
 
 GROUP = os.getenv("LEVEL_ENTRY_GROUP", "level-entry")
 CONSUMER = os.getenv("LEVEL_ENTRY_CONSUMER", "level-entry-1")
+
+# Only bars whose own bar timestamp is this recent may produce a break signal.
+# Older bars (history bootstrap / consumer-group replay from "0") just warm up
+# the prev-close state.
+MAX_BAR_AGE_MS = env_ms("LEVEL_MAX_BAR_AGE_SEC", 120)
 
 log = setup_logger("level_entry")
 
@@ -83,22 +89,23 @@ def main():
     r = redis.from_url(REDIS_URL, decode_responses=True)
     ensure_group(r, IN_1M, GROUP)
 
-    # Last closed 1m price per symbol (for break detection).
-    prev_close_by_symbol: Dict[str, float] = {}
+    # Last closed 1m price/ts per symbol (for break detection).
+    tracker = LevelBreakTracker(MAX_BAR_AGE_MS)
 
     log.info(
-        "START reading %s + %s{{SYMBOL}}, writing %s (symbols=%d)",
+        "START reading %s + %s{{SYMBOL}}, writing %s (symbols=%d max_bar_age_ms=%d)",
         IN_1M,
         PIVOTS_KEY_PREFIX,
         OUT_STREAM,
         len(symbols),
+        MAX_BAR_AGE_MS,
     )
 
     for sym in symbols:
         bars = read_last_candles(r, IN_1M, sym, limit=1, scan=2000)
         if bars:
-            prev_close_by_symbol[sym] = bars[-1].c
-            log.info("SEED prev_close symbol=%s close=%.4f", sym, bars[-1].c)
+            tracker.seed(sym, bars[-1].c, bars[-1].ts_ms)
+            log.info("SEED prev_close symbol=%s close=%.4f bar_ts_ms=%s", sym, bars[-1].c, bars[-1].ts_ms)
 
     while True:
         resp = r.xreadgroup(
@@ -131,16 +138,25 @@ def main():
                     log.debug("SKIP bad_close symbol=%s c=%r", sym, fields.get("c"))
                     continue
 
-                prev_close = prev_close_by_symbol.get(sym)
-                prev_close_by_symbol[sym] = close
-                if prev_close is None:
-                    log.debug("SKIP seed_prev_close symbol=%s close=%.4f", sym, close)
-                    continue
+                loaded = {}
 
-                pivots = _load_pivots(r, sym)
-                if pivots is None:
-                    log.debug("SKIP no_pivots symbol=%s", sym)
+                def _pivots_loader(_sym=sym, _box=loaded):
+                    _box["p"] = _load_pivots(r, _sym)
+                    return _box["p"]
+
+                decision = tracker.on_bar(sym, close, bar_ts, now_ms, _pivots_loader)
+                if not decision.emit:
+                    log.debug(
+                        "SKIP %s symbol=%s close=%.4f bar_ts_ms=%s",
+                        decision.skip_reason,
+                        sym,
+                        close,
+                        bar_ts,
+                    )
                     continue
+                prev_close = decision.prev_close
+                result = decision.result
+                pivots = loaded["p"]
 
                 log.debug(
                     "INPUTS symbol=%s prev_close=%.4f close=%.4f pivots=%s",
@@ -149,8 +165,6 @@ def main():
                     close,
                     pivots,
                 )
-
-                result = level_entry(prev_close, close, pivots)
 
                 payload = {
                     "ts_ms": str(now_ms),
@@ -168,7 +182,7 @@ def main():
                     "R2": f"{pivots.R2:.2f}",
                     "S2": f"{pivots.S2:.2f}",
                     "pivot_date": pivots.date,
-                    "bar_ts_ms": str(bar_ts or now_ms),
+                    "bar_ts_ms": str(bar_ts),
                     "reason": result.reason,
                 }
 

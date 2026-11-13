@@ -34,6 +34,16 @@ $env:ARCHIVE_TZ = "Asia/Kolkata"
 # Match run_all.sh: Start-Worker already redirects stdout into logs\<date>\<name>.log
 $env:LOG_TO_FILE = "0"
 
+# Refuse to start a second copy: pid files would be overwritten and the first set
+# of workers (incl. the order executor) would keep running with no way to stop them.
+if ($env:ALLOW_DUPLICATE_START -ne "1") {
+    & (Join-Path $PSScriptRoot "stop_all.ps1") -Check
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Pipeline already running (see above). Stop it first: .\stop_all.ps1  (or set `$env:ALLOW_DUPLICATE_START=1)" -ForegroundColor Red
+        exit 1
+    }
+}
+
 # 3. Start Redis Container
 Write-Host "`n[1/4] Ensuring Redis Docker Container is running..." -ForegroundColor Yellow
 docker compose up -d
@@ -44,7 +54,8 @@ if ($LASTEXITCODE -ne 0) {
 
 # 4. Setup Logging and PID directories
 $date = Get-Date -Format "yyyy-MM-dd"
-$logDir = Join-Path $PSScriptRoot "logs\$date"
+$logRoot = if ($env:LOG_DIR) { $env:LOG_DIR } else { Join-Path $PSScriptRoot "logs" }
+$logDir = Join-Path $logRoot $date
 $pidDir = Join-Path $logDir "pids"
 New-Item -ItemType Directory -Force -Path $pidDir | Out-Null
 
@@ -66,15 +77,16 @@ function Start-Worker {
     param (
         [string]$Name,
         [string]$Script,
-        [string]$Args = ""
+        # NOT $Args: that is a PowerShell automatic variable
+        [string]$ExtraArgs = ""
     )
     Write-Host "  -> Launching worker: $Name" -ForegroundColor Green
     $stdoutFile = Join-Path $logDir "$Name.log"
     $stderrFile = Join-Path $logDir "$Name.err.log"
     $pidFile = Join-Path $pidDir "$Name.pid"
     
-    if ($Args) {
-        $proc = Start-Process -FilePath $VenvPython -ArgumentList "$Script $Args" -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -PassThru -NoNewWindow
+    if ($ExtraArgs) {
+        $proc = Start-Process -FilePath $VenvPython -ArgumentList "$Script $ExtraArgs" -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -PassThru -NoNewWindow
     } else {
         $proc = Start-Process -FilePath $VenvPython -ArgumentList "$Script" -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -PassThru -NoNewWindow
     }
@@ -116,6 +128,14 @@ Start-Worker "liquidity_score" "run_liquidity_score.py"
 # --- Strategy Decision & Strike Selection ---
 Start-Worker "entry_trigger" "run_entry_trigger.py"
 Start-Worker "strike_select" "run_strike_select.py"
+Start-Worker "strike_intel" "run_strike_intel.py"
+Start-Worker "account" "run_account.py"
+Start-Worker "probability" "run_probability.py"
+Start-Worker "trade_ranking" "run_trade_ranking.py"
+Start-Worker "icare" "run_icare.py"
+Start-Worker "order_executor" "run_order_executor.py"
+Start-Worker "trade_journal" "run_trade_journal.py"
+Start-Worker "adaptive_tsl" "run_adaptive_tsl.py"
 Start-Worker "capital_alloc" "run_capital_alloc.py"
 
 # --- Adaptive Learning (record mode): paper trades -> outcomes -> bucket stats ---
@@ -130,7 +150,28 @@ Start-Worker "greeks_change" "run_greeks_change.py"
 # --- Archiver: all Angel One + layer streams -> data_lake/*.parquet ---
 Start-Worker "arch_layers" "run_archiver_layers.py" "all"
 
+# --- Copy dashboard inputs to a cloud Redis (for Streamlit Community Cloud) ---
+# Only when CLOUD_REDIS_URL is set (environment or .env).
+$HasCloudRedis = [bool]$env:CLOUD_REDIS_URL
+if (-not $HasCloudRedis -and (Test-Path "$PSScriptRoot\.env")) {
+    $HasCloudRedis = [bool](Select-String -Path "$PSScriptRoot\.env" -Pattern '^\s*CLOUD_REDIS_URL\s*=\s*\S' -Quiet)
+}
+if ($HasCloudRedis) {
+    Start-Worker "cloud_mirror" "run_cloud_mirror.py"
+}
+
+# --- Live Streamlit UI — set START_DASHBOARD=0 to skip ---
+# Binds to 127.0.0.1 by default; share it via Cloudflare Tunnel, not the LAN.
+$DashPort = if ($env:DASHBOARD_PORT) { $env:DASHBOARD_PORT } else { "8501" }
+$DashAddr = if ($env:DASHBOARD_ADDR) { $env:DASHBOARD_ADDR } else { "127.0.0.1" }
+if ($env:START_DASHBOARD -ne "0") {
+    Start-Worker "dashboard" "-m streamlit" "run streamlit_app.py --server.port $DashPort --server.address $DashAddr --server.headless true --browser.gatherUsageStats false"
+}
+
 Write-Host "`n[4/4] Success! Pipeline is running." -ForegroundColor Cyan
 Write-Host "Logs are being recorded in: $logDir" -ForegroundColor Gray
-Write-Host "To stop all processes, run: .\stop_all.ps1" -ForegroundColor Yellow
-Write-Host "Dashboard (Linux): ./run_dashboard.sh  →  http://127.0.0.1:8501" -ForegroundColor Gray
+Write-Host "PIDs: $pidDir" -ForegroundColor Gray
+Write-Host "To stop all processes (any day, also after midnight), run: .\stop_all.ps1" -ForegroundColor Yellow
+if ($env:START_DASHBOARD -ne "0") {
+    Write-Host "Dashboard: http://127.0.0.1:$DashPort" -ForegroundColor Gray
+}

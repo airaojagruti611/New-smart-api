@@ -95,16 +95,33 @@ def closed_period_candles(
     period_candles: List[Candle],
     *,
     drop_current: bool,
+    key_fn=None,
+    today: Optional[dt.date] = None,
 ) -> List[Candle]:
     """
-    For week/month, drop the in-progress period (current calendar bucket).
+    For week/month, drop the in-progress period — but only when the last
+    bucket really is the current calendar period (it contains ``today``, IST).
+
+    On the first session of a new week/month the dailies end on the last
+    completed day, so the last bucket is a *completed* period and must be kept;
+    dropping it would make the weekly/monthly direction one period stale.
+
+    ``key_fn`` maps a date to its period key (``_week_key`` / ``_month_key``).
+    Without ``key_fn`` the legacy behaviour (always drop the last bucket) is used.
     Daily candles from md:candles:1d are already closed — do not drop.
     """
     if not drop_current:
         return list(period_candles)
-    if len(period_candles) <= 1:
+    if not period_candles:
         return []
-    return list(period_candles[:-1])
+    if key_fn is None:
+        return list(period_candles[:-1])
+    if today is None:
+        today = dt.datetime.now(tz=IST).date()
+    last_key = key_fn(_candle_date_ist(period_candles[-1]))
+    if last_key == key_fn(today):
+        return list(period_candles[:-1])
+    return list(period_candles)
 
 
 def _direction_from_closes(prev_close: float, close: float) -> str:
@@ -122,7 +139,7 @@ def _tf_direction(closed: List[Candle]) -> Tuple[str, float, float]:
     return _direction_from_closes(prev.c, last.c), float(last.c), float(prev.c)
 
 
-def htf_trend_bias(daily: List[Candle]) -> HtfTrendResult:
+def htf_trend_bias(daily: List[Candle], today: Optional[dt.date] = None) -> HtfTrendResult:
     """
     Chartink-style higher-timeframe trend:
 
@@ -133,13 +150,22 @@ def htf_trend_bias(daily: List[Candle]) -> HtfTrendResult:
     All three bullish -> CALL (only allow calls)
     All three bearish -> PUT (only allow puts)
     Else -> NEUTRAL
+
+    Weekly/monthly use the last two *completed* periods: the last bucket is
+    dropped only if it is the in-progress period containing ``today`` (IST).
     """
     ordered = sorted(daily, key=lambda x: x.ts_ms)
 
     d_dir, d_close, d_prev = _tf_direction(ordered)
 
-    weeks = closed_period_candles(weekly_candles_from_daily(ordered), drop_current=True)
-    months = closed_period_candles(monthly_candles_from_daily(ordered), drop_current=True)
+    if today is None:
+        today = dt.datetime.now(tz=IST).date()
+    weeks = closed_period_candles(
+        weekly_candles_from_daily(ordered), drop_current=True, key_fn=_week_key, today=today
+    )
+    months = closed_period_candles(
+        monthly_candles_from_daily(ordered), drop_current=True, key_fn=_month_key, today=today
+    )
 
     w_dir, w_close, w_prev = _tf_direction(weeks)
     m_dir, m_close, m_prev = _tf_direction(months)

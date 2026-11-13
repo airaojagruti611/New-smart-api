@@ -39,12 +39,15 @@ def compute_indicator_score(
     except (TypeError, ValueError):
         n_bear = 0
 
+    # A level-signal "strong" only upgrades the side it points to:
+    # BUY CALL -> bullish/CE, BUY PUT -> bearish/PE. An opposite-direction
+    # level break never upgrades (conservative: no upgrade, no downgrade).
     strong_call = (
-        lvl_sig == "BUY CALL" and lvl in ("R1", "R2")
-    ) or strength_in == "strong" or n_bull >= 3
+        lvl_sig == "BUY CALL" and (lvl in ("R1", "R2") or strength_in == "strong")
+    ) or n_bull >= 3
     strong_put = (
-        lvl_sig == "BUY PUT" and lvl in ("S1", "S2")
-    ) or strength_in == "strong" or n_bear >= 3
+        lvl_sig == "BUY PUT" and (lvl in ("S1", "S2") or strength_in == "strong")
+    ) or n_bear >= 3
 
     if bias == "CALL" and state == "bullish":
         if strong_call:

@@ -1,4 +1,5 @@
 import json
+import re
 import time
 import datetime as dt
 from pathlib import Path
@@ -42,8 +43,29 @@ def load_scripmaster(cache_path: Path = CACHE_PATH) -> pd.DataFrame:
         cache_path.write_bytes(r.content)
 
     data = json.loads(cache_path.read_text(encoding="utf-8"))
-    df = pd.DataFrame(data)
+    return prepare_scripmaster(pd.DataFrame(data))
 
+
+def option_type_of(symbol: Any, instrumenttype: Any = "") -> Optional[str]:
+    """CE/PE from the tradingsymbol's 2-char suffix (PETRONET27OCT26320CE -> CE).
+
+    Substring matching is wrong: PETRONET/PERSISTENT/HINDPETRO contain "PE".
+    Non-option instruments return None.
+    """
+    it = str(instrumenttype or "").upper()
+    if it and not it.startswith("OPT"):
+        return None
+    s = str(symbol or "").strip().upper()
+    if s.endswith("CE"):
+        return "CE"
+    if s.endswith("PE"):
+        return "PE"
+    return None
+
+
+def prepare_scripmaster(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize raw ScripMaster rows (columns, expiry/strike parsing, opt_type)."""
+    df = df.copy()
     df["exch_seg"] = df["exch_seg"].astype(str).str.upper()
 
     # token
@@ -73,10 +95,9 @@ def load_scripmaster(cache_path: Path = CACHE_PATH) -> pd.DataFrame:
     df["expiry_date"] = df.get("expiry", "").apply(parse_expiry)
     df["strike_f"] = df.get("strike", None).apply(to_float)
 
-    sym_u = df["symbol"].str.upper()
-    df["opt_type"] = None
-    df.loc[sym_u.str.contains("CE"), "opt_type"] = "CE"
-    df.loc[sym_u.str.contains("PE"), "opt_type"] = "PE"
+    df["opt_type"] = [
+        option_type_of(sym, it) for sym, it in zip(df["symbol"].tolist(), df["instrumenttype"].tolist())
+    ]
 
     return df
 
@@ -95,8 +116,11 @@ def resolve_eq_tokens(df: pd.DataFrame, symbols: List[str]) -> Dict[str, Dict[st
             r = hit.iloc[0]
             out[s] = {"tradingsymbol": r["symbol"], "token": str(r["token"]), "exchange": "NSE"}
         else:
-            # fallback: startwith and endswith -EQ
-            hit2 = d[d["sym_u"].str.startswith(s) & d["sym_u"].str.endswith("-EQ")]
+            # Fallback: same base symbol in another series (e.g. HFCL-BE for
+            # trade-to-trade stocks). Exact base match only: a prefix match
+            # would map PNB to PNBHOUSING.
+            hit2 = d[d["sym_u"].str.split("-").str[0] == s]
+            hit2 = hit2[hit2["sym_u"].str.endswith(("-EQ", "-BE", "-BZ"))]
             if not hit2.empty:
                 r = hit2.iloc[0]
                 out[s] = {"tradingsymbol": r["symbol"], "token": str(r["token"]), "exchange": "NSE"}
@@ -136,6 +160,41 @@ def _opt_int(v) -> Optional[int]:
         return None
 
 
+def filter_underlying(d: pd.DataFrame, underlying: str) -> pd.DataFrame:
+    """Rows whose underlying is exactly `underlying`.
+
+    Uses the ScripMaster `name` column (LT != LTF/LTM, NIFTY != NIFTYNXT50,
+    PNB != PNBHOUSING). Rows with an empty name fall back to a strict
+    tradingsymbol pattern: UNDERLYING + DDMMMYY + strike + CE/PE.
+    """
+    u = str(underlying or "").strip().upper()
+    names = d["name"].astype(str).str.strip().str.upper() if "name" in d.columns else pd.Series("", index=d.index)
+    by_name = names == u
+    blank = names == ""
+    sym_u = d["symbol"].astype(str).str.upper()
+    pat = r"^" + re.escape(u) + r"\d{2}[A-Z]{3}\d{2}\d+(?:\.\d+)?(?:CE|PE)$"
+    by_sym = blank & sym_u.str.match(pat)
+    return d[by_name | by_sym]
+
+
+def _option_rows(df: pd.DataFrame, underlying: str) -> pd.DataFrame:
+    """
+    filter_underlying() over the NFO option rows, cached on the frame: the
+    producer plans every symbol (twice with the wide tier), and re-filtering
+    the full ScripMaster each time blocks the websocket callback for seconds.
+    """
+    cache = df.attrs.get("_opt_rows")
+    if cache is None:
+        nfo = df[(df["exch_seg"] == "NFO") & (df["instrumenttype"].str.contains("OPT", na=False))].copy()
+        nfo["sym_u"] = nfo["symbol"].str.upper()
+        cache = {"_all": nfo}
+        df.attrs["_opt_rows"] = cache
+    u = str(underlying or "").strip().upper()
+    if u not in cache:
+        cache[u] = filter_underlying(cache["_all"], u)
+    return cache[u]
+
+
 def build_atm_option_tokens(
     df: pd.DataFrame,
     underlying: str,
@@ -147,13 +206,10 @@ def build_atm_option_tokens(
       - list of {token, tradingsymbol, underlying, expiry, strike, cp, exchange}
       - expiry_str like '2026-01-27' for greeks poller
     """
-    d = df[(df["exch_seg"] == "NFO") & (df["instrumenttype"].str.contains("OPT", na=False))].copy()
-    d["sym_u"] = d["symbol"].str.upper()
-
-    # simple reliable match: tradingsymbol startswith underlying
-    d = d[d["sym_u"].str.startswith(underlying)]
+    d = _option_rows(df, underlying)
     if d.empty:
         return [], None
+    d = d.copy()
 
     expiry = pick_nearest_expiry(d)
     if not expiry:
@@ -201,3 +257,29 @@ def build_atm_option_tokens(
             })
 
     return out, expiry.isoformat()
+
+
+def option_specs(df: pd.DataFrame, underlyings: List[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Per-contract order specs for NFO options of `underlyings` (DECISION.md §7 E6/E8):
+      tick       price tick in rupees (ScripMaster tick_size is in paise: 5 -> 0.05, 1 -> 0.01)
+      lot_size   units per lot
+      freeze_qty NSE quantity-freeze limit in UNITS per order (None if absent)
+      expiry     date
+      kind       OPTSTK / OPTIDX
+    """
+    names = {u.upper() for u in underlyings}
+    d = df[(df["exch_seg"] == "NFO") & df["instrumenttype"].isin(["OPTSTK", "OPTIDX"])]
+    d = d[d["name"].str.upper().isin(names)]
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in d.to_dict("records"):
+        tick_paise = to_float(row.get("tick_size"))
+        out[str(row["symbol"]).upper()] = {
+            "tick": round(tick_paise / 100.0, 4) if tick_paise else 0.05,
+            "lot_size": to_float(row.get("lotsize")),
+            "freeze_qty": to_float(row.get("freeze_qty")),
+            "expiry": row.get("expiry_date"),
+            "kind": row.get("instrumenttype"),
+            "token": str(row.get("token") or ""),
+        }
+    return out

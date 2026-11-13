@@ -39,8 +39,13 @@ class VolumeAnalyzer:
             self._vol_history.append(volume)
 
     @property
+    def history_len(self) -> int:
+        return len(self._vol_history)
+
+    @property
     def avg_volume(self) -> Optional[float]:
-        if not self._vol_history:
+        # Match spec rolling(period=20): no surge until the window is full.
+        if len(self._vol_history) < self._avg_window:
             return None
         return sum(self._vol_history) / len(self._vol_history)
 
@@ -70,14 +75,20 @@ class VolumeAnalyzer:
             buy_pct = 50.0
             sell_pct = 50.0
         else:
-            buy_pct  = ((close - low)  / candle_range) * 100.0
-            sell_pct = ((high  - close) / candle_range) * 100.0
+            # Round BEFORE the 60% gate so stored buy_pct=60.00 cannot
+            # disagree with the signal (IEEE float otherwise yields
+            # 59.999… → Possible Wrong Entry, then round() to 60.00).
+            buy_pct = round(((close - low) / candle_range) * 100.0, 2)
+            sell_pct = round(100.0 - buy_pct, 2)
 
         volume_surge: Optional[float] = None
+        surge_raw: Optional[float] = None
         if avg_volume and avg_volume > 0:
-            volume_surge = round(volume / avg_volume, 2)
+            surge_raw = volume / avg_volume
+            volume_surge = round(surge_raw, 2)
 
-        surge_confirmed = volume_surge is not None and volume_surge > 2.0
+        # Compare the unrounded ratio: 2.004 rounds to 2.0 but IS > 2.
+        surge_confirmed = surge_raw is not None and surge_raw > 2.0
 
         if buy_pct >= 60.0:
             signal = "Strong Bullish Volume" if surge_confirmed else "Bullish Volume"
@@ -91,8 +102,8 @@ class VolumeAnalyzer:
             low=low,
             close=close,
             volume=volume,
-            buy_pct=round(buy_pct, 2),
-            sell_pct=round(sell_pct, 2),
+            buy_pct=buy_pct,
+            sell_pct=sell_pct,
             volume_surge=volume_surge,
             signal=signal,
         )

@@ -20,11 +20,27 @@ export LOG_LEVEL="${LOG_LEVEL:-DEBUG}"
 export LOG_TO_FILE="${LOG_TO_FILE:-0}"
 export LOG_DIR="${LOG_DIR:-$BASE/logs}"
 
+# Refuse to start a second copy: pid files would be overwritten and the first
+# set of workers (incl. the order executor) would keep running unstoppable.
+# The lock covers the startup window before any pid file exists (bootstrap
+# takes minutes); workers inherit fd 9, so it is held while any of them runs.
+mkdir -p "$LOG_DIR"
+exec 9>"$LOG_DIR/.run_all.lock"
+if [[ "${ALLOW_DUPLICATE_START:-0}" != "1" ]] && ! flock -n 9; then
+  echo "Another run_all.sh is starting or its workers are still running. Stop it first: ./stop_all.sh"
+  exit 1
+fi
+if [[ "${ALLOW_DUPLICATE_START:-0}" != "1" ]] && ! LOG_DIR="$LOG_DIR" "$BASE/stop_all.sh" --check; then
+  echo "Pipeline already running (see above). Stop it first: ./stop_all.sh"
+  echo "(or set ALLOW_DUPLICATE_START=1 to start anyway)"
+  exit 1
+fi
+
 # start redis
 docker compose up -d
 
 DAY="$(date +%F)"
-LOGDIR="$BASE/logs/$DAY"
+LOGDIR="$LOG_DIR/$DAY"
 PIDDIR="$LOGDIR/pids"
 mkdir -p "$PIDDIR"
 
@@ -34,6 +50,9 @@ start() {
   nohup "$@" >> "$LOGDIR/$name.log" 2>&1 &
   echo $! > "$PIDDIR/$name.pid"
 }
+
+echo "Refreshing F&O universe (ScripMaster + NSE ban list, prunes expired symbols.txt entries)..."
+python3 run_fo_universe.py >> "$LOGDIR/fo_universe.log" 2>&1 || echo "WARNING: F&O universe refresh failed; see $LOGDIR/fo_universe.log"
 
 echo "Seeding candle history for Indicator Signals..."
 python3 run_history_bootstrap.py >> "$LOGDIR/history_bootstrap.log" 2>&1 || echo "WARNING: history bootstrap failed; see $LOGDIR/history_bootstrap.log"
@@ -123,6 +142,23 @@ start "entry_trigger" python3 run_entry_trigger.py
 # 3g) Strike select: entry signal -> ATM / slight-OTM option contract
 start "strike_select" python3 run_strike_select.py
 
+# 3g2) Strike Intelligence Engine (Module 10, shadow alongside strike_select): top-3 ranked strikes
+start "strike_intel" python3 run_strike_intel.py
+
+# 3g3) Decision layer (shadow, PAPER only — no broker orders):
+#      account snapshot -> Probability Engine -> Trade Ranking -> ICARE lots/risk -> paper-trade journal
+start "account" python3 run_account.py
+start "probability" python3 run_probability.py
+# Module 13 Trade Ranking (RANK_MODE=shadow by default: ICARE keeps reading md:probability)
+start "trade_ranking" python3 run_trade_ranking.py
+start "icare" python3 run_icare.py
+# Module 14 Order Executor (EXEC_MODE=shadow by default: simulated fills, journal unchanged;
+# live is refused without EXEC_LIVE_ENABLED=1 + a registered static IP — DECISION.md §7)
+start "order_executor" python3 run_order_executor.py
+start "trade_journal" python3 run_trade_journal.py
+# Module 18 Adaptive Trailing SL & Re-entry (TSL_MODE=shadow by default: observes only)
+start "adaptive_tsl" python3 run_adaptive_tsl.py
+
 # 3h) Capital alloc: regime bias + strike -> sized CALL/PUT notional
 start "capital_alloc" python3 run_capital_alloc.py
 
@@ -138,6 +174,11 @@ start "greeks_change" python3 run_greeks_change.py
 # 4) One parquet archiver: Angel One + all layer streams -> data_lake/stream=.../dt=YYYY-MM-DD/...
 start "arch_layers" python3 run_archiver_layers.py all
 
+# 4b) Copy dashboard inputs to a cloud Redis (Streamlit Community Cloud) when configured
+if [[ -n "${CLOUD_REDIS_URL:-}" ]] || grep -qE '^\s*CLOUD_REDIS_URL\s*=\s*\S' .env 2>/dev/null; then
+  start "cloud_mirror" python3 run_cloud_mirror.py
+fi
+
 # 5) Live Streamlit UI (http://127.0.0.1:8501) — set START_DASHBOARD=0 to skip
 if [[ "${START_DASHBOARD:-1}" != "0" ]]; then
   start "dashboard" streamlit run streamlit_app.py \
@@ -152,8 +193,8 @@ echo "All started."
 echo "Logs: $LOGDIR"
 echo "PIDs: $PIDDIR"
 echo "Dashboard: http://127.0.0.1:${DASHBOARD_PORT:-8501}"
-echo "To stop everything:"
-echo "  kill \$(cat $PIDDIR/*.pid)"
+echo "To stop everything (SIGTERM, then SIGKILL after \${STOP_TIMEOUT:-20}s; works after midnight too):"
+echo "  ./stop_all.sh"
 echo "Client Excel (any time while Redis is up):"
 echo "  ./export_client_excel.sh"
 echo "  python3 export_client_excel.py --symbols RELIANCE,TCS,INFY"

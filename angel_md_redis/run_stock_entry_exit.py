@@ -28,6 +28,7 @@ import redis
 
 from app.config import load_symbols
 from app.logging_setup import setup_logger
+from app.order_flow import CumVolTradeQty
 from app.stock_entry_exit import DepthLevel, EntryExitResult, StockEntryExitDetector
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -106,7 +107,7 @@ def main() -> None:
     ensure_group(r, EQ_STREAM, GROUP)
 
     detectors: Dict[str, StockEntryExitDetector] = {}
-    prev_cum_vol: Dict[str, float] = {}
+    trade_qty_tracker = CumVolTradeQty()
     last_entry: Dict[str, bool] = {}
 
     log.info(
@@ -140,6 +141,9 @@ def main() -> None:
                 bid = _safe_float(fields.get("bid"))
                 ask = _safe_float(fields.get("ask"))
                 ltp = _safe_float(fields.get("ltp"))
+                # Trade qty = delta of cumulative day volume (NOT ltq, which
+                # repeats on quote-only ticks and would be double counted).
+                trade_qty = trade_qty_tracker.update(sym, fields.get("vol"))
 
                 bid_sizes = _parse_csv_floats(fields.get("bid_depth5") or "")
                 ask_sizes = _parse_csv_floats(fields.get("ask_depth5") or "")
@@ -151,16 +155,6 @@ def main() -> None:
                 if bid is None or ask is None or not bid_levels or not ask_levels:
                     log.debug("SKIP no_quote symbol=%s", sym)
                     continue
-
-                trade_qty = _safe_float(fields.get("ltq"))
-                if trade_qty is None:
-                    cum_vol = _safe_float(fields.get("vol"))
-                    prev = prev_cum_vol.get(sym)
-                    if cum_vol is not None:
-                        trade_qty = max(0.0, cum_vol - prev) if prev is not None else 0.0
-                        prev_cum_vol[sym] = cum_vol
-                    else:
-                        trade_qty = 0.0
 
                 if sym not in detectors:
                     detectors[sym] = StockEntryExitDetector()

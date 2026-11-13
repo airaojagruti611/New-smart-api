@@ -27,7 +27,7 @@ import redis
 
 from app.config import load_symbols
 from app.logging_setup import setup_logger
-from app.order_flow import DepthLevel, OrderFlowDetector, OrderFlowSignal
+from app.order_flow import CumVolTradeQty, DepthLevel, OrderFlowDetector, OrderFlowSignal, tick_ts_ms
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
@@ -105,7 +105,7 @@ def main() -> None:
     ensure_group(r, OPT_STREAM, GROUP)
 
     detectors: Dict[str, OrderFlowDetector] = {}
-    prev_cum_vol: Dict[str, float] = {}
+    trade_qty_tracker = CumVolTradeQty()
     last_bias: Dict[str, str] = {}
 
     log.info(
@@ -144,6 +144,10 @@ def main() -> None:
                         continue
                     key, kind = tsym, "opt"
 
+                # Trade qty = delta of cumulative day volume. NOT ltq: ltq is the
+                # LAST traded qty and repeats on quote-only ticks (double count).
+                trade_qty = trade_qty_tracker.update(key, fields.get("vol"))
+                tick_ms = tick_ts_ms(fields, now_ms)
                 bid = _safe_float(fields.get("bid"))
                 ask = _safe_float(fields.get("ask"))
                 ltp = _safe_float(fields.get("ltp"))
@@ -159,23 +163,11 @@ def main() -> None:
                     log.debug("SKIP no_depth key=%s kind=%s", key, kind)
                     continue
 
-                # Trade qty: prefer ltq, else derive from cumulative "vol" delta
-                # (same technique as run_smart_money.py / candle_builder.py).
-                trade_qty = _safe_float(fields.get("ltq"))
-                if trade_qty is None:
-                    cum_vol = _safe_float(fields.get("vol"))
-                    prev = prev_cum_vol.get(key)
-                    if cum_vol is not None:
-                        trade_qty = max(0.0, cum_vol - prev) if prev is not None else 0.0
-                        prev_cum_vol[key] = cum_vol
-                    else:
-                        trade_qty = 0.0
-
                 if key not in detectors:
                     detectors[key] = OrderFlowDetector(direction_window=DIRECTION_WINDOW)
 
                 sig = detectors[key].analyze(
-                    ts_ms=now_ms,
+                    ts_ms=tick_ms,
                     trade_price=ltp,
                     trade_qty=trade_qty or 0.0,
                     bid=bid, ask=ask,

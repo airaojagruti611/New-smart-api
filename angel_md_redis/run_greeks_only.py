@@ -15,10 +15,10 @@ PER_REQUEST_SLEEP = 0.12
 
 def main():
     print("[GREEKS] logging in...")
-    _, auth_token, _ = login()
+    smart_api, auth_token, _ = login()
 
     rs = RedisStore()
-    poller = GreeksPoller(auth_token=auth_token)
+    poller = GreeksPoller(auth_token=auth_token, smart_api=smart_api)
 
     print("[GREEKS] started. Waiting for md:active_expiry from producer...")
     waiting_logged = True
@@ -52,8 +52,8 @@ def main():
             print("[GREEKS] re-login in 3s...")
             time.sleep(3)
             try:
-                _, auth_token, _ = login()
-                poller = GreeksPoller(auth_token=auth_token)
+                smart_api, auth_token, _ = login()
+                poller = GreeksPoller(auth_token=auth_token, smart_api=smart_api)
             except Exception as e2:
                 print("[GREEKS] relogin failed:", repr(e2))
                 time.sleep(5)

@@ -4,6 +4,7 @@ import time
 
 import redis
 
+from app.freshness import env_ms, is_fresh_payload
 from app.config import load_symbols
 from app.indicator_score import compute_indicator_score
 from app.logging_setup import setup_logger
@@ -18,6 +19,7 @@ IN_EMA = os.getenv("STREAM_EMA_CROSS", "md:ema:cross")
 ST_LATEST_PREFIX = os.getenv("SUPERTREND_BIAS_LATEST_PREFIX", "md:supertrend:bias:latest:")
 EMA_LATEST_PREFIX = os.getenv("EMA_CROSS_LATEST_PREFIX", "md:ema:cross:latest:")
 LEVEL_LATEST_PREFIX = os.getenv("LEVEL_ENTRY_LATEST_PREFIX", "md:level:entry:latest:")
+LEVEL_MAX_AGE_MS = env_ms("ENTRY_MAX_SIGNAL_AGE_SEC", 120)
 INDICATOR_SCORE_LATEST_PREFIX = os.getenv("INDICATOR_SCORE_LATEST_PREFIX", "md:indicator:score:latest:")
 
 OUT_STREAM = os.getenv("STREAM_MOMENTUM_CONFIRM", "md:momentum:confirm")
@@ -144,6 +146,10 @@ def main():
             signal = momentum_confirm(st_bias, ema_state)
 
             level = _load_latest(r, f"{LEVEL_LATEST_PREFIX}{sym}") or {}
+            # An old level break must not upgrade the live score.
+            if level and not is_fresh_payload(level, now_ms, LEVEL_MAX_AGE_MS, field="bar_ts_ms"):
+                log.debug("SKIP stale_level symbol=%s bar_ts_ms=%s", sym, level.get("bar_ts_ms"))
+                level = {}
             scored = compute_indicator_score(
                 st_bias=st_bias,
                 ema_state=ema_state,
