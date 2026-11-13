@@ -18,6 +18,7 @@ from app.probability_engine import signal_origin_ms, volume_surge_flag
 class FakeRedis:
     def __init__(self):
         self.kv, self.hashes, self.zsets, self.streams = {}, {}, {}, {}
+        self.sets = {}
 
     def get(self, k):
         return self.kv.get(k)
@@ -30,6 +31,12 @@ class FakeRedis:
 
     def scan_iter(self, match="*", count=None):
         return [k for k in list(self.kv) if fnmatch.fnmatch(k, match)]
+
+    def sadd(self, k, *ms):
+        self.sets.setdefault(k, set()).update(ms)
+
+    def sismember(self, k, m):
+        return int(m in self.sets.get(k, set()))
 
     def hget(self, k, f):
         return self.hashes.get(k, {}).get(f)

@@ -18,6 +18,29 @@ STOP = ROOT / "stop_all.sh"
 RUN = ROOT / "run_all.sh"
 
 
+def _working_bash() -> str | None:
+    """A bash that can actually run scripts. On Windows `bash` may resolve to
+    the WSL stub with no distro installed, so try Git Bash too and verify."""
+    cands = [shutil.which("bash")]
+    if os.name == "nt":
+        for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramW6432"), os.environ.get("LOCALAPPDATA")):
+            if base:
+                cands += [str(Path(base) / "Git" / "bin" / "bash.exe"),
+                          str(Path(base) / "Programs" / "Git" / "bin" / "bash.exe")]
+    for c in cands:
+        if not c or not Path(c).exists():
+            continue
+        try:
+            if subprocess.run([c, "-c", "true"], capture_output=True, timeout=20).returncode == 0:
+                return c
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return None
+
+
+BASH = _working_bash()
+
+
 def _spawn_orphan(cwd: Path, cmd: str) -> int:
     """Start `cmd` detached (re-parented to init, so no zombie lingers) and return its pid."""
     out = subprocess.check_output(
@@ -39,11 +62,11 @@ def _alive(pid: int) -> bool:
         return True
 
 
-@unittest.skipIf(shutil.which("bash") is None, "bash not available")
+@unittest.skipIf(BASH is None, "no working bash available")
 class ShellSyntaxTest(unittest.TestCase):
     def test_bash_n(self):
         for script in (STOP, RUN):
-            r = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
+            r = subprocess.run([BASH, "-n", script.as_posix()], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, f"{script.name}: {r.stderr}")
 
     def test_run_all_mentions_stop_all_and_keeps_workers(self):
