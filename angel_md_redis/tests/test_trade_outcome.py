@@ -61,3 +61,44 @@ def test_no_ticks_excluded():
 def test_pending_trade_enters_on_first_tick():
     t = on_tick(mk(premium=""), 120, T0 + 5000, CFG, bid=119, ask=121)
     assert t.entry_premium == 120 and t.entry_spread == 2 and t.sl_px == 96.0
+
+
+def test_actual_move_vs_expected_ce():
+    from app.trade_outcome import on_spot
+    t = mk()  # CE, spot 24500, em 0.4%
+    for px in (24520, 24600, 24450, 24549):
+        t = on_spot(t, px)
+    row = close_trade(on_tick(t, 105, T0 + 60_000, CFG), "timeout", T0 + 120_000)
+    assert row["spot_exit"] == "24549.00"
+    assert abs(float(row["actual_move_pct"]) - 0.2) < 1e-6
+    assert abs(float(row["dir_move_pct"]) - 0.2) < 1e-6
+    assert abs(float(row["move_vs_em"]) - 0.5) < 1e-6
+    assert abs(float(row["fav_move_pct"]) - 100 * 100 / 24500) < 1e-3
+    assert abs(float(row["adv_move_pct"]) - 100 * 50 / 24500) < 1e-3
+
+
+def test_actual_move_pe_signed_in_favour_and_missing_spot():
+    from app.trade_outcome import on_spot
+    t = on_spot(mk(side="PE", tradingsymbol="X24500PE"), 24255)  # -1%
+    row = close_trade(t, "timeout", T0 + 1000)
+    assert abs(float(row["dir_move_pct"]) - 1.0) < 1e-6
+    assert abs(float(row["fav_move_pct"]) - 1.0) < 1e-6
+    assert row["adv_move_pct"] == "0.0000"
+    row = close_trade(mk(), "timeout", T0 + 1000)  # no spot ticks
+    assert row["actual_move_pct"] == "" and row["spot_exit"] == ""
+
+
+def test_paper_trade_restores_old_persisted_doc():
+    import dataclasses
+    from app.trade_outcome import PaperTrade
+    d = dataclasses.asdict(mk())
+    for k in ("spot_last", "spot_max", "spot_min"):
+        d.pop(k)
+    assert PaperTrade(**d).spot_last is None
+
+
+def test_tracker_apply_spot_ticks():
+    import run_paper_tracker as rpt
+    open_t = {"X24500CE": mk(), "Y1CE": mk(symbol="Y", tradingsymbol="Y1CE")}
+    rpt.apply_spot_ticks(open_t, [("1-0", {"symbol": "x", "ltp": "24600"}), ("2-0", {"symbol": "Z", "ltp": "1"})])
+    assert open_t["X24500CE"].spot_last == 24600 and open_t["Y1CE"].spot_last is None

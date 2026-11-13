@@ -64,6 +64,9 @@ class PaperTrade:
     last_tick_ms: Optional[int] = None
     entry_spread: Optional[float] = None
     ctx: Optional[Dict[str, str]] = None  # context strings carried to the outcome row
+    spot_last: Optional[float] = None     # underlying price path (md:ticks:eq) for actual-vs-expected move
+    spot_max: Optional[float] = None
+    spot_min: Optional[float] = None
 
 
 def target_price(entry: float, delta: Optional[float], em_pct: Optional[float],
@@ -148,6 +151,45 @@ def on_tick(t: PaperTrade, ltp: Optional[float], ts_ms: int, cfg: PaperConfig = 
     )
 
 
+def on_spot(t: PaperTrade, px: Optional[float]) -> PaperTrade:
+    """Fold one underlying (spot) tick into the trade. Ignored until the trade has an entry."""
+    if px is None or px <= 0 or t.entry_premium is None:
+        return t
+    return replace(
+        t, spot_last=px,
+        spot_max=max(t.spot_max if t.spot_max is not None else px, px),
+        spot_min=min(t.spot_min if t.spot_min is not None else px, px),
+    )
+
+
+def move_fields(t: PaperTrade) -> Dict[str, Optional[float]]:
+    """Actual underlying move vs the expected move (Expected Move step 6).
+
+    actual_move_pct  signed % change of spot from entry to exit
+    dir_move_pct     same, signed in the trade's favour (CE: up +, PE: down +)
+    move_vs_em       |actual| / expected move %   (1.0 = moved exactly one EM)
+    fav_move_pct     best favourable spot excursion %, adv_move_pct worst adverse (>= 0)
+    """
+    out: Dict[str, Optional[float]] = {"spot_exit": t.spot_last, "actual_move_pct": None,
+                                       "dir_move_pct": None, "move_vs_em": None,
+                                       "fav_move_pct": None, "adv_move_pct": None}
+    s0 = t.spot
+    if not s0 or s0 <= 0 or t.spot_last is None:
+        return out
+    sign = -1.0 if t.side == "PE" else 1.0
+    act = (t.spot_last - s0) / s0 * 100.0
+    out["actual_move_pct"] = act
+    out["dir_move_pct"] = act * sign
+    if t.em_pct and t.em_pct > 0:
+        out["move_vs_em"] = abs(act) / t.em_pct
+    hi = (t.spot_max - s0) / s0 * 100.0 if t.spot_max is not None else act
+    lo = (t.spot_min - s0) / s0 * 100.0 if t.spot_min is not None else act
+    fav, adv = (hi, lo) if sign > 0 else (-lo, -hi)
+    out["fav_move_pct"] = max(fav, 0.0)
+    out["adv_move_pct"] = max(-adv, 0.0)
+    return out
+
+
 def is_session_end(ts_ms: int, cfg: PaperConfig = PaperConfig()) -> bool:
     d = datetime.fromtimestamp(ts_ms / 1000.0, IST)
     return d.hour * 100 + d.minute >= cfg.session_end_hhmm
@@ -204,6 +246,7 @@ def close_trade(t: PaperTrade, reason: str, now_ms: int) -> Dict[str, str]:
         "mae_pct": _fmt(mae / entry * 100.0 if mae is not None else None, 3),
         "delta": _fmt(t.delta), "em_pct": _fmt(t.em_pct), "spot_entry": _fmt(t.spot),
         "spread_entry": _fmt(t.entry_spread),
+        **{k: _fmt(v, 2 if k == "spot_exit" else 4) for k, v in move_fields(t).items()},
         **ctx,
     }
     row["bucket_key"] = bucket_key(ctx.get("regime", ""), ctx.get("em_bucket", "EM_NA"),

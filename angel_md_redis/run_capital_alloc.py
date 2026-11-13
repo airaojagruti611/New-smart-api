@@ -117,7 +117,7 @@ def _open_usage(r: redis.Redis) -> float:
 
 
 def _c_available(r: redis.Redis) -> float:
-    funds = get_available_funds()  # stub returns None until Broker Bridge
+    funds = get_available_funds(r)  # md:account:latest (run_account.py); None if missing/stale
     if funds is not None:
         return max(funds, 0.0)
     return max(TOTAL_CAPITAL - _open_usage(r), 0.0)
